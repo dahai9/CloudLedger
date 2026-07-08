@@ -1,0 +1,24 @@
+{
+  "name": "cloudledger",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "frontend",
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build",
+    "preview": "npm --prefix frontend run preview",
+    "workspace:list": "npm query .workspace",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:android:init": "tauri android init",
+    "tauri:android:dev": "tauri android dev",
+    "tauri:android:build": "tauri android build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}

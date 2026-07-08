@@ -1,0 +1,58 @@
+# Nix
+/result
+/result-*
+.direnv/
+
+# Rust
+/target/
+**/target/
+
+# Node and frontend build output
+node_modules/
+.pnpm-store/
+dist/
+.vite/
+.turbo/
+
+# Tauri generated output
+**/src-tauri/target/
+
+# Android and Gradle generated output
+.gradle/
+**/.gradle/
+src-tauri/gen/android/.tauri/
+**/src-tauri/gen/android/.gradle/
+**/src-tauri/gen/android/app/build/
+**/src-tauri/gen/android/build/
+**/src-tauri/gen/android/buildSrc/build/
+**/src-tauri/gen/android/.externalNativeBuild/
+**/src-tauri/gen/android/.cxx/
+**/src-tauri/gen/android/captures/
+**/src-tauri/gen/android/local.properties
+**/src-tauri/gen/android/key.properties
+**/src-tauri/gen/android/keystore.properties
+**/src-tauri/gen/android/app/src/main/assets/tauri.conf.json
+**/src-tauri/gen/android/app/src/main/**/generated/
+**/src-tauri/gen/android/app/src/main/jniLibs/
+**/src-tauri/gen/android/app/tauri.build.gradle.kts
+**/src-tauri/gen/android/app/tauri.properties
+**/src-tauri/gen/android/app/proguard-tauri.pro
+**/src-tauri/gen/android/tauri.settings.gradle
+**/local.properties
+*.apk
+*.aab
+*.jks
+*.keystore
+
+# Local environment and editor state
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS noise
+.DS_Store
+Thumbs.db

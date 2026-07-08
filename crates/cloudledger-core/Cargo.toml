@@ -1,0 +1,15 @@
+[package]
+name = "cloudledger-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["serde"]
+serde = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
+uuid = { version = "1", features = ["serde", "v4", "v7"] }

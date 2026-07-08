@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/cloudledger-core",
+  "crates/cloudledger-db",
+  "crates/cloudledger-service",
+  "crates/cloudledger-server",
+  "src-tauri",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+argon2 = "0.5"
+axum = "0.7"
+cloudledger-core = { path = "crates/cloudledger-core" }
+cloudledger-db = { path = "crates/cloudledger-db" }
+cloudledger-service = { path = "crates/cloudledger-service" }
+rand_core = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = "2"
+tauri-build = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+uuid = { version = "1", features = ["serde", "v4", "v7"] }

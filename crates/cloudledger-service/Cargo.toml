@@ -1,0 +1,13 @@
+[package]
+name = "cloudledger-service"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+cloudledger-core = { path = "../cloudledger-core" }
+cloudledger-db = { path = "../cloudledger-db" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+time = { version = "0.3", features = ["formatting"] }
+uuid = { version = "1", features = ["serde", "v4"] }

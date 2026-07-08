@@ -1,0 +1,17 @@
+[package]
+name = "cloudledger-server"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+argon2.workspace = true
+axum.workspace = true
+cloudledger-core.workspace = true
+rand_core = { workspace = true, features = ["getrandom"] }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+uuid.workspace = true
