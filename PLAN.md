@@ -90,9 +90,11 @@ development and smoke testing.
 - Tauri commands:
   - `health`
   - `get_overview`
+  - `switch_user`
   - `create_transaction`
 - Server routes currently planned:
   - `GET /health`
+  - `GET /ready`
   - `GET /sync/ping`
   - future auth and sync endpoints for registration, login, refresh, ledger
     pull/push, and audit-log upload.
@@ -115,24 +117,41 @@ cargo metadata --no-deps --format-version 1
 nix flake metadata path:.
 ```
 
-Run the full Nix/Tauri checks once the Android/WebKit closure has finished
-downloading:
+Run the full Nix/Tauri checks:
 
 ```bash
 just doctor
 just check
 just tauri-dev
-just android-build
+nix develop path:. -c npm run tauri:android:build -- --debug --target aarch64
 ```
 
 ## Current Status
 
 - Rust core, DB repository draft, service layer, server scaffold, frontend app,
   Tauri shell, Nix shell, and docs have been created.
-- Rust non-Tauri crates pass formatting, clippy, and tests.
-- Frontend production build passes.
-- APK generation has not been completed yet because the first `nix develop`
-  run was blocked by slow cache downloads for the Android/WebKit closure.
+- Alice and Bob can switch accounts in the app. Each user sees their own
+  private ledger first, while both users can see the Acme public ledger through
+  organization membership.
+- Tauri command creation no longer trusts a renderer-provided actor user ID;
+  it injects the current Rust-side session user before authorization.
+- Local Android state is persisted at the Tauri app data path as
+  `ledger-state.json`, with schema versioning, atomic replacement, and a
+  `ledger-state.json.bak` recovery copy.
+- The frontend shows dev-cloud status from
+  `VITE_CLOUDLEDGER_CLOUD_URL`, defaulting to
+  `http://192.168.1.229:8787` for the current LAN test setup. The app checks
+  `/ready` and displays a short server ID so the active development cloud can
+  be identified from the phone.
+- The development server persists its cloud identity under
+  `.cloudledger-server/server-id` by default, or under
+  `CLOUDLEDGER_SERVER_DATA_DIR` when set.
+- Debug APK generation and installation have been proven on a connected Android
+  phone. The validated debug artifact path is
+  `src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`.
+- The current phone/LAN validation target is developer machine
+  `192.168.1.229:8787` and test phone `192.168.1.14`. Phone-side ADB curl to
+  `/health` succeeds.
 
 ## Assumptions
 

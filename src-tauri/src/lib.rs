@@ -1,12 +1,13 @@
-use std::sync::Mutex;
+use std::{path::PathBuf, sync::Mutex};
 
 use cloudledger_service::{
     AppCreateTransactionInput, AppLedgerService, AppServiceError, LedgerOverview, TransactionDto,
 };
-use tauri::State;
+use tauri::{Manager, State};
 
 struct AppState {
     ledger_service: Mutex<AppLedgerService>,
+    storage_path: PathBuf,
 }
 
 #[tauri::command]
@@ -24,26 +25,51 @@ fn get_overview(state: State<'_, AppState>) -> Result<LedgerOverview, String> {
 }
 
 #[tauri::command]
+fn switch_user(state: State<'_, AppState>, user_id: uuid::Uuid) -> Result<LedgerOverview, String> {
+    let mut service = state
+        .ledger_service
+        .lock()
+        .map_err(|_| "ledger service lock poisoned".to_string())?;
+    let overview = service.switch_user(user_id).map_err(service_error)?;
+    service
+        .save_to_path(&state.storage_path)
+        .map_err(service_error)?;
+    Ok(overview)
+}
+
+#[tauri::command]
 fn create_transaction(
     state: State<'_, AppState>,
-    input: AppCreateTransactionInput,
+    mut input: AppCreateTransactionInput,
 ) -> Result<TransactionDto, String> {
     let mut service = state
         .ledger_service
         .lock()
         .map_err(|_| "ledger service lock poisoned".to_string())?;
-    service.create_transaction(input).map_err(service_error)
+    input.actor_user_id = service.current_user_id();
+    let transaction = service.create_transaction(input).map_err(service_error)?;
+    service
+        .save_to_path(&state.storage_path)
+        .map_err(service_error)?;
+    Ok(transaction)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(AppState {
-            ledger_service: Mutex::new(AppLedgerService::seeded()),
+        .setup(|app| {
+            let storage_path = app.path().app_data_dir()?.join("ledger-state.json");
+            let ledger_service = AppLedgerService::load_or_seed(&storage_path)?;
+            app.manage(AppState {
+                ledger_service: Mutex::new(ledger_service),
+                storage_path,
+            });
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             health,
             get_overview,
+            switch_user,
             create_transaction
         ])
         .run(tauri::generate_context!())

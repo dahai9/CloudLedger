@@ -48,6 +48,7 @@ src-tauri/gen/android/.tauri/
 .env
 .env.*
 !.env.example
+.cloudledger-server/
 .idea/
 .vscode/
 *.swp

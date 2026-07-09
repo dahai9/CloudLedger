@@ -7,6 +7,8 @@ import type {
   LedgerDashboard,
   NewTransactionDraft,
   TransactionDirection,
+  UserAccount,
+  UserSession,
 } from "./types";
 
 type ViewMode = "activity" | "approval" | "audit";
@@ -22,9 +24,12 @@ interface QuickEntryForm {
 }
 
 interface AppState {
+  users: UserAccount[];
   ledgers: Ledger[];
   dashboard?: LedgerDashboard;
   activeLedgerId?: string;
+  activeUserId?: string;
+  cloudStatus: UserSession["cloudStatus"];
   loading: boolean;
   error?: string;
   view: ViewMode;
@@ -42,7 +47,12 @@ if (!appRoot) {
 const app = appRoot;
 
 const state: AppState = {
+  users: [],
   ledgers: [],
+  cloudStatus: {
+    state: "checking",
+    label: "云端检测中",
+  },
   loading: true,
   view: "activity",
   filter: "all",
@@ -70,9 +80,13 @@ async function loadInitialState() {
   try {
     state.loading = true;
     render();
+    const session = await cloudLedgerApi.getUserSession();
     const ledgers = await cloudLedgerApi.listLedgers();
-    const activeLedgerId = ledgers[0]?.id;
+    const activeLedgerId = pickDefaultLedgerId(ledgers);
 
+    state.users = session.users;
+    state.activeUserId = session.currentUser.id;
+    state.cloudStatus = session.cloudStatus;
     state.ledgers = ledgers;
     state.activeLedgerId = activeLedgerId;
     state.dashboard = activeLedgerId
@@ -82,6 +96,36 @@ async function loadInitialState() {
     state.error = undefined;
   } catch (error) {
     state.error = error instanceof Error ? error.message : "加载失败";
+  } finally {
+    state.loading = false;
+    render();
+  }
+}
+
+async function switchUser(userId: string) {
+  try {
+    state.loading = true;
+    state.activeUserId = userId;
+    render();
+    await cloudLedgerApi.switchUser(userId);
+    const session = await cloudLedgerApi.getUserSession();
+    const ledgers = await cloudLedgerApi.listLedgers();
+    const activeLedgerId = pickDefaultLedgerId(ledgers);
+
+    state.users = session.users;
+    state.activeUserId = session.currentUser.id;
+    state.cloudStatus = session.cloudStatus;
+    state.ledgers = ledgers;
+    state.activeLedgerId = activeLedgerId;
+    state.dashboard = activeLedgerId
+      ? await cloudLedgerApi.getLedgerDashboard(activeLedgerId)
+      : undefined;
+    state.view = "activity";
+    state.filter = "all";
+    resetFormForDashboard();
+    state.error = undefined;
+  } catch (error) {
+    state.error = error instanceof Error ? error.message : "切换账号失败";
   } finally {
     state.loading = false;
     render();
@@ -143,7 +187,12 @@ function render() {
   const ledger = dashboard?.ledger;
 
   app.innerHTML = `
-    <main class="app-shell">
+    <main
+      class="app-shell"
+      data-active-user-id="${escapeHtml(state.activeUserId ?? "")}"
+      data-active-ledger-id="${escapeHtml(state.activeLedgerId ?? "")}"
+      data-cloud-state="${escapeHtml(state.cloudStatus.state)}"
+    >
       ${renderTopBar()}
       ${
         state.loading && !dashboard
@@ -162,34 +211,68 @@ function render() {
   bindEvents();
 }
 
+function pickDefaultLedgerId(ledgers: Ledger[]) {
+  return ledgers.find((ledger) => ledger.kind === "private")?.id ?? ledgers[0]?.id;
+}
+
 function renderTopBar() {
   const ledger = state.dashboard?.ledger;
-  const ledgerOptions = state.ledgers
-    .map(
-      (item) => `
-        <option value="${escapeHtml(item.id)}" ${item.id === state.activeLedgerId ? "selected" : ""}>
-          ${escapeHtml(item.name)}
-        </option>
-      `,
-    )
-    .join("");
 
   return `
     <header class="top-bar">
       <div class="brand-block">
         <span class="brand-mark" aria-hidden="true">CL</span>
-        <div>
+      <div>
           <h1>CloudLedger</h1>
           <p>${ledger ? `${ledgerKindLabel(ledger.kind)} · ${roleLabel(ledger.role)}` : "移动账本"}</p>
         </div>
       </div>
-      <label class="ledger-picker">
-        <span>账本</span>
-        <select id="ledgerSelect" ${state.ledgers.length === 0 ? "disabled" : ""}>
-          ${ledgerOptions}
-        </select>
-      </label>
+      <div class="top-controls">
+        <span class="cloud-chip ${state.cloudStatus.state}">${escapeHtml(state.cloudStatus.label)}</span>
+        <div class="control-block account-picker" id="userSelect" role="group" aria-label="账号切换">
+          <span>账号</span>
+          <div class="switcher-row">
+            ${state.users.map(renderUserSwitchButton).join("")}
+          </div>
+        </div>
+        <div class="control-block ledger-picker" id="ledgerSelect" role="group" aria-label="账本切换">
+          <span>账本</span>
+          <div class="switcher-row">
+            ${state.ledgers.map(renderLedgerSwitchButton).join("")}
+          </div>
+        </div>
+      </div>
     </header>
+  `;
+}
+
+function renderUserSwitchButton(user: UserAccount) {
+  const active = user.id === state.activeUserId;
+
+  return `
+    <button
+      class="switcher-button ${active ? "is-active" : ""}"
+      type="button"
+      data-user-id="${escapeHtml(user.id)}"
+      aria-pressed="${active}"
+    >
+      ${escapeHtml(user.displayName)}
+    </button>
+  `;
+}
+
+function renderLedgerSwitchButton(ledger: Ledger) {
+  const active = ledger.id === state.activeLedgerId;
+
+  return `
+    <button
+      class="switcher-button ${active ? "is-active" : ""}"
+      type="button"
+      data-ledger-id="${escapeHtml(ledger.id)}"
+      aria-pressed="${active}"
+    >
+      ${escapeHtml(ledger.name)}
+    </button>
   `;
 }
 
@@ -535,9 +618,22 @@ function renderEmptyState() {
 }
 
 function bindEvents() {
-  app.querySelector<HTMLSelectElement>("#ledgerSelect")?.addEventListener("change", (event) => {
-    const target = event.currentTarget as HTMLSelectElement;
-    void switchLedger(target.value);
+  app.querySelectorAll<HTMLButtonElement>("[data-user-id]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const userId = button.dataset.userId;
+      if (userId && userId !== state.activeUserId) {
+        void switchUser(userId);
+      }
+    });
+  });
+
+  app.querySelectorAll<HTMLButtonElement>("[data-ledger-id]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const ledgerId = button.dataset.ledgerId;
+      if (ledgerId && ledgerId !== state.activeLedgerId) {
+        void switchLedger(ledgerId);
+      }
+    });
   });
 
   app.querySelector<HTMLFormElement>("#quickEntryForm")?.addEventListener("submit", (event) => {
@@ -684,6 +780,8 @@ function roleLabel(role: Ledger["role"]) {
     owner: "所有者",
     admin: "管理员",
     accountant: "会计",
+    approver: "审批",
+    member: "成员",
     auditor: "审计员",
     viewer: "只读",
   };

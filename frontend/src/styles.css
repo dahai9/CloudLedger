@@ -111,13 +111,21 @@ button {
   font-size: 12px;
 }
 
-.ledger-picker {
+.top-controls {
   display: grid;
-  gap: 4px;
-  min-width: 132px;
+  grid-template-columns: auto minmax(120px, 0.8fr) minmax(156px, 1fr);
+  align-items: end;
+  gap: 8px;
+  min-width: min(100%, 390px);
 }
 
-.ledger-picker span,
+.control-block {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.control-block > span,
 .quick-entry label > span,
 .amount-field span {
   color: var(--muted);
@@ -125,7 +133,6 @@ button {
   font-weight: 700;
 }
 
-.ledger-picker select,
 .quick-entry select,
 .quick-entry input {
   width: 100%;
@@ -137,11 +144,79 @@ button {
   outline: none;
 }
 
-.ledger-picker select {
-  min-height: 36px;
-  padding: 0 30px 0 10px;
+.switcher-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+}
+
+.switcher-button {
+  display: inline-flex;
+  flex: 1 1 76px;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  min-width: 0;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--ink);
   font-size: 13px;
   font-weight: 700;
+  overflow-wrap: anywhere;
+  text-align: center;
+}
+
+.switcher-button.is-active {
+  border-color: rgb(15 123 99 / 30%);
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.cloud-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.cloud-chip.online {
+  border-color: rgb(15 123 99 / 24%);
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.cloud-chip.offline {
+  border-color: rgb(199 71 49 / 24%);
+  background: var(--coral-soft);
+  color: var(--coral);
+}
+
+@media (max-width: 520px) {
+  .top-bar {
+    flex-wrap: wrap;
+    align-items: stretch;
+  }
+
+  .top-controls {
+    width: 100%;
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .cloud-chip {
+    justify-self: start;
+  }
 }
 
 .balance-panel {
@@ -308,6 +383,12 @@ button {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 10px;
+}
+
+@media (max-width: 380px) {
+  .field-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .approval-toggle {

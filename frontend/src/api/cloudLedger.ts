@@ -1,6 +1,7 @@
 import {
   createTransaction as invokeCreateTransaction,
   loadOverview,
+  switchUser as invokeSwitchUser,
   type AccountDto,
   type AuditLogDto,
   type LedgerDto,
@@ -16,9 +17,12 @@ import type {
   LedgerDashboard,
   NewTransactionDraft,
   Transaction,
+  UserSession,
 } from "../types";
 
 export interface CloudLedgerApi {
+  getUserSession(): Promise<UserSession>;
+  switchUser(userId: string): Promise<void>;
   listLedgers(): Promise<Ledger[]>;
   getLedgerDashboard(ledgerId: string): Promise<LedgerDashboard>;
   createTransaction(draft: NewTransactionDraft): Promise<Transaction>;
@@ -35,6 +39,7 @@ declare global {
 const isTauriRuntime = () => typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
 
 let overviewCache: LedgerOverview | undefined;
+const cloudBaseUrl = import.meta.env.VITE_CLOUDLEDGER_CLOUD_URL ?? "http://192.168.1.229:8787";
 
 const getOverview = async () => {
   overviewCache = await loadOverview();
@@ -42,6 +47,19 @@ const getOverview = async () => {
 };
 
 const commandApi: CloudLedgerApi = {
+  async getUserSession() {
+    const overview = await getOverview();
+    return {
+      currentUser: overview.currentUser,
+      users: overview.users,
+      cloudStatus: await fetchCloudStatus(),
+    };
+  },
+
+  async switchUser(userId) {
+    overviewCache = await invokeSwitchUser(userId);
+  },
+
   async listLedgers() {
     const overview = await getOverview();
     return overview.ledgers.map((ledger) => mapLedger(ledger, overview));
@@ -58,7 +76,6 @@ const commandApi: CloudLedgerApi = {
     const category = categoryFromDraft(draft, overview);
     const ledger = overview.ledgers.find((item) => item.id === draft.ledgerId);
     const created = await invokeCreateTransaction({
-      actorUserId: overview.currentUser.id,
       ledgerId: draft.ledgerId,
       accountId: draft.accountId,
       kind: draft.direction,
@@ -252,6 +269,21 @@ let mockAuditTrail: AuditLogEntry[] = [
 ];
 
 const mockApi: CloudLedgerApi = {
+  async getUserSession() {
+    return {
+      currentUser: { id: "demo-user", displayName: "Alice" },
+      users: [
+        { id: "demo-user", displayName: "Alice" },
+        { id: "demo-bob", displayName: "Bob" },
+      ],
+      cloudStatus: await fetchCloudStatus(),
+    };
+  },
+
+  async switchUser() {
+    return undefined;
+  },
+
   async listLedgers() {
     return mockLedgers;
   },
@@ -365,13 +397,71 @@ function mapLedger(ledger: LedgerDto, overview: LedgerOverview): Ledger {
     name: ledger.name,
     kind: ledger.kind === "personal" ? "private" : "organization",
     currency: accounts[0]?.currency ?? "CNY",
-    role: ledger.kind === "personal" ? "owner" : "accountant",
+    role: normalizeRole(ledger.role),
     organizationName: ledger.kind === "organization_public" ? ledger.scopeLabel : undefined,
     balanceCents,
     pendingCount: transactions.filter((item) => item.approvalState === "submitted").length,
     auditUnreadCount: overview.auditLogs.filter((item) => item.ledgerId === ledger.id).length,
     lastSyncedAt: latestTransaction,
   };
+}
+
+async function fetchCloudStatus(): Promise<UserSession["cloudStatus"]> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 2500);
+
+  try {
+    const response = await fetch(`${cloudBaseUrl}/ready`, {
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      return {
+        state: "offline",
+        label: "云端异常",
+        detail: `${cloudBaseUrl} HTTP ${response.status}`,
+      };
+    }
+    const ready = (await response.json()) as { serverId?: string; status?: string };
+    if (ready.status !== "ready") {
+      return {
+        state: "offline",
+        label: "云端未就绪",
+        detail: `${cloudBaseUrl} status=${ready.status ?? "unknown"}`,
+      };
+    }
+    const serverLabel = ready.serverId ? ` · ${ready.serverId.slice(0, 8)}` : "";
+
+    return {
+      state: "online",
+      label: `云端在线${serverLabel}`,
+      detail: `${cloudBaseUrl}/ready`,
+    };
+  } catch (error) {
+    return {
+      state: "offline",
+      label: "云端离线",
+      detail: error instanceof Error ? error.message : cloudBaseUrl,
+    };
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+function normalizeRole(role: string): Ledger["role"] {
+  if (
+    role === "owner" ||
+    role === "admin" ||
+    role === "accountant" ||
+    role === "approver" ||
+    role === "member" ||
+    role === "auditor" ||
+    role === "viewer"
+  ) {
+    return role;
+  }
+
+  return "viewer";
 }
 
 function mapAccount(account: AccountDto): FinancialAccount {

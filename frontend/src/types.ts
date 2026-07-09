@@ -1,10 +1,19 @@
 export type LedgerKind = "private" | "organization";
 
-export type MemberRole = "owner" | "admin" | "accountant" | "auditor" | "viewer";
+export type MemberRole =
+  | "owner"
+  | "admin"
+  | "accountant"
+  | "approver"
+  | "member"
+  | "auditor"
+  | "viewer";
 
 export type TransactionDirection = "expense" | "income";
 
 export type ApprovalState = "draft" | "pending" | "approved" | "rejected" | "deleted";
+
+export type CloudConnectionState = "checking" | "online" | "offline";
 
 export type AuditAction =
   | "transaction_created"
@@ -24,6 +33,23 @@ export interface Ledger {
   pendingCount: number;
   auditUnreadCount: number;
   lastSyncedAt?: string;
+}
+
+export interface UserAccount {
+  id: string;
+  displayName: string;
+}
+
+export interface CloudStatus {
+  state: CloudConnectionState;
+  label: string;
+  detail?: string;
+}
+
+export interface UserSession {
+  currentUser: UserAccount;
+  users: UserAccount[];
+  cloudStatus: CloudStatus;
 }
 
 export interface FinancialAccount {

@@ -1,9 +1,12 @@
 pub mod auth;
+pub mod state;
 pub mod sync;
 
-use axum::{routing::get, Json, Router};
+use axum::{extract::State, routing::get, Json, Router};
 use serde::Serialize;
+pub use state::ServerState;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use uuid::Uuid;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -12,10 +15,22 @@ pub struct HealthResponse {
     pub service: &'static str,
 }
 
-pub fn router() -> Router {
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadyResponse {
+    pub status: &'static str,
+    pub service: &'static str,
+    pub server_id: Uuid,
+    pub sync_model: &'static str,
+    pub public_ledger_authority: &'static str,
+}
+
+pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .route("/sync/ping", get(sync::sync_ping))
+        .with_state(state)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
 }
@@ -24,5 +39,15 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
         service: "cloudledger-server",
+    })
+}
+
+async fn ready(State(state): State<ServerState>) -> Json<ReadyResponse> {
+    Json(ReadyResponse {
+        status: "ready",
+        service: "cloudledger-server",
+        server_id: state.server_id,
+        sync_model: "cloud_authoritative_public_ledgers",
+        public_ledger_authority: "server",
     })
 }

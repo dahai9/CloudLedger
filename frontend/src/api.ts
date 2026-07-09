@@ -15,6 +15,7 @@ export interface LedgerDto {
   kind: LedgerKind;
   scopeLabel: string;
   organizationId?: string;
+  role: string;
 }
 
 export interface AccountDto {
@@ -51,6 +52,7 @@ export interface AuditLogDto {
 
 export interface LedgerOverview {
   currentUser: UserDto;
+  users: UserDto[];
   ledgers: LedgerDto[];
   accounts: AccountDto[];
   transactions: TransactionDto[];
@@ -61,7 +63,6 @@ export interface LedgerOverview {
 }
 
 export interface CreateTransactionInput {
-  actorUserId: string;
   ledgerId: string;
   accountId: string;
   kind: TransactionKind;
@@ -71,100 +72,15 @@ export interface CreateTransactionInput {
 }
 
 export async function loadOverview(): Promise<LedgerOverview> {
-  try {
-    return await invoke<LedgerOverview>("get_overview");
-  } catch {
-    return demoOverview();
-  }
+  return invoke<LedgerOverview>("get_overview");
+}
+
+export async function switchUser(userId: string): Promise<LedgerOverview> {
+  return invoke<LedgerOverview>("switch_user", { userId });
 }
 
 export async function createTransaction(
   input: CreateTransactionInput
 ): Promise<TransactionDto> {
   return invoke<TransactionDto>("create_transaction", { input });
-}
-
-function demoOverview(): LedgerOverview {
-  const userId = "demo-user";
-  const personalLedgerId = "personal-ledger";
-  const companyLedgerId = "company-ledger";
-  const personalAccountId = "personal-cash";
-  const companyAccountId = "company-bank";
-
-  return {
-    currentUser: { id: userId, displayName: "Alice" },
-    ledgers: [
-      {
-        id: personalLedgerId,
-        name: "Alice 私账",
-        kind: "personal",
-        scopeLabel: "私账"
-      },
-      {
-        id: companyLedgerId,
-        name: "Acme 公账",
-        kind: "organization_public",
-        scopeLabel: "公账",
-        organizationId: "acme"
-      }
-    ],
-    accounts: [
-      {
-        id: personalAccountId,
-        ledgerId: personalLedgerId,
-        name: "个人现金",
-        kind: "cash",
-        balanceMinor: 338000,
-        currency: "CNY"
-      },
-      {
-        id: companyAccountId,
-        ledgerId: companyLedgerId,
-        name: "公司银行账户",
-        kind: "bank",
-        balanceMinor: 4914000,
-        currency: "CNY"
-      }
-    ],
-    transactions: [
-      {
-        id: "salary",
-        ledgerId: personalLedgerId,
-        accountId: personalAccountId,
-        kind: "income",
-        amountMinor: 1800000,
-        currency: "CNY",
-        description: "工资收入",
-        approvalState: "approved",
-        createdBy: userId,
-        occurredAt: new Date().toISOString()
-      },
-      {
-        id: "office",
-        ledgerId: companyLedgerId,
-        accountId: companyAccountId,
-        kind: "expense",
-        amountMinor: 86000,
-        currency: "CNY",
-        description: "办公用品采购",
-        approvalState: "submitted",
-        createdBy: userId,
-        occurredAt: new Date().toISOString()
-      }
-    ],
-    auditLogs: [
-      {
-        id: "audit-office",
-        ledgerId: companyLedgerId,
-        actorUserId: userId,
-        action: "transaction.submitted",
-        resourceType: "transaction",
-        summary: "提交公账支出：办公用品采购",
-        createdAt: new Date().toISOString()
-      }
-    ],
-    monthlyIncomeMinor: 1800000,
-    monthlyExpenseMinor: 86000,
-    pendingApprovalCount: 1
-  };
 }
