@@ -1,5 +1,6 @@
 import {
   createTransaction as invokeCreateTransaction,
+  decideApproval as invokeDecideApproval,
   loadOverview,
   switchUser as invokeSwitchUser,
   type AccountDto,
@@ -26,6 +27,11 @@ export interface CloudLedgerApi {
   listLedgers(): Promise<Ledger[]>;
   getLedgerDashboard(ledgerId: string): Promise<LedgerDashboard>;
   createTransaction(draft: NewTransactionDraft): Promise<Transaction>;
+  decideApproval(
+    transactionId: string,
+    decision: "approve" | "reject",
+    decisionNote?: string,
+  ): Promise<Transaction>;
   listApprovalQueue(ledgerId: string): Promise<ApprovalQueueItem[]>;
   listAuditTrail(ledgerId: string): Promise<AuditLogEntry[]>;
 }
@@ -39,7 +45,7 @@ declare global {
 const isTauriRuntime = () => typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
 
 let overviewCache: LedgerOverview | undefined;
-const cloudBaseUrl = import.meta.env.VITE_CLOUDLEDGER_CLOUD_URL ?? "http://192.168.1.229:8787";
+const cloudBaseUrl = import.meta.env.VITE_CLOUDLEDGER_CLOUD_URL ?? "http://192.168.1.32:8787";
 
 const getOverview = async () => {
   overviewCache = await loadOverview();
@@ -86,6 +92,13 @@ const commandApi: CloudLedgerApi = {
 
     overviewCache = undefined;
     return mapTransaction(created, overview);
+  },
+
+  async decideApproval(transactionId, decision, decisionNote) {
+    const overview = overviewCache ?? (await getOverview());
+    const decided = await invokeDecideApproval({ transactionId, decision, decisionNote });
+    overviewCache = undefined;
+    return mapTransaction(decided, overview);
   },
 
   async listApprovalQueue(ledgerId) {
@@ -233,8 +246,10 @@ let mockApprovalQueue: ApprovalQueueItem[] = [
     amountCents: 98600,
     direction: "expense",
     submittedBy: "林会计",
+    submittedById: "demo-lin",
     submittedAt: "2026-07-08T02:25:00.000Z",
     state: "pending",
+    canDecide: true,
   },
   {
     id: "approval-203",
@@ -244,8 +259,10 @@ let mockApprovalQueue: ApprovalQueueItem[] = [
     amountCents: 42680,
     direction: "expense",
     submittedBy: "周运营",
+    submittedById: "demo-zhou",
     submittedAt: "2026-07-07T09:30:00.000Z",
     state: "pending",
+    canDecide: true,
   },
 ];
 
@@ -255,6 +272,7 @@ let mockAuditTrail: AuditLogEntry[] = [
     ledgerId: "org-growth",
     action: "transaction_submitted",
     actorName: "林会计",
+    resourceId: "tx-201",
     createdAt: "2026-07-08T02:25:00.000Z",
     summary: "提交对象存储月账单审批",
   },
@@ -263,6 +281,7 @@ let mockAuditTrail: AuditLogEntry[] = [
     ledgerId: "org-growth",
     action: "transaction_approved",
     actorName: "陈经理",
+    resourceId: "tx-202",
     createdAt: "2026-07-06T10:08:00.000Z",
     summary: "批准企业客户回款入账",
   },
@@ -332,8 +351,10 @@ const mockApi: CloudLedgerApi = {
           amountCents: draft.amountCents,
           direction: draft.direction,
           submittedBy: "我",
+          submittedById: "demo-user",
           submittedAt: nowIso(),
           state: "pending",
+          canDecide: false,
         },
         ...mockApprovalQueue,
       ];
@@ -343,12 +364,46 @@ const mockApi: CloudLedgerApi = {
           ledgerId: draft.ledgerId,
           action: "transaction_submitted",
           actorName: "我",
+          resourceId: transaction.id,
           createdAt: nowIso(),
           summary: `提交${transaction.title}审批`,
         },
         ...mockAuditTrail,
       ];
     }
+
+    return transaction;
+  },
+
+  async decideApproval(transactionId, decision, decisionNote) {
+    const transaction = mockTransactions.find((item) => item.id === transactionId);
+    if (!transaction) {
+      throw new Error("流水不存在");
+    }
+    if (transaction.approvalState !== "pending") {
+      throw new Error("流水不是待审批状态");
+    }
+    if (decision === "reject" && !decisionNote?.trim()) {
+      throw new Error("请输入驳回原因");
+    }
+
+    transaction.approvalState = decision === "approve" ? "approved" : "rejected";
+    mockApprovalQueue = mockApprovalQueue.filter((item) => item.transactionId !== transactionId);
+    mockAuditTrail = [
+      {
+        id: crypto.randomUUID(),
+        ledgerId: transaction.ledgerId,
+        action: decision === "approve" ? "transaction_approved" : "transaction_rejected",
+        actorName: "我",
+        resourceId: transaction.id,
+        createdAt: nowIso(),
+        summary:
+          decision === "approve"
+            ? `批准${transaction.title}`
+            : `驳回${transaction.title}，原因：${decisionNote?.trim()}`,
+      },
+      ...mockAuditTrail,
+    ];
 
     return transaction;
   },
@@ -379,8 +434,13 @@ function mapDashboard(ledgerId: string, overview: LedgerOverview): LedgerDashboa
     accounts,
     categories,
     recentTransactions,
-    approvalQueue: mapApprovalQueue(ledger.id, overview),
-    auditTrail: overview.auditLogs.filter((item) => item.ledgerId === ledger.id).map(mapAuditLog),
+    approvalQueue: mapApprovalQueue(ledger.id, overview).sort(
+      (a, b) => Date.parse(b.submittedAt) - Date.parse(a.submittedAt),
+    ),
+    auditTrail: overview.auditLogs
+      .filter((item) => item.ledgerId === ledger.id)
+      .map(mapAuditLog)
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)),
   };
 }
 
@@ -510,6 +570,10 @@ function mapTransaction(transaction: TransactionDto, overview: LedgerOverview): 
 }
 
 function mapApprovalQueue(ledgerId: string, overview: LedgerOverview): ApprovalQueueItem[] {
+  const ledger = overview.ledgers.find((item) => item.id === ledgerId);
+  const role = normalizeRole(ledger?.role ?? "viewer");
+  const canApproveLedger = role === "owner" || role === "admin" || role === "approver";
+
   return overview.transactions
     .filter((item) => item.ledgerId === ledgerId && item.approvalState === "submitted")
     .map((transaction) => ({
@@ -520,8 +584,10 @@ function mapApprovalQueue(ledgerId: string, overview: LedgerOverview): ApprovalQ
       amountCents: transaction.amountMinor,
       direction: transaction.kind === "income" ? "income" : "expense",
       submittedBy: transaction.createdBy,
+      submittedById: transaction.createdByUserId,
       submittedAt: transaction.occurredAt,
       state: "pending",
+      canDecide: canApproveLedger && transaction.createdByUserId !== overview.currentUser.id,
     }));
 }
 
@@ -530,7 +596,8 @@ function mapAuditLog(entry: AuditLogDto): AuditLogEntry {
     id: entry.id,
     ledgerId: entry.ledgerId,
     action: normalizeAuditAction(entry.action),
-    actorName: entry.actorUserId,
+    actorName: entry.actorDisplayName || entry.actorUserId,
+    resourceId: entry.resourceId,
     createdAt: entry.createdAt,
     summary: entry.summary,
   };

@@ -25,8 +25,20 @@ pub enum AppServiceError {
     UserNotFound,
     #[error("account was not found")]
     AccountNotFound,
+    #[error("transaction was not found")]
+    TransactionNotFound,
     #[error("actor is not authorized for this action")]
     Unauthorized,
+    #[error("transaction is not pending approval")]
+    InvalidApprovalState,
+    #[error("submitter cannot approve their own transaction")]
+    SelfApprovalDenied,
+    #[error("rejection reason is required")]
+    DecisionNoteRequired,
+    #[error("transaction currency must match account currency")]
+    CurrencyMismatch,
+    #[error("transfer transactions are not supported in the MVP")]
+    UnsupportedTransactionKind,
     #[error("invalid amount: {0}")]
     InvalidAmount(String),
     #[error("storage error: {0}")]
@@ -44,6 +56,23 @@ pub struct AppCreateTransactionInput {
     pub amount_minor: i64,
     pub currency: String,
     pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppDecideApprovalInput {
+    #[serde(default)]
+    pub actor_user_id: Uuid,
+    pub transaction_id: Uuid,
+    pub decision: ApprovalDecision,
+    pub decision_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    Approve,
+    Reject,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +130,7 @@ pub struct TransactionDto {
     pub description: String,
     pub approval_state: String,
     pub created_by: String,
+    pub created_by_user_id: String,
     pub occurred_at: String,
 }
 
@@ -110,8 +140,10 @@ pub struct AuditLogDto {
     pub id: String,
     pub ledger_id: String,
     pub actor_user_id: String,
+    pub actor_display_name: String,
     pub action: String,
     pub resource_type: String,
+    pub resource_id: String,
     pub summary: String,
     pub created_at: String,
 }
@@ -276,15 +308,15 @@ impl AppLedgerService {
             TransactionKind::Expense,
             Money::new(86_000, "CNY").expect("valid seed money"),
             "办公用品采购",
-            alice_id,
+            bob_id,
         );
         office.approval_state = ApprovalState::Submitted;
-        office.submitted_by = Some(alice_id);
+        office.submitted_by = Some(bob_id);
 
         let audit = AuditLog::new(
             Some(organization.id),
             public_ledger.id,
-            alice_id,
+            bob_id,
             "transaction.submitted",
             "transaction",
             office.id,
@@ -298,7 +330,7 @@ impl AppLedgerService {
             organizations: BTreeMap::from([(organization.id, organization.clone())]),
             memberships: vec![
                 Membership::new(organization.id, alice_id, MembershipRole::Owner),
-                Membership::new(organization.id, bob_id, MembershipRole::Accountant),
+                Membership::new(organization.id, bob_id, MembershipRole::Approver),
             ],
             ledgers: BTreeMap::from([
                 (personal_ledger.id, personal_ledger),
@@ -372,16 +404,18 @@ impl AppLedgerService {
             .transactions
             .values()
             .filter(|transaction| visible_ledger_ids.contains(&transaction.ledger_id))
-            .map(transaction_dto)
+            .map(|transaction| self.transaction_dto(transaction))
             .collect();
 
         let monthly_income_minor = transactions
             .iter()
+            .filter(|transaction| transaction.approval_state == "approved")
             .filter(|transaction| transaction.kind == "income")
             .map(|transaction| transaction.amount_minor)
             .sum();
         let monthly_expense_minor = transactions
             .iter()
+            .filter(|transaction| transaction.approval_state == "approved")
             .filter(|transaction| transaction.kind == "expense")
             .map(|transaction| transaction.amount_minor)
             .sum();
@@ -406,8 +440,13 @@ impl AppLedgerService {
             audit_logs: self
                 .audit_logs
                 .iter()
-                .filter(|audit| visible_ledger_ids.contains(&audit.ledger_id))
-                .map(audit_dto)
+                .filter(|audit| {
+                    visible_ledger_ids.contains(&audit.ledger_id)
+                        && self.ledgers.get(&audit.ledger_id).is_some_and(|ledger| {
+                            self.authorized(actor_user_id, ledger, Action::ViewAuditLog)
+                        })
+                })
+                .map(|audit| self.audit_dto(audit))
                 .collect(),
             monthly_income_minor,
             monthly_expense_minor,
@@ -434,6 +473,12 @@ impl AppLedgerService {
             .ok_or(AppServiceError::AccountNotFound)?;
         if account.ledger_id != input.ledger_id {
             return Err(AppServiceError::AccountNotFound);
+        }
+        if input.kind == TransactionKind::Transfer {
+            return Err(AppServiceError::UnsupportedTransactionKind);
+        }
+        if account.opening_balance.currency != input.currency.as_str() {
+            return Err(AppServiceError::CurrencyMismatch);
         }
 
         let amount = Money::new(input.amount_minor, input.currency)
@@ -465,9 +510,84 @@ impl AppLedgerService {
             transaction.approved_by = Some(input.actor_user_id);
         }
 
-        let dto = transaction_dto(&transaction);
+        let dto = self.transaction_dto(&transaction);
         self.transactions.insert(transaction.id, transaction);
         Ok(dto)
+    }
+
+    pub fn decide_approval(
+        &mut self,
+        input: AppDecideApprovalInput,
+    ) -> Result<TransactionDto, AppServiceError> {
+        let transaction = self
+            .transactions
+            .get(&input.transaction_id)
+            .ok_or(AppServiceError::TransactionNotFound)?;
+        if transaction.approval_state != ApprovalState::Submitted {
+            return Err(AppServiceError::InvalidApprovalState);
+        }
+
+        let ledger = self
+            .ledgers
+            .get(&transaction.ledger_id)
+            .cloned()
+            .ok_or(AppServiceError::LedgerNotFound)?;
+        if !self.authorized(input.actor_user_id, &ledger, Action::ApproveTransaction) {
+            return Err(AppServiceError::Unauthorized);
+        }
+        if transaction.submitted_by == Some(input.actor_user_id)
+            || transaction.created_by == input.actor_user_id
+        {
+            return Err(AppServiceError::SelfApprovalDenied);
+        }
+        let decision_note = normalize_decision_note(input.decision_note);
+        if input.decision == ApprovalDecision::Reject && decision_note.is_none() {
+            return Err(AppServiceError::DecisionNoteRequired);
+        }
+
+        let (updated_transaction, action, summary) = {
+            let transaction = self
+                .transactions
+                .get_mut(&input.transaction_id)
+                .ok_or(AppServiceError::TransactionNotFound)?;
+            transaction.updated_at = OffsetDateTime::now_utc();
+            let (action, summary) = match input.decision {
+                ApprovalDecision::Approve => {
+                    transaction.approval_state = ApprovalState::Approved;
+                    transaction.approved_by = Some(input.actor_user_id);
+                    (
+                        "transaction.approved",
+                        format!("批准公账流水入账：{}", transaction.description),
+                    )
+                }
+                ApprovalDecision::Reject => {
+                    transaction.approval_state = ApprovalState::Rejected;
+                    (
+                        "transaction.rejected",
+                        format!(
+                            "驳回公账流水：{}，原因：{}",
+                            transaction.description,
+                            decision_note
+                                .as_deref()
+                                .expect("validated rejection reason")
+                        ),
+                    )
+                }
+            };
+            (transaction.clone(), action, summary)
+        };
+
+        self.audit_logs.push(AuditLog::new(
+            ledger.organization_id,
+            ledger.id,
+            input.actor_user_id,
+            action,
+            "transaction",
+            updated_transaction.id,
+            summary,
+        ));
+
+        Ok(self.transaction_dto(&updated_transaction))
     }
 
     fn account_dto(&self, account: &FinancialAccount) -> AccountDto {
@@ -477,8 +597,7 @@ impl AppLedgerService {
             .filter(|transaction| {
                 transaction.account_id == account.id
                     && transaction.deleted_at.is_none()
-                    && transaction.approval_state != ApprovalState::Rejected
-                    && transaction.approval_state != ApprovalState::Voided
+                    && transaction.approval_state == ApprovalState::Approved
             })
             .map(|transaction| match transaction.kind {
                 TransactionKind::Income => transaction.amount.amount_minor,
@@ -569,6 +688,49 @@ impl AppLedgerService {
         )
     }
 
+    fn transaction_dto(&self, transaction: &Transaction) -> TransactionDto {
+        TransactionDto {
+            id: transaction.id.to_string(),
+            ledger_id: transaction.ledger_id.to_string(),
+            account_id: transaction.account_id.to_string(),
+            kind: match transaction.kind {
+                TransactionKind::Income => "income",
+                TransactionKind::Expense => "expense",
+                TransactionKind::Transfer => "transfer",
+            }
+            .to_string(),
+            amount_minor: transaction.amount.amount_minor,
+            currency: transaction.amount.currency.clone(),
+            description: transaction.description.clone(),
+            approval_state: approval_state_name(transaction.approval_state).to_string(),
+            created_by: self
+                .users
+                .get(&transaction.created_by)
+                .map(|user| user.display_name.clone())
+                .unwrap_or_else(|| transaction.created_by.to_string()),
+            created_by_user_id: transaction.created_by.to_string(),
+            occurred_at: format_time(transaction.occurred_at),
+        }
+    }
+
+    fn audit_dto(&self, audit: &AuditLog) -> AuditLogDto {
+        AuditLogDto {
+            id: audit.id.to_string(),
+            ledger_id: audit.ledger_id.to_string(),
+            actor_user_id: audit.actor_user_id.to_string(),
+            actor_display_name: self
+                .users
+                .get(&audit.actor_user_id)
+                .map(|user| user.display_name.clone())
+                .unwrap_or_else(|| audit.actor_user_id.to_string()),
+            action: audit.action.clone(),
+            resource_type: audit.resource_type.clone(),
+            resource_id: audit.resource_id.to_string(),
+            summary: audit.summary.clone(),
+            created_at: format_time(audit.created_at),
+        }
+    }
+
     fn ensure_mvp_seed_data(&mut self) {
         let Some(bob_id) = self
             .users
@@ -583,15 +745,17 @@ impl AppLedgerService {
             if let Some(membership) = self.memberships.iter_mut().find(|membership| {
                 membership.organization_id == organization_id && membership.user_id == bob_id
             }) {
-                membership.role = MembershipRole::Accountant;
+                membership.role = MembershipRole::Approver;
             } else {
                 self.memberships.push(Membership::new(
                     organization_id,
                     bob_id,
-                    MembershipRole::Accountant,
+                    MembershipRole::Approver,
                 ));
             }
         }
+
+        self.migrate_legacy_seeded_public_approval(bob_id);
 
         let has_bob_private_ledger = self
             .ledgers
@@ -622,6 +786,42 @@ impl AppLedgerService {
         self.ledgers.insert(bob_ledger.id, bob_ledger);
         self.accounts.insert(bob_wallet.id, bob_wallet);
         self.transactions.insert(bob_meal.id, bob_meal);
+    }
+
+    fn migrate_legacy_seeded_public_approval(&mut self, bob_id: Uuid) {
+        let Some((transaction_id, ledger_id)) = self
+            .transactions
+            .values_mut()
+            .find(|transaction| {
+                transaction.description == "办公用品采购"
+                    && transaction.kind == TransactionKind::Expense
+                    && transaction.amount.amount_minor == 86_000
+                    && transaction.approval_state == ApprovalState::Submitted
+                    && self
+                        .ledgers
+                        .get(&transaction.ledger_id)
+                        .is_some_and(|ledger| ledger.kind == LedgerKind::OrganizationPublic)
+                    && (transaction.submitted_by != Some(bob_id)
+                        || transaction.created_by != bob_id)
+            })
+            .map(|transaction| {
+                transaction.created_by = bob_id;
+                transaction.submitted_by = Some(bob_id);
+                transaction.updated_at = OffsetDateTime::now_utc();
+                (transaction.id, transaction.ledger_id)
+            })
+        else {
+            return;
+        };
+
+        for audit in self.audit_logs.iter_mut().filter(|audit| {
+            audit.ledger_id == ledger_id
+                && audit.resource_id == transaction_id
+                && audit.action == "transaction.submitted"
+                && audit.summary == "提交公账支出：办公用品采购"
+        }) {
+            audit.actor_user_id = bob_id;
+        }
     }
 }
 
@@ -658,36 +858,9 @@ fn user_dto(user: &User) -> UserDto {
     }
 }
 
-fn transaction_dto(transaction: &Transaction) -> TransactionDto {
-    TransactionDto {
-        id: transaction.id.to_string(),
-        ledger_id: transaction.ledger_id.to_string(),
-        account_id: transaction.account_id.to_string(),
-        kind: match transaction.kind {
-            TransactionKind::Income => "income",
-            TransactionKind::Expense => "expense",
-            TransactionKind::Transfer => "transfer",
-        }
-        .to_string(),
-        amount_minor: transaction.amount.amount_minor,
-        currency: transaction.amount.currency.clone(),
-        description: transaction.description.clone(),
-        approval_state: approval_state_name(transaction.approval_state).to_string(),
-        created_by: transaction.created_by.to_string(),
-        occurred_at: format_time(transaction.occurred_at),
-    }
-}
-
-fn audit_dto(audit: &AuditLog) -> AuditLogDto {
-    AuditLogDto {
-        id: audit.id.to_string(),
-        ledger_id: audit.ledger_id.to_string(),
-        actor_user_id: audit.actor_user_id.to_string(),
-        action: audit.action.clone(),
-        resource_type: audit.resource_type.clone(),
-        summary: audit.summary.clone(),
-        created_at: format_time(audit.created_at),
-    }
+fn normalize_decision_note(note: Option<String>) -> Option<String> {
+    note.map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn approval_state_name(state: ApprovalState) -> &'static str {
@@ -749,7 +922,7 @@ mod tests {
         assert!(overview
             .ledgers
             .iter()
-            .any(|ledger| { ledger.kind == "organization_public" && ledger.role == "accountant" }));
+            .any(|ledger| { ledger.kind == "organization_public" && ledger.role == "approver" }));
     }
 
     #[test]
@@ -833,9 +1006,342 @@ mod tests {
             .expect("create public transaction");
 
         assert_eq!(transaction.approval_state, "submitted");
+        assert_eq!(transaction.created_by, "Alice");
         assert_eq!(
             service.overview(service.current_user_id()).audit_logs.len(),
             2
         );
+    }
+
+    #[test]
+    fn pending_public_transaction_posts_only_after_approval() {
+        let mut service = AppLedgerService::seeded();
+        let overview = service.overview(service.current_user_id());
+        let public = overview
+            .ledgers
+            .iter()
+            .find(|ledger| ledger.kind == "organization_public")
+            .expect("seeded public ledger");
+        let public_account = overview
+            .accounts
+            .iter()
+            .find(|account| account.ledger_id == public.id)
+            .expect("seeded public account");
+        let pending = overview
+            .transactions
+            .iter()
+            .find(|transaction| transaction.approval_state == "submitted")
+            .expect("seeded pending transaction");
+
+        assert_eq!(pending.created_by, "Bob");
+        assert_eq!(public_account.balance_minor, 5_000_000);
+
+        let approved = service
+            .decide_approval(AppDecideApprovalInput {
+                actor_user_id: service.current_user_id(),
+                transaction_id: Uuid::parse_str(&pending.id).expect("uuid"),
+                decision: ApprovalDecision::Approve,
+                decision_note: None,
+            })
+            .expect("approve seeded transaction");
+        let overview = service.overview(service.current_user_id());
+        let public_account = overview
+            .accounts
+            .iter()
+            .find(|account| account.ledger_id == public.id)
+            .expect("seeded public account");
+
+        assert_eq!(approved.approval_state, "approved");
+        assert_eq!(public_account.balance_minor, 4_914_000);
+        assert_eq!(overview.pending_approval_count, 0);
+        assert!(overview
+            .audit_logs
+            .iter()
+            .any(|audit| audit.action == "transaction.approved"
+                && audit.actor_display_name == "Alice"));
+    }
+
+    #[test]
+    fn rejected_public_transaction_never_posts_to_balance() {
+        let mut service = AppLedgerService::seeded();
+        let overview = service.overview(service.current_user_id());
+        let public = overview
+            .ledgers
+            .iter()
+            .find(|ledger| ledger.kind == "organization_public")
+            .expect("seeded public ledger");
+        let public_account = overview
+            .accounts
+            .iter()
+            .find(|account| account.ledger_id == public.id)
+            .expect("seeded public account");
+        let pending = overview
+            .transactions
+            .iter()
+            .find(|transaction| transaction.approval_state == "submitted")
+            .expect("seeded pending transaction");
+
+        assert_eq!(public_account.balance_minor, 5_000_000);
+
+        let rejected = service
+            .decide_approval(AppDecideApprovalInput {
+                actor_user_id: service.current_user_id(),
+                transaction_id: Uuid::parse_str(&pending.id).expect("uuid"),
+                decision: ApprovalDecision::Reject,
+                decision_note: Some("票据不完整".to_string()),
+            })
+            .expect("reject seeded transaction");
+        let overview = service.overview(service.current_user_id());
+        let public_account = overview
+            .accounts
+            .iter()
+            .find(|account| account.ledger_id == public.id)
+            .expect("seeded public account");
+
+        assert_eq!(rejected.approval_state, "rejected");
+        assert_eq!(public_account.balance_minor, 5_000_000);
+        assert_eq!(overview.pending_approval_count, 0);
+        assert!(overview
+            .audit_logs
+            .iter()
+            .any(|audit| audit.action == "transaction.rejected"
+                && audit.actor_display_name == "Alice"
+                && audit.summary.contains("票据不完整")));
+    }
+
+    #[test]
+    fn seeded_approver_can_decide_owner_submitted_public_transaction() {
+        let mut service = AppLedgerService::seeded();
+        let alice_overview = service.overview(service.current_user_id());
+        let public = alice_overview
+            .ledgers
+            .iter()
+            .find(|ledger| ledger.kind == "organization_public")
+            .expect("seeded public ledger");
+        let account = alice_overview
+            .accounts
+            .iter()
+            .find(|account| account.ledger_id == public.id)
+            .expect("seeded public account");
+        let transaction = service
+            .create_transaction(AppCreateTransactionInput {
+                actor_user_id: service.current_user_id(),
+                ledger_id: Uuid::parse_str(&public.id).expect("uuid"),
+                account_id: Uuid::parse_str(&account.id).expect("uuid"),
+                kind: TransactionKind::Expense,
+                amount_minor: 3_300,
+                currency: "CNY".to_string(),
+                description: "差旅费".to_string(),
+            })
+            .expect("alice creates public transaction");
+        let bob = service
+            .users()
+            .into_iter()
+            .find(|user| user.display_name == "Bob")
+            .expect("seeded bob");
+        let bob_id = Uuid::parse_str(&bob.id).expect("uuid");
+
+        service.switch_user(bob_id).expect("switch to bob");
+        let approved = service
+            .decide_approval(AppDecideApprovalInput {
+                actor_user_id: bob_id,
+                transaction_id: Uuid::parse_str(&transaction.id).expect("uuid"),
+                decision: ApprovalDecision::Approve,
+                decision_note: None,
+            })
+            .expect("bob approves alice transaction");
+
+        assert_eq!(approved.approval_state, "approved");
+        assert!(service
+            .overview(bob_id)
+            .audit_logs
+            .iter()
+            .any(
+                |audit| audit.action == "transaction.approved" && audit.actor_display_name == "Bob"
+            ));
+    }
+
+    #[test]
+    fn member_can_view_public_ledger_but_not_audit_logs() {
+        let mut service = AppLedgerService::seeded();
+        let bob = service
+            .users()
+            .into_iter()
+            .find(|user| user.display_name == "Bob")
+            .expect("seeded bob");
+        let bob_id = Uuid::parse_str(&bob.id).expect("uuid");
+        for membership in service
+            .memberships
+            .iter_mut()
+            .filter(|membership| membership.user_id == bob_id)
+        {
+            membership.role = MembershipRole::Member;
+        }
+
+        let overview = service.overview(bob_id);
+
+        assert!(overview
+            .ledgers
+            .iter()
+            .any(|ledger| ledger.kind == "organization_public"));
+        assert!(overview.audit_logs.is_empty());
+    }
+
+    #[test]
+    fn reject_requires_a_reason() {
+        let mut service = AppLedgerService::seeded();
+        let overview = service.overview(service.current_user_id());
+        let pending = overview
+            .transactions
+            .iter()
+            .find(|transaction| transaction.approval_state == "submitted")
+            .expect("seeded pending transaction");
+
+        let result = service.decide_approval(AppDecideApprovalInput {
+            actor_user_id: service.current_user_id(),
+            transaction_id: Uuid::parse_str(&pending.id).expect("uuid"),
+            decision: ApprovalDecision::Reject,
+            decision_note: Some(" ".to_string()),
+        });
+
+        assert!(matches!(result, Err(AppServiceError::DecisionNoteRequired)));
+    }
+
+    #[test]
+    fn create_transaction_rejects_unsupported_transfer_and_currency_mismatch() {
+        let mut service = AppLedgerService::seeded();
+        let overview = service.overview(service.current_user_id());
+        let private = overview
+            .ledgers
+            .iter()
+            .find(|ledger| ledger.kind == "personal")
+            .expect("seeded private ledger");
+        let account = overview
+            .accounts
+            .iter()
+            .find(|account| account.ledger_id == private.id)
+            .expect("seeded private account");
+
+        let transfer = service.create_transaction(AppCreateTransactionInput {
+            actor_user_id: service.current_user_id(),
+            ledger_id: Uuid::parse_str(&private.id).expect("uuid"),
+            account_id: Uuid::parse_str(&account.id).expect("uuid"),
+            kind: TransactionKind::Transfer,
+            amount_minor: 1_000,
+            currency: "CNY".to_string(),
+            description: "转账".to_string(),
+        });
+        let currency_mismatch = service.create_transaction(AppCreateTransactionInput {
+            actor_user_id: service.current_user_id(),
+            ledger_id: Uuid::parse_str(&private.id).expect("uuid"),
+            account_id: Uuid::parse_str(&account.id).expect("uuid"),
+            kind: TransactionKind::Expense,
+            amount_minor: 1_000,
+            currency: "USD".to_string(),
+            description: "美元支出".to_string(),
+        });
+
+        assert!(matches!(
+            transfer,
+            Err(AppServiceError::UnsupportedTransactionKind)
+        ));
+        assert!(matches!(
+            currency_mismatch,
+            Err(AppServiceError::CurrencyMismatch)
+        ));
+    }
+
+    #[test]
+    fn submitter_cannot_decide_own_public_transaction() {
+        let mut service = AppLedgerService::seeded();
+        let overview = service.overview(service.current_user_id());
+        let public = overview
+            .ledgers
+            .iter()
+            .find(|ledger| ledger.kind == "organization_public")
+            .expect("seeded public ledger");
+        let account = overview
+            .accounts
+            .iter()
+            .find(|account| account.ledger_id == public.id)
+            .expect("seeded public account");
+        let transaction = service
+            .create_transaction(AppCreateTransactionInput {
+                actor_user_id: service.current_user_id(),
+                ledger_id: Uuid::parse_str(&public.id).expect("uuid"),
+                account_id: Uuid::parse_str(&account.id).expect("uuid"),
+                kind: TransactionKind::Expense,
+                amount_minor: 3_300,
+                currency: "CNY".to_string(),
+                description: "差旅费".to_string(),
+            })
+            .expect("bob creates public transaction");
+
+        let result = service.decide_approval(AppDecideApprovalInput {
+            actor_user_id: service.current_user_id(),
+            transaction_id: Uuid::parse_str(&transaction.id).expect("uuid"),
+            decision: ApprovalDecision::Approve,
+            decision_note: None,
+        });
+
+        assert!(matches!(result, Err(AppServiceError::SelfApprovalDenied)));
+    }
+
+    #[test]
+    fn load_or_seed_migrates_legacy_seeded_public_approval_submitter() {
+        let directory =
+            std::env::temp_dir().join(format!("cloudledger-service-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).expect("create temp dir");
+        let path = directory.join("ledger-state.json");
+
+        let mut service = AppLedgerService::seeded();
+        let alice_id = service.current_user_id();
+        let transaction_id = service
+            .transactions
+            .values_mut()
+            .find(|transaction| transaction.description == "办公用品采购")
+            .map(|transaction| {
+                transaction.created_by = alice_id;
+                transaction.submitted_by = Some(alice_id);
+                transaction.id
+            })
+            .expect("seeded office transaction");
+        for audit in service
+            .audit_logs
+            .iter_mut()
+            .filter(|audit| audit.resource_id == transaction_id)
+        {
+            audit.actor_user_id = alice_id;
+        }
+        service.save_to_path(&path).expect("save legacy state");
+
+        let mut migrated = AppLedgerService::load_or_seed(&path).expect("load migrated state");
+        let overview = migrated.overview(migrated.current_user_id());
+        let pending = overview
+            .transactions
+            .iter()
+            .find(|transaction| transaction.id == transaction_id.to_string())
+            .expect("pending transaction");
+
+        assert_eq!(pending.created_by, "Bob");
+        assert_eq!(
+            overview
+                .audit_logs
+                .iter()
+                .find(|audit| audit.action == "transaction.submitted")
+                .expect("submitted audit")
+                .actor_display_name,
+            "Bob"
+        );
+        migrated
+            .decide_approval(AppDecideApprovalInput {
+                actor_user_id: migrated.current_user_id(),
+                transaction_id,
+                decision: ApprovalDecision::Approve,
+                decision_note: None,
+            })
+            .expect("alice can approve migrated state");
+
+        fs::remove_dir_all(directory).expect("remove temp dir");
     }
 }

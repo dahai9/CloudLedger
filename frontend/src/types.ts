@@ -101,8 +101,10 @@ export interface ApprovalQueueItem {
   amountCents: number;
   direction: TransactionDirection;
   submittedBy: string;
+  submittedById: string;
   submittedAt: string;
   state: Extract<ApprovalState, "pending" | "rejected">;
+  canDecide: boolean;
 }
 
 export interface AuditLogEntry {
@@ -110,6 +112,7 @@ export interface AuditLogEntry {
   ledgerId: string;
   action: AuditAction;
   actorName: string;
+  resourceId: string;
   createdAt: string;
   summary: string;
 }

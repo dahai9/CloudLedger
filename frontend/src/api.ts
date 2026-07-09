@@ -37,6 +37,7 @@ export interface TransactionDto {
   description: string;
   approvalState: ApprovalState;
   createdBy: string;
+  createdByUserId: string;
   occurredAt: string;
 }
 
@@ -44,8 +45,10 @@ export interface AuditLogDto {
   id: string;
   ledgerId: string;
   actorUserId: string;
+  actorDisplayName: string;
   action: string;
   resourceType: string;
+  resourceId: string;
   summary: string;
   createdAt: string;
 }
@@ -71,6 +74,12 @@ export interface CreateTransactionInput {
   description: string;
 }
 
+export interface DecideApprovalInput {
+  transactionId: string;
+  decision: "approve" | "reject";
+  decisionNote?: string;
+}
+
 export async function loadOverview(): Promise<LedgerOverview> {
   return invoke<LedgerOverview>("get_overview");
 }
@@ -83,4 +92,10 @@ export async function createTransaction(
   input: CreateTransactionInput
 ): Promise<TransactionDto> {
   return invoke<TransactionDto>("create_transaction", { input });
+}
+
+export async function decideApproval(
+  input: DecideApprovalInput
+): Promise<TransactionDto> {
+  return invoke<TransactionDto>("decide_approval", { input });
 }

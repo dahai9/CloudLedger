@@ -1,7 +1,8 @@
 use std::{path::PathBuf, sync::Mutex};
 
 use cloudledger_service::{
-    AppCreateTransactionInput, AppLedgerService, AppServiceError, LedgerOverview, TransactionDto,
+    AppCreateTransactionInput, AppDecideApprovalInput, AppLedgerService, AppServiceError,
+    LedgerOverview, TransactionDto,
 };
 use tauri::{Manager, State};
 
@@ -54,6 +55,23 @@ fn create_transaction(
     Ok(transaction)
 }
 
+#[tauri::command]
+fn decide_approval(
+    state: State<'_, AppState>,
+    mut input: AppDecideApprovalInput,
+) -> Result<TransactionDto, String> {
+    let mut service = state
+        .ledger_service
+        .lock()
+        .map_err(|_| "ledger service lock poisoned".to_string())?;
+    input.actor_user_id = service.current_user_id();
+    let transaction = service.decide_approval(input).map_err(service_error)?;
+    service
+        .save_to_path(&state.storage_path)
+        .map_err(service_error)?;
+    Ok(transaction)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -70,7 +88,8 @@ pub fn run() {
             health,
             get_overview,
             switch_user,
-            create_transaction
+            create_transaction,
+            decide_approval
         ])
         .run(tauri::generate_context!())
         .expect("error while running CloudLedger");

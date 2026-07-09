@@ -46,6 +46,7 @@ fn can_perform_personal(ctx: &AuthorizationContext<'_>, action: Action) -> bool 
             | Action::VoidTransaction
             | Action::ExportLedger
             | Action::ManageAccounts
+            | Action::ViewAuditLog
     )
 }
 

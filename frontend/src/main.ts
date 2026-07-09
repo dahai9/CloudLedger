@@ -12,7 +12,7 @@ import type {
 } from "./types";
 
 type ViewMode = "activity" | "approval" | "audit";
-type TransactionFilter = "all" | "pending" | "approved";
+type TransactionFilter = "all" | "pending" | "approved" | "rejected";
 
 interface QuickEntryForm {
   direction: TransactionDirection;
@@ -31,6 +31,7 @@ interface AppState {
   activeUserId?: string;
   cloudStatus: UserSession["cloudStatus"];
   loading: boolean;
+  pendingAction?: string;
   error?: string;
   view: ViewMode;
   filter: TransactionFilter;
@@ -95,7 +96,7 @@ async function loadInitialState() {
     resetFormForDashboard();
     state.error = undefined;
   } catch (error) {
-    state.error = error instanceof Error ? error.message : "加载失败";
+    state.error = friendlyError(error, "加载失败");
   } finally {
     state.loading = false;
     render();
@@ -125,7 +126,7 @@ async function switchUser(userId: string) {
     resetFormForDashboard();
     state.error = undefined;
   } catch (error) {
-    state.error = error instanceof Error ? error.message : "切换账号失败";
+    state.error = friendlyError(error, "切换账号失败");
   } finally {
     state.loading = false;
     render();
@@ -143,7 +144,7 @@ async function switchLedger(ledgerId: string) {
     resetFormForDashboard();
     state.error = undefined;
   } catch (error) {
-    state.error = error instanceof Error ? error.message : "切换账本失败";
+    state.error = friendlyError(error, "切换账本失败");
   } finally {
     state.loading = false;
     render();
@@ -155,6 +156,8 @@ async function refreshDashboard() {
     return;
   }
 
+  const session = await cloudLedgerApi.getUserSession();
+  state.cloudStatus = session.cloudStatus;
   state.dashboard = await cloudLedgerApi.getLedgerDashboard(state.activeLedgerId);
   resetFormForDashboard({ preserveAmount: true });
 }
@@ -302,7 +305,7 @@ function renderBalancePanel(dashboard: LedgerDashboard) {
         <span class="context-pill">${ledger.pendingCount} 待审</span>
         <span class="context-pill">${ledger.auditUnreadCount} 审计</span>
       </div>
-      <p class="sync-line">同步 ${formatDate(ledger.lastSyncedAt)}</p>
+      <p class="sync-line">最近流水 ${formatDate(ledger.lastSyncedAt)}</p>
     </section>
   `;
 }
@@ -375,13 +378,18 @@ function renderQuickEntry(dashboard: LedgerDashboard) {
       </label>
 
       <label class="approval-toggle">
-        <input id="approvalToggle" type="checkbox" ${form.submitForApproval ? "checked" : ""} />
-        <span>提交审批</span>
+        <input
+          id="approvalToggle"
+          type="checkbox"
+          ${dashboard.ledger.kind === "organization" ? "checked disabled" : ""}
+          ${dashboard.ledger.kind !== "organization" && form.submitForApproval ? "checked" : ""}
+        />
+        <span>${dashboard.ledger.kind === "organization" ? "公账自动审批" : "提交审批"}</span>
       </label>
 
-      <button class="primary-button" type="submit">
+      <button class="primary-button" type="submit" ${state.loading ? "disabled" : ""}>
         <span aria-hidden="true">+</span>
-        保存流水
+        ${state.pendingAction === "create" ? "保存中" : "保存流水"}
       </button>
     </form>
   `;
@@ -426,6 +434,10 @@ function renderTransactionList(dashboard: LedgerDashboard) {
       return transaction.approvalState === "approved";
     }
 
+    if (state.filter === "rejected") {
+      return transaction.approvalState === "rejected";
+    }
+
     return true;
   });
 
@@ -440,6 +452,7 @@ function renderTransactionList(dashboard: LedgerDashboard) {
           ${renderFilterButton("all", "全部")}
           ${renderFilterButton("pending", "待审")}
           ${renderFilterButton("approved", "已入账")}
+          ${renderFilterButton("rejected", "驳回")}
         </div>
       </div>
       <div class="transaction-list">
@@ -512,25 +525,55 @@ function renderApprovalPanel(dashboard: LedgerDashboard) {
         ${
           dashboard.approvalQueue.length > 0
             ? dashboard.approvalQueue
-                .map(
-                  (item) => `
-                    <article class="approval-row">
-                      <div>
-                        <h3>${escapeHtml(item.title)}</h3>
-                        <p>${escapeHtml(item.submittedBy)} · ${formatDate(item.submittedAt)}</p>
-                      </div>
-                      <strong>${item.direction === "expense" ? "-" : "+"}${formatMoney(
-                        item.amountCents,
-                        dashboard.ledger.currency,
-                      )}</strong>
-                    </article>
-                  `,
-                )
+                .map((item) => renderApprovalRow(item, dashboard.ledger.currency))
                 .join("")
             : `<p class="empty-copy">暂无待审批流水</p>`
         }
       </div>
     </section>
+  `;
+}
+
+function renderApprovalRow(item: LedgerDashboard["approvalQueue"][number], currency: string) {
+  const signedAmount = `${item.direction === "expense" ? "-" : "+"}${formatMoney(item.amountCents, currency)}`;
+  const processing = state.pendingAction === item.transactionId;
+  const disabled = state.loading ? "disabled" : "";
+  const decisionControls = item.canDecide
+    ? `
+      <div class="approval-actions">
+        <button
+          class="secondary-button"
+          type="button"
+          data-approval-transaction-id="${escapeHtml(item.transactionId)}"
+          data-approval-decision="approve"
+          ${disabled}
+        >
+          ${processing ? "处理中" : "批准"}
+        </button>
+        <button
+          class="danger-button"
+          type="button"
+          data-approval-transaction-id="${escapeHtml(item.transactionId)}"
+          data-approval-decision="reject"
+          ${disabled}
+        >
+          驳回
+        </button>
+      </div>
+    `
+    : `<p class="approval-note">仅审批人或所有者可处理，且不能审批自己提交的流水</p>`;
+
+  return `
+    <article class="approval-row">
+      <div class="approval-main">
+        <div>
+          <h3>${escapeHtml(item.title)}</h3>
+          <p>${escapeHtml(item.submittedBy)} · ${formatDate(item.submittedAt)}</p>
+        </div>
+        <strong>${signedAmount}</strong>
+      </div>
+      ${decisionControls}
+    </article>
   `;
 }
 
@@ -557,6 +600,7 @@ function renderAuditPanel(dashboard: LedgerDashboard) {
                         <p>${escapeHtml(item.actorName)} · ${auditActionLabel(item.action)} · ${formatDate(
                           item.createdAt,
                         )}</p>
+                        <p>资源 #${escapeHtml(item.resourceId.slice(0, 8))}</p>
                       </div>
                     </article>
                   `,
@@ -662,6 +706,11 @@ function bindEvents() {
   });
 
   app.querySelector<HTMLInputElement>("#approvalToggle")?.addEventListener("change", (event) => {
+    if (state.dashboard?.ledger.kind === "organization") {
+      state.form.submitForApproval = true;
+      render();
+      return;
+    }
     const target = event.currentTarget as HTMLInputElement;
     state.form.submitForApproval = target.checked;
   });
@@ -689,9 +738,49 @@ function bindEvents() {
     });
   });
 
+  app.querySelectorAll<HTMLButtonElement>("[data-approval-decision]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const transactionId = button.dataset.approvalTransactionId;
+      const decision = button.dataset.approvalDecision;
+      if ((decision === "approve" || decision === "reject") && transactionId) {
+        void decideApproval(transactionId, decision);
+      }
+    });
+  });
+
   app.querySelector<HTMLButtonElement>("#retryButton")?.addEventListener("click", () => {
     void loadInitialState();
   });
+}
+
+async function decideApproval(transactionId: string, decision: "approve" | "reject") {
+  if (state.pendingAction) {
+    return;
+  }
+
+  const decisionNote =
+    decision === "reject" ? window.prompt("请输入驳回原因")?.trim() : undefined;
+  if (decision === "reject" && !decisionNote) {
+    showToast("请输入驳回原因");
+    return;
+  }
+
+  try {
+    state.loading = true;
+    state.pendingAction = transactionId;
+    render();
+    await cloudLedgerApi.decideApproval(transactionId, decision, decisionNote);
+    await refreshDashboard();
+    state.view = "activity";
+    state.filter = decision === "approve" ? "approved" : "rejected";
+    showToast(decision === "approve" ? "已批准入账" : "已驳回流水");
+  } catch (error) {
+    showToast(friendlyError(error, "审批失败"));
+  } finally {
+    state.loading = false;
+    state.pendingAction = undefined;
+    render();
+  }
 }
 
 async function submitQuickEntry() {
@@ -714,10 +803,13 @@ async function submitQuickEntry() {
     accountId: state.form.accountId,
     categoryId: state.form.categoryId,
     memo: state.form.memo.trim() || undefined,
-    submitForApproval: state.form.submitForApproval,
+    submitForApproval: dashboard.ledger.kind === "organization" || state.form.submitForApproval,
   };
 
   try {
+    state.loading = true;
+    state.pendingAction = "create";
+    render();
     await cloudLedgerApi.createTransaction(draft);
     state.form.amount = "";
     state.form.memo = "";
@@ -725,7 +817,11 @@ async function submitQuickEntry() {
     state.view = "activity";
     showToast(state.form.submitForApproval ? "已提交审批" : "已保存流水");
   } catch (error) {
-    showToast(error instanceof Error ? error.message : "保存失败");
+    showToast(friendlyError(error, "保存失败"));
+  } finally {
+    state.loading = false;
+    state.pendingAction = undefined;
+    render();
   }
 }
 
@@ -738,6 +834,34 @@ function showToast(message: string) {
       render();
     }
   }, 2200);
+}
+
+function friendlyError(error: unknown, fallback: string) {
+  const message = error instanceof Error ? error.message : String(error || fallback);
+
+  if (message.includes("rejection reason is required")) {
+    return "请输入驳回原因";
+  }
+  if (message.includes("submitter cannot approve")) {
+    return "不能审批自己提交的流水";
+  }
+  if (message.includes("not pending approval")) {
+    return "这笔流水已不在待审批状态";
+  }
+  if (message.includes("not authorized")) {
+    return "当前账号没有权限执行此操作";
+  }
+  if (message.includes("currency must match")) {
+    return "流水币种必须和账户币种一致";
+  }
+  if (message.includes("transfer transactions are not supported")) {
+    return "当前 MVP 暂不支持转账流水";
+  }
+  if (message.includes("transaction was not found")) {
+    return "流水不存在或已被移除";
+  }
+
+  return message || fallback;
 }
 
 function parseAmountToCents(value: string): number | undefined {

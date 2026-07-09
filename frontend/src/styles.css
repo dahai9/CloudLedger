@@ -452,8 +452,8 @@ button {
 
 .filter-tabs {
   display: grid;
-  grid-template-columns: repeat(3, minmax(48px, 1fr));
-  width: min(186px, 48vw);
+  grid-template-columns: repeat(4, minmax(42px, 1fr));
+  width: min(248px, 58vw);
   gap: 4px;
   padding: 4px;
   border-radius: 8px;
@@ -496,7 +496,7 @@ button {
 
 .row-main,
 .row-meta,
-.approval-row {
+.approval-main {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -504,7 +504,7 @@ button {
 }
 
 .row-main > div,
-.approval-row > div,
+.approval-main > div,
 .audit-row > div {
   min-width: 0;
 }
@@ -526,7 +526,7 @@ button {
 
 .amount-out,
 .amount-in,
-.approval-row strong {
+.approval-main strong {
   flex: 0 0 auto;
   font-size: 15px;
   white-space: nowrap;
@@ -566,8 +566,48 @@ button {
 }
 
 .approval-row {
-  min-height: 72px;
+  display: grid;
+  gap: 12px;
   padding: 12px;
+}
+
+.approval-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.secondary-button,
+.danger-button {
+  min-height: 44px;
+  border-radius: 8px;
+  font-weight: 900;
+}
+
+.secondary-button {
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.danger-button {
+  background: var(--coral-soft);
+  color: var(--coral);
+}
+
+.primary-button:disabled,
+.secondary-button:disabled,
+.danger-button:disabled,
+.switcher-button:disabled,
+.filter-tab:disabled,
+.nav-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.approval-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .audit-row {

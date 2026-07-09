@@ -92,6 +92,7 @@ development and smoke testing.
   - `get_overview`
   - `switch_user`
   - `create_transaction`
+  - `decide_approval`
 - Server routes currently planned:
   - `GET /health`
   - `GET /ready`
@@ -135,12 +136,25 @@ nix develop path:. -c npm run tauri:android:build -- --debug --target aarch64
   organization membership.
 - Tauri command creation no longer trusts a renderer-provided actor user ID;
   it injects the current Rust-side session user before authorization.
+- Public-ledger transactions now enter a real approval flow: pending entries do
+  not affect posted balances, eligible approvers can approve or reject them,
+  submitters cannot approve their own entries, rejection requires a reason, and
+  every decision writes an audit log entry with the transaction resource ID.
+- The seeded Acme organization now supports two-way MVP approval validation:
+  Alice is the owner and Bob is an approver, so either user's public-ledger
+  submission can be decided by the other user instead of getting stuck.
+- Audit logs are returned only when the actor has `ViewAuditLog` permission for
+  that ledger. Member-level public-ledger users can still see the public ledger
+  without receiving the audit trail.
+- MVP transaction creation rejects unsupported transfer entries and currency
+  mismatches between the transaction and selected account, keeping posted
+  balances deterministic.
 - Local Android state is persisted at the Tauri app data path as
   `ledger-state.json`, with schema versioning, atomic replacement, and a
   `ledger-state.json.bak` recovery copy.
 - The frontend shows dev-cloud status from
   `VITE_CLOUDLEDGER_CLOUD_URL`, defaulting to
-  `http://192.168.1.229:8787` for the current LAN test setup. The app checks
+  `http://192.168.1.32:8787` for the current LAN test setup. The app checks
   `/ready` and displays a short server ID so the active development cloud can
   be identified from the phone.
 - The development server persists its cloud identity under
@@ -150,8 +164,8 @@ nix develop path:. -c npm run tauri:android:build -- --debug --target aarch64
   phone. The validated debug artifact path is
   `src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`.
 - The current phone/LAN validation target is developer machine
-  `192.168.1.229:8787` and test phone `192.168.1.14`. Phone-side ADB curl to
-  `/health` succeeds.
+  `192.168.1.32:8787` and test phone `192.168.1.28`. Phone-side ADB curl to
+  `/ready` succeeds.
 
 ## Assumptions
 
