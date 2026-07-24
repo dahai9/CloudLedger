@@ -1,8 +1,15 @@
+pub mod admin;
+pub mod app_api;
 pub mod auth;
+pub mod auth_routes;
 pub mod state;
 pub mod sync;
 
-use axum::{extract::State, routing::get, Json, Router};
+use axum::{
+    extract::State,
+    routing::{get, post},
+    Json, Router,
+};
 use serde::Serialize;
 pub use state::ServerState;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -30,9 +37,23 @@ pub fn router(state: ServerState) -> Router {
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/sync/ping", get(sync::sync_ping))
+        .route("/auth/login", post(auth_routes::login))
+        .route("/auth/refresh", post(auth_routes::refresh))
+        .route(
+            "/auth/me",
+            get(auth_routes::me).patch(auth_routes::update_me),
+        )
+        .route("/auth/logout", post(auth_routes::logout))
+        .route("/app/overview", get(app_api::overview))
+        .route("/app/transactions", post(app_api::create_transaction))
+        .route("/app/approvals/decide", post(app_api::decide_approval))
         .with_state(state)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
+}
+
+pub fn admin_router(state: ServerState) -> Router {
+    admin::router(state).layer(TraceLayer::new_for_http())
 }
 
 async fn health() -> Json<HealthResponse> {

@@ -26,19 +26,6 @@ fn get_overview(state: State<'_, AppState>) -> Result<LedgerOverview, String> {
 }
 
 #[tauri::command]
-fn switch_user(state: State<'_, AppState>, user_id: uuid::Uuid) -> Result<LedgerOverview, String> {
-    let mut service = state
-        .ledger_service
-        .lock()
-        .map_err(|_| "ledger service lock poisoned".to_string())?;
-    let overview = service.switch_user(user_id).map_err(service_error)?;
-    service
-        .save_to_path(&state.storage_path)
-        .map_err(service_error)?;
-    Ok(overview)
-}
-
-#[tauri::command]
 fn create_transaction(
     state: State<'_, AppState>,
     mut input: AppCreateTransactionInput,
@@ -87,7 +74,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             health,
             get_overview,
-            switch_user,
             create_transaction,
             decide_approval
         ])

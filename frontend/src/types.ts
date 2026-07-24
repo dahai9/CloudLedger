@@ -38,6 +38,8 @@ export interface Ledger {
 export interface UserAccount {
   id: string;
   displayName: string;
+  email?: string;
+  phone?: string;
 }
 
 export interface CloudStatus {
@@ -48,8 +50,23 @@ export interface CloudStatus {
 
 export interface UserSession {
   currentUser: UserAccount;
-  users: UserAccount[];
   cloudStatus: CloudStatus;
+}
+
+export interface AuthSession {
+  user: UserAccount;
+  accessToken: string;
+  refreshToken: string;
+  installationId: string;
+}
+
+export interface LoginDraft {
+  identifier: string;
+  password: string;
+}
+
+export interface UpdateProfileDraft {
+  displayName: string;
 }
 
 export interface FinancialAccount {

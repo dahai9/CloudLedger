@@ -55,7 +55,6 @@ export interface AuditLogDto {
 
 export interface LedgerOverview {
   currentUser: UserDto;
-  users: UserDto[];
   ledgers: LedgerDto[];
   accounts: AccountDto[];
   transactions: TransactionDto[];
@@ -82,10 +81,6 @@ export interface DecideApprovalInput {
 
 export async function loadOverview(): Promise<LedgerOverview> {
   return invoke<LedgerOverview>("get_overview");
-}
-
-export async function switchUser(userId: string): Promise<LedgerOverview> {
-  return invoke<LedgerOverview>("switch_user", { userId });
 }
 
 export async function createTransaction(

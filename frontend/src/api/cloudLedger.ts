@@ -1,29 +1,26 @@
-import {
-  createTransaction as invokeCreateTransaction,
-  decideApproval as invokeDecideApproval,
-  loadOverview,
-  switchUser as invokeSwitchUser,
-  type AccountDto,
-  type AuditLogDto,
-  type LedgerDto,
-  type LedgerOverview,
-  type TransactionDto,
-} from "../api";
+import type { AccountDto, AuditLogDto, LedgerDto, LedgerOverview, TransactionDto } from "../api";
 import type {
   ApprovalQueueItem,
+  AuthSession,
   AuditLogEntry,
   Category,
   FinancialAccount,
   Ledger,
   LedgerDashboard,
+  LoginDraft,
   NewTransactionDraft,
   Transaction,
+  UpdateProfileDraft,
   UserSession,
 } from "../types";
 
 export interface CloudLedgerApi {
+  getStoredSession(): AuthSession | undefined;
+  login(input: LoginDraft): Promise<UserSession>;
+  updateProfile(input: UpdateProfileDraft): Promise<UserSession>;
+  logout(): Promise<void>;
   getUserSession(): Promise<UserSession>;
-  switchUser(userId: string): Promise<void>;
+  checkCloudStatus(): Promise<UserSession["cloudStatus"]>;
   listLedgers(): Promise<Ledger[]>;
   getLedgerDashboard(ledgerId: string): Promise<LedgerDashboard>;
   createTransaction(draft: NewTransactionDraft): Promise<Transaction>;
@@ -34,36 +31,91 @@ export interface CloudLedgerApi {
   ): Promise<Transaction>;
   listApprovalQueue(ledgerId: string): Promise<ApprovalQueueItem[]>;
   listAuditTrail(ledgerId: string): Promise<AuditLogEntry[]>;
+  isAuthRequired(error: unknown): boolean;
 }
 
-declare global {
-  interface Window {
-    __TAURI_INTERNALS__?: unknown;
+let overviewCache: LedgerOverview | undefined;
+const cloudBaseUrl = import.meta.env.VITE_CLOUDLEDGER_CLOUD_URL ?? "http://192.168.1.229:8787";
+const sessionStorageKey = "cloudledger.session";
+const installationStorageKey = "cloudledger.installationId";
+
+class AuthRequiredError extends Error {
+  constructor(message = "请先登录") {
+    super(message);
+    this.name = "AuthRequiredError";
   }
 }
 
-const isTauriRuntime = () => typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
-
-let overviewCache: LedgerOverview | undefined;
-const cloudBaseUrl = import.meta.env.VITE_CLOUDLEDGER_CLOUD_URL ?? "http://192.168.1.32:8787";
-
 const getOverview = async () => {
-  overviewCache = await loadOverview();
+  overviewCache = await authenticatedJson<LedgerOverview>("/app/overview");
   return overviewCache;
 };
 
-const commandApi: CloudLedgerApi = {
-  async getUserSession() {
-    const overview = await getOverview();
+const serverApi: CloudLedgerApi = {
+  getStoredSession() {
+    return loadStoredSession();
+  },
+
+  async login(input) {
+    const session = await authJson("/auth/login", authPayload(input));
+    storeSession(session);
+    overviewCache = undefined;
     return {
-      currentUser: overview.currentUser,
-      users: overview.users,
+      currentUser: session.user,
       cloudStatus: await fetchCloudStatus(),
     };
   },
 
-  async switchUser(userId) {
-    overviewCache = await invokeSwitchUser(userId);
+  async updateProfile(input) {
+    const me = await authenticatedJson<{ user: AuthSession["user"]; installationId: string }>(
+      "/auth/me",
+      {
+        method: "PATCH",
+        body: { displayName: input.displayName.trim() },
+      },
+    );
+    const session = loadStoredSession();
+    if (session) {
+      storeSession({
+        ...session,
+        user: me.user,
+        installationId: me.installationId,
+      });
+    }
+    overviewCache = undefined;
+    return {
+      currentUser: me.user,
+      cloudStatus: await fetchCloudStatus(),
+    };
+  },
+
+  async logout() {
+    try {
+      await authenticatedJson("/auth/logout", { method: "POST", empty: true });
+    } catch (error) {
+      if (!serverApi.isAuthRequired(error)) {
+        throw error;
+      }
+    } finally {
+      clearSession();
+      overviewCache = undefined;
+    }
+  },
+
+  async getUserSession() {
+    const session = loadStoredSession();
+    if (!session) {
+      throw new AuthRequiredError();
+    }
+    const me = await authenticatedJson<{ user: AuthSession["user"]; installationId: string }>("/auth/me");
+    return {
+      currentUser: me.user,
+      cloudStatus: await fetchCloudStatus(),
+    };
+  },
+
+  async checkCloudStatus() {
+    return fetchCloudStatus();
   },
 
   async listLedgers() {
@@ -81,13 +133,16 @@ const commandApi: CloudLedgerApi = {
     const account = overview.accounts.find((item) => item.id === draft.accountId);
     const category = categoryFromDraft(draft, overview);
     const ledger = overview.ledgers.find((item) => item.id === draft.ledgerId);
-    const created = await invokeCreateTransaction({
-      ledgerId: draft.ledgerId,
-      accountId: draft.accountId,
-      kind: draft.direction,
-      amountMinor: draft.amountCents,
-      currency: account?.currency ?? "CNY",
-      description: draft.memo?.trim() || category?.name || ledger?.name || "未命名流水",
+    const created = await authenticatedJson<TransactionDto>("/app/transactions", {
+      method: "POST",
+      body: {
+        ledgerId: draft.ledgerId,
+        accountId: draft.accountId,
+        kind: draft.direction,
+        amountMinor: draft.amountCents,
+        currency: account?.currency ?? "CNY",
+        description: draft.memo?.trim() || category?.name || ledger?.name || "未命名流水",
+      },
     });
 
     overviewCache = undefined;
@@ -96,7 +151,10 @@ const commandApi: CloudLedgerApi = {
 
   async decideApproval(transactionId, decision, decisionNote) {
     const overview = overviewCache ?? (await getOverview());
-    const decided = await invokeDecideApproval({ transactionId, decision, decisionNote });
+    const decided = await authenticatedJson<TransactionDto>("/app/approvals/decide", {
+      method: "POST",
+      body: { transactionId, decision, decisionNote },
+    });
     overviewCache = undefined;
     return mapTransaction(decided, overview);
   },
@@ -110,7 +168,155 @@ const commandApi: CloudLedgerApi = {
     const overview = await getOverview();
     return overview.auditLogs.filter((item) => item.ledgerId === ledgerId).map(mapAuditLog);
   },
+
+  isAuthRequired(error) {
+    return error instanceof AuthRequiredError;
+  },
 };
+
+interface JsonRequestOptions {
+  method?: "GET" | "POST" | "PATCH";
+  body?: unknown;
+  empty?: boolean;
+}
+
+function authPayload(input: LoginDraft) {
+  const identifier = input.identifier.trim();
+  const isEmail = identifier.includes("@");
+
+  return {
+    email: isEmail ? identifier : undefined,
+    phone: isEmail ? undefined : identifier,
+    password: input.password,
+    installationId: getInstallationId(),
+  };
+}
+
+async function authJson(path: string, body: unknown): Promise<AuthSession> {
+  const response = await fetch(`${cloudBaseUrl}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw await responseError(response);
+  }
+  return normalizeSession((await response.json()) as AuthSession);
+}
+
+async function authenticatedJson<T>(
+  path: string,
+  options: JsonRequestOptions = {},
+  allowRefresh = true,
+): Promise<T> {
+  const session = loadStoredSession();
+  if (!session) {
+    throw new AuthRequiredError();
+  }
+
+  const response = await fetch(`${cloudBaseUrl}${path}`, {
+    method: options.method ?? "GET",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: options.body ? JSON.stringify(options.body) : undefined,
+  });
+
+  if (response.status === 401 && allowRefresh) {
+    await refreshStoredSession(session);
+    return authenticatedJson<T>(path, options, false);
+  }
+
+  if (!response.ok) {
+    if (response.status === 401) {
+      clearSession();
+      throw new AuthRequiredError();
+    }
+    throw await responseError(response);
+  }
+
+  if (options.empty || response.status === 204) {
+    return undefined as T;
+  }
+
+  return response.json() as Promise<T>;
+}
+
+async function refreshStoredSession(session: AuthSession) {
+  const response = await fetch(`${cloudBaseUrl}/auth/refresh`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      refreshToken: session.refreshToken,
+      installationId: session.installationId,
+    }),
+  });
+
+  if (!response.ok) {
+    clearSession();
+    throw new AuthRequiredError();
+  }
+
+  storeSession(normalizeSession((await response.json()) as AuthSession));
+}
+
+async function responseError(response: Response) {
+  const body = (await response.json().catch(() => ({}))) as { error?: string };
+  return new Error(body.error || `HTTP ${response.status}`);
+}
+
+function loadStoredSession(): AuthSession | undefined {
+  const raw = window.localStorage.getItem(sessionStorageKey);
+  if (!raw) {
+    return undefined;
+  }
+
+  try {
+    return normalizeSession(JSON.parse(raw) as AuthSession);
+  } catch {
+    clearSession();
+    return undefined;
+  }
+}
+
+function storeSession(session: AuthSession) {
+  window.localStorage.setItem(sessionStorageKey, JSON.stringify(normalizeSession(session)));
+}
+
+function clearSession() {
+  window.localStorage.removeItem(sessionStorageKey);
+}
+
+function normalizeSession(session: AuthSession): AuthSession {
+  if (!session.accessToken || !session.refreshToken || !session.installationId || !session.user?.id) {
+    throw new AuthRequiredError("登录状态无效");
+  }
+
+  return {
+    ...session,
+    user: {
+      id: String(session.user.id),
+      displayName: session.user.displayName,
+      email: session.user.email,
+      phone: session.user.phone,
+    },
+  };
+}
+
+function getInstallationId() {
+  const existing = window.localStorage.getItem(installationStorageKey);
+  if (existing) {
+    return existing;
+  }
+
+  const created =
+    typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `install_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  window.localStorage.setItem(installationStorageKey, created);
+  return created;
+}
 
 const nowIso = () => new Date().toISOString();
 
@@ -288,19 +494,42 @@ let mockAuditTrail: AuditLogEntry[] = [
 ];
 
 const mockApi: CloudLedgerApi = {
-  async getUserSession() {
+  getStoredSession() {
     return {
-      currentUser: { id: "demo-user", displayName: "Alice" },
-      users: [
-        { id: "demo-user", displayName: "Alice" },
-        { id: "demo-bob", displayName: "Bob" },
-      ],
+      user: { id: "demo-user", displayName: "Alice" },
+      accessToken: "mock-access",
+      refreshToken: "mock-refresh",
+      installationId: "mock-installation",
+    };
+  },
+
+  async login(input) {
+    return {
+      currentUser: { id: "demo-user", displayName: input.identifier.trim() || "Alice" },
       cloudStatus: await fetchCloudStatus(),
     };
   },
 
-  async switchUser() {
+  async updateProfile(input) {
+    return {
+      currentUser: { id: "demo-user", displayName: input.displayName.trim() || "Alice" },
+      cloudStatus: await fetchCloudStatus(),
+    };
+  },
+
+  async logout() {
     return undefined;
+  },
+
+  async getUserSession() {
+    return {
+      currentUser: { id: "demo-user", displayName: "Alice" },
+      cloudStatus: await fetchCloudStatus(),
+    };
+  },
+
+  async checkCloudStatus() {
+    return fetchCloudStatus();
   },
 
   async listLedgers() {
@@ -415,9 +644,14 @@ const mockApi: CloudLedgerApi = {
   async listAuditTrail(ledgerId) {
     return mockAuditTrail.filter((item) => item.ledgerId === ledgerId);
   },
+
+  isAuthRequired() {
+    return false;
+  },
 };
 
-export const cloudLedgerApi: CloudLedgerApi = isTauriRuntime() ? commandApi : mockApi;
+export const cloudLedgerApi: CloudLedgerApi =
+  import.meta.env.VITE_CLOUDLEDGER_USE_MOCK === "1" ? mockApi : serverApi;
 
 function mapDashboard(ledgerId: string, overview: LedgerOverview): LedgerDashboard {
   const ledgerDto = overview.ledgers.find((item) => item.id === ledgerId) ?? overview.ledgers[0];

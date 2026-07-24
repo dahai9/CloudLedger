@@ -5,14 +5,17 @@ import type {
   Category,
   Ledger,
   LedgerDashboard,
+  LoginDraft,
   NewTransactionDraft,
   TransactionDirection,
+  UpdateProfileDraft,
   UserAccount,
   UserSession,
 } from "./types";
 
 type ViewMode = "activity" | "approval" | "audit";
 type TransactionFilter = "all" | "pending" | "approved" | "rejected";
+type AuthStatus = "checking" | "authenticated" | "anonymous";
 
 interface QuickEntryForm {
   direction: TransactionDirection;
@@ -23,12 +26,23 @@ interface QuickEntryForm {
   submitForApproval: boolean;
 }
 
+interface AuthForm {
+  identifier: string;
+  password: string;
+}
+
+interface ProfileForm {
+  displayName: string;
+}
+
 interface AppState {
-  users: UserAccount[];
+  authStatus: AuthStatus;
+  userMenuOpen: boolean;
+  profileEditing: boolean;
   ledgers: Ledger[];
   dashboard?: LedgerDashboard;
   activeLedgerId?: string;
-  activeUserId?: string;
+  currentUser?: UserAccount;
   cloudStatus: UserSession["cloudStatus"];
   loading: boolean;
   pendingAction?: string;
@@ -36,6 +50,8 @@ interface AppState {
   view: ViewMode;
   filter: TransactionFilter;
   form: QuickEntryForm;
+  authForm: AuthForm;
+  profileForm: ProfileForm;
   toast?: string;
 }
 
@@ -48,7 +64,9 @@ if (!appRoot) {
 const app = appRoot;
 
 const state: AppState = {
-  users: [],
+  authStatus: "checking",
+  userMenuOpen: false,
+  profileEditing: false,
   ledgers: [],
   cloudStatus: {
     state: "checking",
@@ -65,6 +83,13 @@ const state: AppState = {
     memo: "",
     submitForApproval: false,
   },
+  authForm: {
+    identifier: "",
+    password: "",
+  },
+  profileForm: {
+    displayName: "",
+  },
 };
 
 const moneyFormatterCache = new Map<string, Intl.NumberFormat>();
@@ -74,8 +99,47 @@ const dateFormatter = new Intl.DateTimeFormat("zh-CN", {
   hour: "2-digit",
   minute: "2-digit",
 });
+const autoRefreshMs = 10_000;
+let autoRefreshInFlight = false;
 
 void loadInitialState();
+window.setInterval(() => {
+  if (shouldAutoRefresh()) {
+    void refreshRemoteState({ silent: true });
+  }
+}, autoRefreshMs);
+
+window.addEventListener("focus", () => {
+  if (state.authStatus === "authenticated") {
+    void refreshRemoteState({ silent: true });
+  }
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && state.authStatus === "authenticated") {
+    void refreshRemoteState({ silent: true });
+  }
+});
+
+document.addEventListener("click", (event) => {
+  if (!state.userMenuOpen) {
+    return;
+  }
+  const target = event.target instanceof Element ? event.target : undefined;
+  if (target?.closest("#userMenuButton")) {
+    return;
+  }
+  if (!target?.closest(".user-menu")) {
+    closeUserMenu();
+  }
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && state.userMenuOpen) {
+    closeUserMenu();
+    app.querySelector<HTMLButtonElement>("#userMenuButton")?.focus();
+  }
+});
 
 async function loadInitialState() {
   try {
@@ -85,49 +149,79 @@ async function loadInitialState() {
     const ledgers = await cloudLedgerApi.listLedgers();
     const activeLedgerId = pickDefaultLedgerId(ledgers);
 
-    state.users = session.users;
-    state.activeUserId = session.currentUser.id;
+    state.currentUser = session.currentUser;
     state.cloudStatus = session.cloudStatus;
     state.ledgers = ledgers;
     state.activeLedgerId = activeLedgerId;
     state.dashboard = activeLedgerId
       ? await cloudLedgerApi.getLedgerDashboard(activeLedgerId)
       : undefined;
+    state.authStatus = "authenticated";
+    syncProfileFormFromUser();
     resetFormForDashboard();
     state.error = undefined;
   } catch (error) {
-    state.error = friendlyError(error, "加载失败");
+    if (cloudLedgerApi.isAuthRequired(error)) {
+      state.authStatus = "anonymous";
+      state.currentUser = undefined;
+      state.ledgers = [];
+      state.activeLedgerId = undefined;
+      state.dashboard = undefined;
+      state.userMenuOpen = false;
+      state.profileEditing = false;
+      state.error = undefined;
+    } else {
+      state.error = friendlyError(error, "加载失败");
+    }
   } finally {
     state.loading = false;
     render();
   }
 }
 
-async function switchUser(userId: string) {
+async function submitAuthForm() {
+  if (state.pendingAction) {
+    return;
+  }
+
+  const identifier = state.authForm.identifier.trim();
+  const password = state.authForm.password;
+  if (!identifier || !password) {
+    showToast("请填写完整登录信息");
+    return;
+  }
+
   try {
     state.loading = true;
-    state.activeUserId = userId;
+    state.pendingAction = "auth";
     render();
-    await cloudLedgerApi.switchUser(userId);
-    const session = await cloudLedgerApi.getUserSession();
-    const ledgers = await cloudLedgerApi.listLedgers();
-    const activeLedgerId = pickDefaultLedgerId(ledgers);
-
-    state.users = session.users;
-    state.activeUserId = session.currentUser.id;
-    state.cloudStatus = session.cloudStatus;
-    state.ledgers = ledgers;
-    state.activeLedgerId = activeLedgerId;
-    state.dashboard = activeLedgerId
-      ? await cloudLedgerApi.getLedgerDashboard(activeLedgerId)
-      : undefined;
-    state.view = "activity";
-    state.filter = "all";
-    resetFormForDashboard();
-    state.error = undefined;
+    const draft: LoginDraft = { identifier, password };
+    await cloudLedgerApi.login(draft);
+    await loadInitialState();
   } catch (error) {
-    state.error = friendlyError(error, "切换账号失败");
+    showToast(friendlyError(error, "登录失败"));
   } finally {
+    state.loading = false;
+    state.pendingAction = undefined;
+    render();
+  }
+}
+
+async function logout() {
+  try {
+    state.loading = true;
+    state.userMenuOpen = false;
+    state.profileEditing = false;
+    render();
+    await cloudLedgerApi.logout();
+  } catch (error) {
+    showToast(friendlyError(error, "退出失败"));
+  } finally {
+    state.authStatus = "anonymous";
+    state.currentUser = undefined;
+    state.ledgers = [];
+    state.activeLedgerId = undefined;
+    state.dashboard = undefined;
     state.loading = false;
     render();
   }
@@ -152,33 +246,96 @@ async function switchLedger(ledgerId: string) {
 }
 
 async function refreshDashboard() {
-  if (!state.activeLedgerId) {
+  await refreshRemoteState({ silent: false, allowPending: true });
+}
+
+async function refreshRemoteState(
+  options: { silent: boolean; allowPending?: boolean } = { silent: true },
+) {
+  if (!state.activeLedgerId || autoRefreshInFlight || (state.pendingAction && !options.allowPending)) {
     return;
   }
 
-  const session = await cloudLedgerApi.getUserSession();
-  state.cloudStatus = session.cloudStatus;
-  state.dashboard = await cloudLedgerApi.getLedgerDashboard(state.activeLedgerId);
-  resetFormForDashboard({ preserveAmount: true });
+  autoRefreshInFlight = true;
+  try {
+    const previousLedgerId = state.activeLedgerId;
+    const session = await cloudLedgerApi.getUserSession();
+    const ledgers = await cloudLedgerApi.listLedgers();
+    const activeLedgerId = ledgers.some((ledger) => ledger.id === previousLedgerId)
+      ? previousLedgerId
+      : pickDefaultLedgerId(ledgers);
+
+    state.currentUser = session.currentUser;
+    state.cloudStatus = session.cloudStatus;
+    state.ledgers = ledgers;
+    state.activeLedgerId = activeLedgerId;
+    state.dashboard = activeLedgerId
+      ? await cloudLedgerApi.getLedgerDashboard(activeLedgerId)
+      : undefined;
+    state.error = undefined;
+    syncProfileFormFromUser();
+    resetFormForDashboard({ preserveDraft: true });
+  } catch (error) {
+    if (cloudLedgerApi.isAuthRequired(error)) {
+      state.authStatus = "anonymous";
+      state.currentUser = undefined;
+      state.ledgers = [];
+      state.activeLedgerId = undefined;
+      state.dashboard = undefined;
+      state.userMenuOpen = false;
+      state.profileEditing = false;
+      state.error = undefined;
+    } else {
+      state.cloudStatus = await cloudLedgerApi.checkCloudStatus();
+      if (!options.silent) {
+        state.error = friendlyError(error, "刷新失败");
+      }
+    }
+  } finally {
+    autoRefreshInFlight = false;
+    render();
+  }
 }
 
-function resetFormForDashboard(options: { preserveAmount?: boolean } = {}) {
+function shouldAutoRefresh() {
+  return (
+    state.authStatus === "authenticated" &&
+    document.visibilityState !== "hidden" &&
+    !state.loading &&
+    !state.pendingAction
+  );
+}
+
+function resetFormForDashboard(options: { preserveDraft?: boolean } = {}) {
   const dashboard = state.dashboard;
   if (!dashboard) {
     return;
   }
 
-  const firstAccount = dashboard.accounts[0];
+  const preservedAccount = dashboard.accounts.find((account) => account.id === state.form.accountId);
+  const firstAccount = preservedAccount ?? dashboard.accounts[0];
   const categories = categoriesForDirection(state.form.direction);
+  const preservedCategory = categories.find((category) => category.id === state.form.categoryId);
 
   state.form = {
     ...state.form,
-    amount: options.preserveAmount ? state.form.amount : "",
+    amount: options.preserveDraft ? state.form.amount : "",
     accountId: firstAccount?.id ?? "",
-    categoryId: categories[0]?.id ?? "",
-    memo: options.preserveAmount ? state.form.memo : "",
-    submitForApproval: dashboard.ledger.kind === "organization",
+    categoryId: preservedCategory?.id ?? categories[0]?.id ?? "",
+    memo: options.preserveDraft ? state.form.memo : "",
+    submitForApproval:
+      dashboard.ledger.kind === "organization"
+        ? true
+        : options.preserveDraft
+          ? state.form.submitForApproval
+          : false,
   };
+}
+
+function syncProfileFormFromUser() {
+  if (!state.profileEditing) {
+    state.profileForm.displayName = state.currentUser?.displayName ?? "";
+  }
 }
 
 function categoriesForDirection(direction: TransactionDirection): Category[] {
@@ -192,13 +349,16 @@ function render() {
   app.innerHTML = `
     <main
       class="app-shell"
-      data-active-user-id="${escapeHtml(state.activeUserId ?? "")}"
+      data-auth-state="${escapeHtml(state.authStatus)}"
+      data-current-user-id="${escapeHtml(state.currentUser?.id ?? "")}"
       data-active-ledger-id="${escapeHtml(state.activeLedgerId ?? "")}"
       data-cloud-state="${escapeHtml(state.cloudStatus.state)}"
     >
-      ${renderTopBar()}
+      ${state.authStatus === "authenticated" ? renderTopBar() : ""}
       ${
-        state.loading && !dashboard
+        state.authStatus === "anonymous"
+          ? renderLogin()
+          : state.loading && !dashboard
           ? renderLoading()
           : state.error
             ? renderError()
@@ -225,42 +385,125 @@ function renderTopBar() {
     <header class="top-bar">
       <div class="brand-block">
         <span class="brand-mark" aria-hidden="true">CL</span>
-      <div>
+        <div>
           <h1>CloudLedger</h1>
           <p>${ledger ? `${ledgerKindLabel(ledger.kind)} · ${roleLabel(ledger.role)}` : "移动账本"}</p>
         </div>
       </div>
-      <div class="top-controls">
+      <div class="top-actions">
         <span class="cloud-chip ${state.cloudStatus.state}">${escapeHtml(state.cloudStatus.label)}</span>
-        <div class="control-block account-picker" id="userSelect" role="group" aria-label="账号切换">
-          <span>账号</span>
-          <div class="switcher-row">
-            ${state.users.map(renderUserSwitchButton).join("")}
-          </div>
-        </div>
-        <div class="control-block ledger-picker" id="ledgerSelect" role="group" aria-label="账本切换">
-          <span>账本</span>
-          <div class="switcher-row">
-            ${state.ledgers.map(renderLedgerSwitchButton).join("")}
-          </div>
-        </div>
+        ${renderUserMenu()}
       </div>
     </header>
+    <div class="ledger-picker" id="ledgerSelect" role="group" aria-label="账本切换">
+      <span>账本</span>
+      <div class="switcher-row">
+        ${state.ledgers.map(renderLedgerSwitchButton).join("")}
+      </div>
+    </div>
   `;
 }
 
-function renderUserSwitchButton(user: UserAccount) {
-  const active = user.id === state.activeUserId;
+function renderUserMenu() {
+  const user = state.currentUser;
+  const displayName = user?.displayName ?? "未登录";
+  const contact = user?.email || user?.phone || "未绑定联系方式";
+  const editing = state.profileEditing;
 
   return `
-    <button
-      class="switcher-button ${active ? "is-active" : ""}"
-      type="button"
-      data-user-id="${escapeHtml(user.id)}"
-      aria-pressed="${active}"
-    >
-      ${escapeHtml(user.displayName)}
-    </button>
+    <div class="user-menu ${state.userMenuOpen ? "is-open" : ""}">
+      <button
+        class="avatar-button"
+        id="userMenuButton"
+        type="button"
+        aria-label="账号菜单"
+        aria-expanded="${state.userMenuOpen}"
+        aria-controls="userMenuPanel"
+        aria-haspopup="true"
+      >
+        ${escapeHtml(userInitial(displayName))}
+      </button>
+      ${
+        state.userMenuOpen
+          ? `
+        <div class="user-menu-panel" id="userMenuPanel">
+          <div class="user-menu-account">
+            <span class="section-kicker">Account</span>
+            <strong>${escapeHtml(displayName)}</strong>
+            <p>${escapeHtml(contact)}</p>
+            <p>ID ${escapeHtml(user?.id.slice(0, 8) ?? "-")}</p>
+          </div>
+          ${
+            editing
+              ? `
+            <form class="profile-form" id="profileForm">
+              <label>
+                <span>显示名</span>
+                <input
+                  id="profileDisplayName"
+                  autocomplete="name"
+                  value="${escapeHtml(state.profileForm.displayName)}"
+                />
+              </label>
+              <div class="profile-actions">
+                <button class="secondary-button" type="submit" ${state.pendingAction === "profile" ? "disabled" : ""}>
+                  ${state.pendingAction === "profile" ? "保存中" : "保存"}
+                </button>
+                <button class="ghost-button" id="cancelProfileEdit" type="button">
+                  取消
+                </button>
+              </div>
+            </form>
+          `
+              : `
+            <button class="ghost-button user-menu-action" id="editProfileButton" type="button">
+              编辑基本信息
+            </button>
+          `
+          }
+          <button class="danger-button user-menu-logout" data-user-menu-action="logout" type="button" ${
+            state.loading ? "disabled" : ""
+          }>
+            退出登录
+          </button>
+        </div>
+      `
+          : ""
+      }
+    </div>
+  `;
+}
+
+function renderLogin() {
+  return `
+    <section class="login-panel" aria-label="账号登录">
+      <div class="login-brand">
+        <span class="brand-mark" aria-hidden="true">CL</span>
+        <div>
+          <h1>CloudLedger</h1>
+          <p>${state.cloudStatus.detail ? escapeHtml(state.cloudStatus.detail) : "移动账本"}</p>
+        </div>
+      </div>
+
+      <form id="authForm" class="auth-form">
+        <label>
+          <span>邮箱或手机号</span>
+          <input id="authIdentifier" autocomplete="username" value="${escapeHtml(state.authForm.identifier)}" />
+        </label>
+        <label>
+          <span>密码</span>
+          <input
+            id="authPassword"
+            type="password"
+            autocomplete="current-password"
+            value="${escapeHtml(state.authForm.password)}"
+          />
+        </label>
+        <button class="primary-button" type="submit" ${state.loading ? "disabled" : ""}>
+          ${state.pendingAction === "auth" ? "处理中" : "登录"}
+        </button>
+      </form>
+    </section>
   `;
 }
 
@@ -662,13 +905,56 @@ function renderEmptyState() {
 }
 
 function bindEvents() {
-  app.querySelectorAll<HTMLButtonElement>("[data-user-id]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const userId = button.dataset.userId;
-      if (userId && userId !== state.activeUserId) {
-        void switchUser(userId);
-      }
-    });
+  app.querySelector<HTMLFormElement>("#authForm")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void submitAuthForm();
+  });
+
+  app.querySelector<HTMLInputElement>("#authIdentifier")?.addEventListener("input", (event) => {
+    const target = event.currentTarget as HTMLInputElement;
+    state.authForm.identifier = target.value;
+  });
+
+  app.querySelector<HTMLInputElement>("#authPassword")?.addEventListener("input", (event) => {
+    const target = event.currentTarget as HTMLInputElement;
+    state.authForm.password = target.value;
+  });
+
+  app.querySelector<HTMLButtonElement>("#userMenuButton")?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    state.userMenuOpen = !state.userMenuOpen;
+    if (state.userMenuOpen) {
+      syncProfileFormFromUser();
+    } else {
+      state.profileEditing = false;
+    }
+    render();
+  });
+
+  app.querySelector<HTMLButtonElement>("#editProfileButton")?.addEventListener("click", () => {
+    state.profileEditing = true;
+    syncProfileFormFromUser();
+    render();
+  });
+
+  app.querySelector<HTMLButtonElement>("#cancelProfileEdit")?.addEventListener("click", () => {
+    state.profileEditing = false;
+    syncProfileFormFromUser();
+    render();
+  });
+
+  app.querySelector<HTMLInputElement>("#profileDisplayName")?.addEventListener("input", (event) => {
+    const target = event.currentTarget as HTMLInputElement;
+    state.profileForm.displayName = target.value;
+  });
+
+  app.querySelector<HTMLFormElement>("#profileForm")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void saveProfile();
+  });
+
+  app.querySelector<HTMLButtonElement>("[data-user-menu-action='logout']")?.addEventListener("click", () => {
+    void logout();
   });
 
   app.querySelectorAll<HTMLButtonElement>("[data-ledger-id]").forEach((button) => {
@@ -751,6 +1037,44 @@ function bindEvents() {
   app.querySelector<HTMLButtonElement>("#retryButton")?.addEventListener("click", () => {
     void loadInitialState();
   });
+}
+
+function closeUserMenu() {
+  state.userMenuOpen = false;
+  state.profileEditing = false;
+  syncProfileFormFromUser();
+  render();
+}
+
+async function saveProfile() {
+  if (state.pendingAction) {
+    return;
+  }
+
+  const displayName = state.profileForm.displayName.trim();
+  if (!displayName) {
+    showToast("请输入显示名");
+    return;
+  }
+
+  try {
+    state.pendingAction = "profile";
+    render();
+    const draft: UpdateProfileDraft = { displayName };
+    const session = await cloudLedgerApi.updateProfile(draft);
+    state.currentUser = session.currentUser;
+    state.cloudStatus = session.cloudStatus;
+    state.profileEditing = false;
+    state.userMenuOpen = true;
+    syncProfileFormFromUser();
+    await refreshRemoteState({ silent: true, allowPending: true });
+    showToast("账号信息已更新");
+  } catch (error) {
+    showToast(friendlyError(error, "保存账号信息失败"));
+  } finally {
+    state.pendingAction = undefined;
+    render();
+  }
 }
 
 async function decideApproval(transactionId: string, decision: "approve" | "reject") {
@@ -947,6 +1271,10 @@ function auditActionLabel(action: LedgerDashboard["auditTrail"][number]["action"
   };
 
   return labels[action];
+}
+
+function userInitial(displayName: string) {
+  return Array.from(displayName.trim())[0]?.toUpperCase() ?? "账";
 }
 
 function escapeHtml(value: string) {

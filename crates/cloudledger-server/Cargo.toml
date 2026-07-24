@@ -9,9 +9,12 @@ anyhow.workspace = true
 argon2.workspace = true
 axum.workspace = true
 cloudledger-core.workspace = true
+cloudledger-service.workspace = true
 rand_core = { workspace = true, features = ["getrandom"] }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+time.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
 uuid.workspace = true

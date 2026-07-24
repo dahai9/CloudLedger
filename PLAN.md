@@ -32,13 +32,15 @@ development and smoke testing.
 - `crates/cloudledger-db`: repository traits plus in-memory and SQLite storage
   drafts.
 - `crates/cloudledger-service`: application services for posting entries,
-  approval decisions, dashboard DTOs, seeded app state, and Tauri-facing use
-  cases.
+  approval decisions, dashboard DTOs, setup/bootstrap app state, server-side
+  organization membership management, and Tauri-facing use cases.
 - `crates/cloudledger-server`: cloud sync and authentication scaffold with
-  Argon2 password hashing.
+  Argon2 password hashing plus a separate admin backend for organization and
+  account relationship management.
 - `src-tauri`: Tauri v2 shell exposing Rust commands to the frontend.
-- `frontend`: Android-first Vite/TypeScript UI with ledger switching, quick
-  entry, transactions, approvals, and audit views.
+- `frontend`: Android-first Vite/TypeScript UI with server-backed login, a
+  single logged-in account, ledger switching, quick entry, transactions,
+  approvals, and audit views.
 - `flake.nix`: pinned NixOS development shell for Rust, Tauri Linux
   dependencies, Android SDK/NDK, JDK, Node, and build helpers.
 
@@ -58,15 +60,17 @@ development and smoke testing.
      approval requests, audit logs, and sync events.
 
 3. Mobile App MVP
-   - Wire the frontend fully to Tauri commands.
+   - Wire the frontend to the mobile server API for login, overview, quick
+     entry, approval decisions, and audit views.
    - Keep the UI optimized for Android: single-column layout, quick entry,
      bottom navigation, touch-friendly controls, and clear offline/error states.
    - Build and verify desktop dev mode first, then Android debug APK.
 
 4. Cloud Sync
-   - Turn the server scaffold into real APIs for registration, login, refresh
-     token rotation, organization membership, public-ledger sync, and audit-log
-     upload.
+  - Turn the server scaffold into real APIs for admin-created accounts, login,
+    refresh token rotation, public-ledger sync, and audit-log upload.
+   - Keep organization membership and account relationship management on the
+     server-side admin backend, never in the Android app.
    - Use cloud authority for public ledgers and local encrypted cache for the
      Android app.
    - Keep private ledger sync user-controlled and isolated from organization
@@ -90,18 +94,39 @@ development and smoke testing.
 - Tauri commands:
   - `health`
   - `get_overview`
-  - `switch_user`
   - `create_transaction`
   - `decide_approval`
 - Server routes currently planned:
   - `GET /health`
   - `GET /ready`
   - `GET /sync/ping`
-  - future auth and sync endpoints for registration, login, refresh, ledger
-    pull/push, and audit-log upload.
+  - `POST /auth/login`
+  - `POST /auth/refresh`
+  - `GET /auth/me`
+  - `POST /auth/logout`
+  - `GET /app/overview`
+  - `POST /app/transactions`
+  - `POST /app/approvals/decide`
+  - `GET /admin`
+  - `GET /admin/api/setup`
+  - `POST /admin/api/setup`
+  - `GET /admin/api/organizations`
+  - `GET /admin/api/organizations/:organization_id/members`
+  - `POST /admin/api/organizations/:organization_id/members`
+  - `PATCH /admin/api/organizations/:organization_id/members/:membership_id`
+  - `PATCH /admin/api/organizations/:organization_id/members/:membership_id/password`
+  - `DELETE /admin/api/organizations/:organization_id/members/:membership_id`
+  - future sync endpoints for ledger pull/push and audit-log upload.
+- Server ports:
+  - Mobile API uses `CLOUDLEDGER_BIND_ADDR`, defaulting to `0.0.0.0:8787` for
+    Android LAN testing.
+  - Admin backend uses `CLOUDLEDGER_ADMIN_BIND_ADDR`, defaulting to
+    `127.0.0.1:8788`; LAN admin testing must bind a specific private IP such as
+    `192.168.1.229:8788`. Binding admin to `0.0.0.0` or public IPs is rejected.
 - Frontend API boundary:
   - browser/mock mode for fast UI development.
-  - Tauri invoke adapter for real app runtime.
+  - HTTP adapter for the real app runtime, pointed at
+    `VITE_CLOUDLEDGER_CLOUD_URL`.
 
 ## Validation Plan
 
@@ -131,30 +156,45 @@ nix develop path:. -c npm run tauri:android:build -- --debug --target aarch64
 
 - Rust core, DB repository draft, service layer, server scaffold, frontend app,
   Tauri shell, Nix shell, and docs have been created.
-- Alice and Bob can switch accounts in the app. Each user sees their own
-  private ledger first, while both users can see the Acme public ledger through
-  organization membership.
-- Tauri command creation no longer trusts a renderer-provided actor user ID;
-  it injects the current Rust-side session user before authorization.
+- The Android app uses one current account per install/session and no longer
+  exposes account switching or organization membership management on the phone.
+- The mobile API now provides login, refresh, `me`, logout, server overview,
+  transaction creation, and approval decisions. Registration is not exposed on
+  the mobile/user frontend; admins create accounts and initial credentials from
+  the separate admin backend. Each login is bound to the app installation id, so
+  one app install cannot switch to another account through the mobile UI.
+- Account and organization relationships are managed by the server-side admin
+  backend on the separate admin port. The admin port defaults to localhost and
+  can only be moved to loopback, link-local, or private LAN addresses.
+- Fresh server data starts uninitialized. The admin setup wizard creates the
+  single organization, owner login identity, owner private ledger, organization
+  public ledger, and default accounts. The current backend enforces a
+  single-organization invariant.
+- Each user sees their own private ledger first, while permitted organization
+  members can see the configured organization's public ledger through
+  membership.
+- Server-side transaction and approval routes no longer trust a renderer-
+  provided actor user ID; they inject the authenticated access-token user before
+  authorization.
 - Public-ledger transactions now enter a real approval flow: pending entries do
   not affect posted balances, eligible approvers can approve or reject them,
   submitters cannot approve their own entries, rejection requires a reason, and
   every decision writes an audit log entry with the transaction resource ID.
-- The seeded Acme organization now supports two-way MVP approval validation:
-  Alice is the owner and Bob is an approver, so either user's public-ledger
-  submission can be decided by the other user instead of getting stuck.
+- Public-ledger approval validation uses admin-created members in real server
+  flows; seeded Acme/Alice/Bob data remains only as an explicit service-layer
+  test fixture.
 - Audit logs are returned only when the actor has `ViewAuditLog` permission for
   that ledger. Member-level public-ledger users can still see the public ledger
   without receiving the audit trail.
 - MVP transaction creation rejects unsupported transfer entries and currency
   mismatches between the transaction and selected account, keeping posted
   balances deterministic.
-- Local Android state is persisted at the Tauri app data path as
-  `ledger-state.json`, with schema versioning, atomic replacement, and a
-  `ledger-state.json.bak` recovery copy.
+- Development server ledger state is persisted as `ledger-state.json`, with
+  schema versioning, atomic replacement, and a `ledger-state.json.bak` recovery
+  copy. Auth state is persisted as `auth-state.json`.
 - The frontend shows dev-cloud status from
   `VITE_CLOUDLEDGER_CLOUD_URL`, defaulting to
-  `http://192.168.1.32:8787` for the current LAN test setup. The app checks
+  `http://192.168.1.229:8787` for the current LAN test setup. The app checks
   `/ready` and displays a short server ID so the active development cloud can
   be identified from the phone.
 - The development server persists its cloud identity under
@@ -164,8 +204,8 @@ nix develop path:. -c npm run tauri:android:build -- --debug --target aarch64
   phone. The validated debug artifact path is
   `src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`.
 - The current phone/LAN validation target is developer machine
-  `192.168.1.32:8787` and test phone `192.168.1.28`. Phone-side ADB curl to
-  `/ready` succeeds.
+  `192.168.1.229:8787`; phone-side ADB validation should use the current phone
+  WLAN address reported by `adb shell ip -4 addr`.
 
 ## Assumptions
 

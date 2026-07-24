@@ -54,5 +54,8 @@ test:
 frontend-build:
     nix develop {{flake}} -c npm run build
 
+client-web:
+    nix develop {{flake}} -c npm run dev
+
 server:
     nix develop {{flake}} -c cargo run -p cloudledger-server
