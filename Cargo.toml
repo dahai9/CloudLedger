@@ -21,8 +21,10 @@ cloudledger-core = { path = "crates/cloudledger-core" }
 cloudledger-db = { path = "crates/cloudledger-db" }
 cloudledger-service = { path = "crates/cloudledger-service" }
 rand_core = "0.6"
+reqwest = { version = "0.13", default-features = false, features = ["form", "json", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+subtle = "2"
 tauri = "2"
 tauri-build = "2"
 thiserror = "2"

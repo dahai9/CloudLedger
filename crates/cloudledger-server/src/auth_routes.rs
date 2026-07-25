@@ -1,6 +1,11 @@
+use std::net::{IpAddr, SocketAddr};
+
 use axum::{
-    extract::State,
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    extract::{ConnectInfo, State},
+    http::{
+        header::{AUTHORIZATION, RETRY_AFTER},
+        HeaderMap, HeaderValue, StatusCode,
+    },
     response::{IntoResponse, Response},
     Json,
 };
@@ -11,29 +16,52 @@ use crate::{
     auth::{
         AuthError, AuthenticatedSession, LoginInput, RefreshInput, Session, UpdateProfileInput,
     },
+    login_protection::LoginSurface,
     ServerState,
 };
 
 pub async fn login(
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     State(state): State<ServerState>,
     Json(request): Json<LoginRequest>,
 ) -> Result<Json<Session>, ApiError> {
-    let session = {
+    let identifier = login_identifier(request.email.as_deref(), request.phone.as_deref());
+    check_login_attempt(&state, peer_addr.ip(), LoginSurface::Business, &identifier)?;
+
+    let login_result = {
         let mut auth = state
             .auth_service
             .lock()
             .map_err(|_| ApiError::internal("auth service lock poisoned"))?;
-        let session = auth
-            .login(LoginInput {
-                email: request.email,
-                phone: request.phone,
-                password: request.password,
-                installation_id: request.installation_id,
-            })
-            .map_err(ApiError::from_auth)?;
-        auth.save_to_path(&state.auth_state_path)
-            .map_err(ApiError::from_auth)?;
-        session
+        let result = auth.login(LoginInput {
+            email: request.email,
+            phone: request.phone,
+            password: request.password,
+            installation_id: request.installation_id,
+        });
+        if result.is_ok() {
+            auth.save_to_path(&state.auth_state_path)
+                .map_err(ApiError::from_auth)?;
+        }
+        result
+    };
+    let session = match login_result {
+        Ok(session) => {
+            record_login_success(&state, peer_addr.ip(), LoginSurface::Business, &identifier)?;
+            session
+        }
+        Err(AuthError::InvalidCredentials) => {
+            if let Some(error) =
+                record_login_failure(&state, peer_addr.ip(), LoginSurface::Business, &identifier)?
+            {
+                return Err(ApiError::from_auth(error));
+            }
+            return Err(ApiError::from_auth(AuthError::InvalidCredentials));
+        }
+        Err(error) => {
+            record_login_success(&state, peer_addr.ip(), LoginSurface::Business, &identifier)?;
+            return Err(ApiError::from_auth(error));
+        }
     };
 
     ensure_ledger_identity(&state, &session)?;
@@ -174,6 +202,54 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
         .ok_or_else(|| ApiError::unauthorized("access token required"))
 }
 
+fn login_identifier(email: Option<&str>, phone: Option<&str>) -> String {
+    email
+        .or(phone)
+        .map(|value| value.trim().to_lowercase())
+        .unwrap_or_default()
+}
+
+fn check_login_attempt(
+    state: &ServerState,
+    ip: IpAddr,
+    surface: LoginSurface,
+    identifier: &str,
+) -> Result<(), ApiError> {
+    state
+        .login_protection
+        .lock()
+        .map_err(|_| ApiError::internal("login protection lock poisoned"))?
+        .check(ip, surface, identifier)
+        .map_err(ApiError::from_auth)
+}
+
+fn record_login_failure(
+    state: &ServerState,
+    ip: IpAddr,
+    surface: LoginSurface,
+    identifier: &str,
+) -> Result<Option<AuthError>, ApiError> {
+    Ok(state
+        .login_protection
+        .lock()
+        .map_err(|_| ApiError::internal("login protection lock poisoned"))?
+        .record_failure(ip, surface, identifier))
+}
+
+fn record_login_success(
+    state: &ServerState,
+    ip: IpAddr,
+    surface: LoginSurface,
+    identifier: &str,
+) -> Result<(), ApiError> {
+    state
+        .login_protection
+        .lock()
+        .map_err(|_| ApiError::internal("login protection lock poisoned"))?
+        .record_success(ip, surface, identifier);
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginRequest {
@@ -213,6 +289,7 @@ struct ErrorResponse {
 pub struct ApiError {
     status: StatusCode,
     message: String,
+    retry_after_seconds: Option<u64>,
 }
 
 impl ApiError {
@@ -220,6 +297,7 @@ impl ApiError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: message.into(),
+            retry_after_seconds: None,
         }
     }
 
@@ -227,12 +305,20 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
+            retry_after_seconds: None,
         }
     }
 
     pub(crate) fn from_auth(error: AuthError) -> Self {
-        let status = match error {
+        let retry_after_seconds = match &error {
+            AuthError::LoginRateLimited {
+                retry_after_seconds,
+            } => Some(*retry_after_seconds),
+            _ => None,
+        };
+        let status = match &error {
             AuthError::InvalidCredentials | AuthError::SessionNotFound => StatusCode::UNAUTHORIZED,
+            AuthError::LoginRateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             AuthError::BusinessAppAccessDenied | AuthError::AdminAccessDenied => {
                 StatusCode::FORBIDDEN
             }
@@ -245,11 +331,13 @@ impl ApiError {
             AuthError::LoginIdentifierRequired
             | AuthError::DisplayNameRequired
             | AuthError::PasswordRequired
+            | AuthError::PasswordPolicyViolation
             | AuthError::InstallationIdRequired => StatusCode::BAD_REQUEST,
         };
         Self {
             status,
             message: error.to_string(),
+            retry_after_seconds,
         }
     }
 
@@ -266,18 +354,25 @@ impl ApiError {
         Self {
             status,
             message: error.to_string(),
+            retry_after_seconds: None,
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
+        let mut response = (
             self.status,
             Json(ErrorResponse {
                 error: self.message,
             }),
         )
-            .into_response()
+            .into_response();
+        if let Some(retry_after_seconds) = self.retry_after_seconds {
+            if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+                response.headers_mut().insert(RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }

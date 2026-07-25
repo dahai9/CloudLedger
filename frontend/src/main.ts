@@ -1187,6 +1187,9 @@ function friendlyError(error: unknown, fallback: string) {
   if (message.includes("organization admin accounts cannot use the business app")) {
     return "组织管理员账号只能登录后台，不能用于前台业务";
   }
+  if (message.includes("too many login attempts")) {
+    return "登录尝试过多，请稍后重试";
+  }
   if (message.includes("invalid credentials")) {
     return "账号或密码错误";
   }

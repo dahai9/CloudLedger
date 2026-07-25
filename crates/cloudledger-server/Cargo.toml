@@ -11,8 +11,10 @@ axum.workspace = true
 cloudledger-core.workspace = true
 cloudledger-service.workspace = true
 rand_core = { workspace = true, features = ["getrandom"] }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true

@@ -56,16 +56,24 @@ window.__CLOUDLEDGER_CONFIG__ = {
 
 The admin backend is intentionally separated from the mobile API. It listens on
 `CLOUDLEDGER_ADMIN_BIND_ADDR`, defaulting to `127.0.0.1:8788`. For LAN admin
-testing bind it to a specific private address, for example
-`10.0.0.42:8788`; the server rejects `0.0.0.0` and public IPs for this admin
-port. The platform token comes from `CLOUDLEDGER_ADMIN_TOKEN` or the server data
-directory's `admin-token` file.
+testing bind it to a specific private address, for example `10.0.0.42:8788`;
+the server rejects `0.0.0.0` and public IPs for this admin port.
 
-The `/admin` page has separate platform and organization entry points. The
-platform token creates and lists organizations. Every organization is created
-with its own organization-admin login, public ledger, and default company bank
-account. Organization admins log in with their own email/phone and password and
-can manage employees only inside their organization.
+On first initialization the server generates a high-entropy path such as
+`manage-0123456789abcdef0123456789abcdef` and stores it in the server data
+directory's `admin-path` file with mode `0600` on Unix. The fixed `/admin`
+route intentionally returns `404`. `CLOUDLEDGER_ADMIN_PATH` can override the
+generated value with one 16-128 character path segment, but deployments should
+keep it unguessable. The platform token comes from `CLOUDLEDGER_ADMIN_TOKEN` or
+the data directory's `admin-token` file, which is also restricted to `0600`.
+
+The randomized admin page has separate platform and organization entry points.
+The raw platform token must first be exchanged for a revocable eight-hour
+platform session; it is not accepted as an API bearer token. The platform
+session creates and lists organizations. Every organization is created with its
+own organization-admin login, public ledger, and default company bank account.
+Organization admins log in with their own email/phone and password and can
+manage employees only inside their organization.
 
 New organization-admin accounts are backend-only identities and do not receive
 a personal ledger; `POST /auth/login` rejects them. Employee accounts use the
@@ -73,6 +81,41 @@ mobile/Web business frontend, belong to one organization only, and cannot log in
 to the organization admin backend. Existing persisted `owner` or `admin`
 membership accounts are migrated to backend-only organization admins when the
 server starts.
+
+Login brute-force protection is shared by the mobile and admin servers. By
+default, five failed attempts for one source IP and login identifier within 15
+minutes lock that login for 15 minutes; 20 failed attempts from one IP also lock
+that source even when identifiers are rotated. Rate-limited responses use HTTP
+`429` with `Retry-After`. New and reset passwords must contain 12–128
+characters. Existing password hashes remain valid until the password is reset.
+The defaults can be tuned with:
+
+- `CLOUDLEDGER_LOGIN_MAX_FAILURES`
+- `CLOUDLEDGER_LOGIN_MAX_FAILURES_PER_IP`
+- `CLOUDLEDGER_LOGIN_WINDOW_SECONDS`
+- `CLOUDLEDGER_LOGIN_LOCKOUT_SECONDS`
+
+The limits use the direct TCP peer address. Deployments behind a reverse proxy
+must enforce equivalent limits at the proxy because forwarded client IP headers
+are intentionally not trusted by the application.
+
+Cloudflare Turnstile protects both organization and platform login forms. Set
+both variables from the Turnstile widget configured for the admin hostname:
+
+- `CLOUDLEDGER_TURNSTILE_SITE_KEY`
+- `CLOUDLEDGER_TURNSTILE_SECRET_KEY`
+
+The server refuses a non-loopback admin bind unless both keys are configured.
+Turnstile may be omitted only for loopback-only local development. When a
+reverse proxy exposes a loopback-bound admin server, the application cannot
+detect that public exposure, so the keys and proxy-level request limits are
+still required for a secure deployment. Turnstile responses must carry the
+`admin-login` action and are verified server-side with the direct peer IP.
+
+Business access tokens expire after 15 minutes and use the existing rotating
+refresh flow. Refresh tokens expire after 30 days. Organization-admin sessions
+expire after 8 hours and require a new login; changing an account password or
+account type continues to revoke all of that user's sessions immediately.
 
 The mobile API owns app login and ledger operations:
 
@@ -116,7 +159,8 @@ Use the server-side admin backend to manage organization/account relationships:
 CLOUDLEDGER_ADMIN_BIND_ADDR=127.0.0.1:8788 nix develop path:. -c cargo run -p cloudledger-server
 ```
 
-Then open `http://127.0.0.1:8788/admin`. Use the platform-token tab with
+Read `.cloudledger-server/admin-path`, then open
+`http://127.0.0.1:8788/<admin-path>`. Use the platform-token tab with
 `.cloudledger-server/admin-token` to create organizations. Afterwards, each
 organization administrator uses the organization-account tab to create and
 manage that organization's employee accounts.

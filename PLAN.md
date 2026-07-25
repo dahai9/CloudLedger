@@ -77,6 +77,21 @@ development and smoke testing.
      access.
 
 5. Security And Backup
+   - Rate-limit failed business, organization-admin, and platform-token
+     authentication by direct peer IP and normalized login identifier.
+   - Require 12–128 character passwords for new accounts and password resets,
+     while keeping existing hashes login-compatible.
+   - Return `429` plus `Retry-After` during login lockout and apply no-store,
+     anti-framing, MIME-sniffing, referrer, permissions, and CSP headers to the
+     admin backend.
+   - Expire business access tokens after 15 minutes, rotating refresh tokens
+     after 30 days, and organization-admin sessions after 8 hours.
+   - Generate and persist a high-entropy admin path during initialization;
+     never expose the management UI or APIs at the fixed `/admin` route.
+   - Require Cloudflare Turnstile for organization and platform login whenever
+     the admin listener is not loopback-only. Exchange the raw platform token
+     for a revocable eight-hour session instead of accepting it on every API
+     request.
    - Store mobile tokens and local key material through Android Keystore or a
      Tauri-supported equivalent.
    - Add encrypted backup export/import with schema version, KDF parameters,
@@ -107,24 +122,27 @@ development and smoke testing.
   - `GET /app/overview`
   - `POST /app/transactions`
   - `POST /app/approvals/decide`
-  - `GET /admin`
-  - `POST /admin/api/login`
-  - `POST /admin/api/logout`
-  - `GET /admin/api/me`
-  - `GET /admin/api/organizations`
-  - `POST /admin/api/organizations`
-  - `GET /admin/api/organizations/:organization_id/members`
-  - `POST /admin/api/organizations/:organization_id/members`
-  - `PATCH /admin/api/organizations/:organization_id/members/:membership_id`
-  - `PATCH /admin/api/organizations/:organization_id/members/:membership_id/password`
-  - `DELETE /admin/api/organizations/:organization_id/members/:membership_id`
+  - `GET /{admin_path}`
+  - `GET /{admin_path}/api/security`
+  - `POST /{admin_path}/api/login`
+  - `POST /{admin_path}/api/platform-login`
+  - `POST /{admin_path}/api/logout`
+  - `GET /{admin_path}/api/me`
+  - `GET /{admin_path}/api/organizations`
+  - `POST /{admin_path}/api/organizations`
+  - `GET /{admin_path}/api/organizations/:organization_id/members`
+  - `POST /{admin_path}/api/organizations/:organization_id/members`
+  - `PATCH /{admin_path}/api/organizations/:organization_id/members/:membership_id`
+  - `PATCH /{admin_path}/api/organizations/:organization_id/members/:membership_id/password`
+  - `DELETE /{admin_path}/api/organizations/:organization_id/members/:membership_id`
   - future sync endpoints for ledger pull/push and audit-log upload.
 - Server ports:
   - Mobile API uses `CLOUDLEDGER_BIND_ADDR`, defaulting to `0.0.0.0:8787` for
     Android LAN testing.
   - Admin backend uses `CLOUDLEDGER_ADMIN_BIND_ADDR`, defaulting to
     `127.0.0.1:8788`; LAN admin testing must bind a specific private IP such as
-    `10.0.0.42:8788`. Binding admin to `0.0.0.0` or public IPs is rejected.
+    `10.0.0.42:8788` and configure Cloudflare Turnstile. Binding admin to
+    `0.0.0.0` or public IPs is rejected.
 - Frontend API boundary:
   - browser/mock mode for fast UI development.
   - HTTP adapter for the real app runtime, pointed at the runtime

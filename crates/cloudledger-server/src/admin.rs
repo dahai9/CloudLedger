@@ -1,6 +1,12 @@
+use std::net::{IpAddr, SocketAddr};
+
 use axum::{
-    extract::{Path, State},
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    extract::{ConnectInfo, Path, Request, State},
+    http::{
+        header::{AUTHORIZATION, RETRY_AFTER},
+        HeaderMap, HeaderValue, StatusCode,
+    },
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, patch, post},
     Json, Router,
@@ -18,60 +24,218 @@ use crate::{
         AccountKind, AdminAuthenticatedSession, AdminCreateUserInput, AdminLoginInput,
         AdminSession, AuthError, AuthUserDto,
     },
+    login_protection::LoginSurface,
+    platform_auth::{platform_token_matches, PlatformSessions},
+    turnstile::TurnstileError,
     ServerState,
 };
 
+const ADMIN_AUTHORIZATION_IDENTIFIER: &str = "admin-authorization";
+
 pub fn router(state: ServerState) -> Router {
+    let protection_state = state.clone();
+    let base_path = format!("/{}", state.admin_path);
+    let api_path = format!("{base_path}/api");
     Router::new()
-        .route("/admin", get(admin_page))
-        .route("/admin/", get(admin_page))
-        .route("/admin/api/login", post(admin_login))
-        .route("/admin/api/logout", post(admin_logout))
-        .route("/admin/api/me", get(admin_me))
+        .route(&base_path, get(admin_page))
+        .route(&format!("{base_path}/"), get(admin_page))
+        .route(&format!("{api_path}/security"), get(admin_security))
+        .route(&format!("{api_path}/login"), post(admin_login))
+        .route(&format!("{api_path}/platform-login"), post(platform_login))
+        .route(&format!("{api_path}/logout"), post(admin_logout))
+        .route(&format!("{api_path}/me"), get(admin_me))
         .route(
-            "/admin/api/organizations",
+            &format!("{api_path}/organizations"),
             get(list_organizations).post(create_organization),
         )
         .route(
-            "/admin/api/organizations/:organization_id/members",
+            &format!("{api_path}/organizations/:organization_id/members"),
             get(list_members).post(add_member),
         )
         .route(
-            "/admin/api/organizations/:organization_id/members/:membership_id",
+            &format!("{api_path}/organizations/:organization_id/members/:membership_id"),
             patch(update_member_role).delete(remove_member),
         )
         .route(
-            "/admin/api/organizations/:organization_id/members/:membership_id/password",
+            &format!("{api_path}/organizations/:organization_id/members/:membership_id/password"),
             patch(reset_member_password),
         )
         .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            protection_state,
+            protect_admin_authorization,
+        ))
 }
 
 async fn admin_page() -> Html<&'static str> {
     Html(include_str!("admin_v2.html"))
 }
 
+async fn protect_admin_authorization(
+    State(state): State<ServerState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    let api_path = format!("/{}/api", state.admin_path);
+    if !path.starts_with(&format!("{api_path}/"))
+        || matches!(
+            path.strip_prefix(&api_path),
+            Some("/security" | "/login" | "/platform-login")
+        )
+    {
+        return next.run(request).await;
+    }
+    let Some(peer_ip) = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|connect_info| connect_info.0.ip())
+    else {
+        return AdminApiError::internal("client address is unavailable").into_response();
+    };
+    if let Err(error) = check_login_attempt(
+        &state,
+        peer_ip,
+        LoginSurface::AdminAuthorization,
+        ADMIN_AUTHORIZATION_IDENTIFIER,
+    ) {
+        return error.into_response();
+    }
+
+    let response = next.run(request).await;
+    if response.status() == StatusCode::UNAUTHORIZED {
+        return match record_login_failure(
+            &state,
+            peer_ip,
+            LoginSurface::AdminAuthorization,
+            ADMIN_AUTHORIZATION_IDENTIFIER,
+        ) {
+            Ok(Some(error)) => AdminApiError::from_auth(error).into_response(),
+            Ok(None) => response,
+            Err(error) => error.into_response(),
+        };
+    }
+    if let Err(error) = record_login_success(
+        &state,
+        peer_ip,
+        LoginSurface::AdminAuthorization,
+        ADMIN_AUTHORIZATION_IDENTIFIER,
+    ) {
+        return error.into_response();
+    }
+    response
+}
+
 async fn admin_login(
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     State(state): State<ServerState>,
     Json(request): Json<AdminLoginRequest>,
 ) -> Result<Json<AdminSession>, AdminApiError> {
-    let identifier = request.identifier.trim();
+    let identifier = request.identifier.trim().to_lowercase();
+    check_login_attempt(
+        &state,
+        peer_addr.ip(),
+        LoginSurface::OrganizationAdmin,
+        &identifier,
+    )?;
+    state
+        .turnstile
+        .verify(&request.turnstile_token, peer_addr.ip())
+        .await
+        .map_err(AdminApiError::from_turnstile)?;
     let (email, phone) = if identifier.contains('@') {
-        (Some(identifier.to_string()), None)
+        (Some(identifier.clone()), None)
     } else {
-        (None, Some(identifier.to_string()))
+        (None, Some(identifier.clone()))
     };
     let mut auth = lock_auth(&state)?;
-    let session = auth
-        .admin_login(AdminLoginInput {
-            email,
-            phone,
-            password: request.password,
-        })
-        .map_err(AdminApiError::from_auth)?;
-    auth.save_to_path(&state.auth_state_path)
-        .map_err(AdminApiError::from_auth)?;
+    let login_result = auth.admin_login(AdminLoginInput {
+        email,
+        phone,
+        password: request.password,
+    });
+    if login_result.is_ok() {
+        auth.save_to_path(&state.auth_state_path)
+            .map_err(AdminApiError::from_auth)?;
+    }
+    drop(auth);
+    let session = match login_result {
+        Ok(session) => {
+            record_login_success(
+                &state,
+                peer_addr.ip(),
+                LoginSurface::OrganizationAdmin,
+                &identifier,
+            )?;
+            session
+        }
+        Err(AuthError::InvalidCredentials) => {
+            if let Some(error) = record_login_failure(
+                &state,
+                peer_addr.ip(),
+                LoginSurface::OrganizationAdmin,
+                &identifier,
+            )? {
+                return Err(AdminApiError::from_auth(error));
+            }
+            return Err(AdminApiError::from_auth(AuthError::InvalidCredentials));
+        }
+        Err(error) => {
+            record_login_success(
+                &state,
+                peer_addr.ip(),
+                LoginSurface::OrganizationAdmin,
+                &identifier,
+            )?;
+            return Err(AdminApiError::from_auth(error));
+        }
+    };
     Ok(Json(session))
+}
+
+async fn admin_security(State(state): State<ServerState>) -> Json<AdminSecurityResponse> {
+    Json(AdminSecurityResponse {
+        turnstile_enabled: state.turnstile.is_enabled(),
+        turnstile_site_key: state.turnstile.site_key().map(str::to_string),
+    })
+}
+
+async fn platform_login(
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    State(state): State<ServerState>,
+    Json(request): Json<PlatformLoginRequest>,
+) -> Result<Json<PlatformLoginResponse>, AdminApiError> {
+    check_login_attempt(
+        &state,
+        peer_addr.ip(),
+        LoginSurface::Platform,
+        "platform-token",
+    )?;
+    state
+        .turnstile
+        .verify(&request.turnstile_token, peer_addr.ip())
+        .await
+        .map_err(AdminApiError::from_turnstile)?;
+    if !platform_token_matches(&state.admin_token, &request.platform_token) {
+        if let Some(error) = record_login_failure(
+            &state,
+            peer_addr.ip(),
+            LoginSurface::Platform,
+            "platform-token",
+        )? {
+            return Err(AdminApiError::from_auth(error));
+        }
+        return Err(AdminApiError::from_auth(AuthError::InvalidCredentials));
+    }
+
+    record_login_success(
+        &state,
+        peer_addr.ip(),
+        LoginSurface::Platform,
+        "platform-token",
+    )?;
+    let access_token = lock_platform_sessions(&state)?.issue();
+    Ok(Json(PlatformLoginResponse { access_token }))
 }
 
 async fn admin_logout(
@@ -79,12 +243,15 @@ async fn admin_logout(
     headers: HeaderMap,
 ) -> Result<StatusCode, AdminApiError> {
     let principal = authenticate_principal(&headers, &state)?;
-    if matches!(principal, AdminPrincipal::Organization(_)) {
-        let token = bearer_token(&headers)?;
-        let mut auth = lock_auth(&state)?;
-        auth.logout(token).map_err(AdminApiError::from_auth)?;
-        auth.save_to_path(&state.auth_state_path)
-            .map_err(AdminApiError::from_auth)?;
+    let token = bearer_token(&headers)?;
+    match principal {
+        AdminPrincipal::Platform => lock_platform_sessions(&state)?.revoke(token),
+        AdminPrincipal::Organization(_) => {
+            let mut auth = lock_auth(&state)?;
+            auth.logout(token).map_err(AdminApiError::from_auth)?;
+            auth.save_to_path(&state.auth_state_path)
+                .map_err(AdminApiError::from_auth)?;
+        }
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -408,7 +575,7 @@ fn authenticate_principal(
     state: &ServerState,
 ) -> Result<AdminPrincipal, AdminApiError> {
     let token = bearer_token(headers)?;
-    if token == state.admin_token.as_str() {
+    if lock_platform_sessions(state)?.authenticate(token) {
         return Ok(AdminPrincipal::Platform);
     }
     let auth = lock_auth(state)?;
@@ -470,6 +637,56 @@ fn lock_service(
         .map_err(|_| AdminApiError::internal("ledger service lock poisoned"))
 }
 
+fn lock_platform_sessions(
+    state: &ServerState,
+) -> Result<std::sync::MutexGuard<'_, PlatformSessions>, AdminApiError> {
+    state
+        .platform_sessions
+        .lock()
+        .map_err(|_| AdminApiError::internal("platform session lock poisoned"))
+}
+
+fn check_login_attempt(
+    state: &ServerState,
+    ip: IpAddr,
+    surface: LoginSurface,
+    identifier: &str,
+) -> Result<(), AdminApiError> {
+    state
+        .login_protection
+        .lock()
+        .map_err(|_| AdminApiError::internal("login protection lock poisoned"))?
+        .check(ip, surface, identifier)
+        .map_err(AdminApiError::from_auth)
+}
+
+fn record_login_failure(
+    state: &ServerState,
+    ip: IpAddr,
+    surface: LoginSurface,
+    identifier: &str,
+) -> Result<Option<AuthError>, AdminApiError> {
+    Ok(state
+        .login_protection
+        .lock()
+        .map_err(|_| AdminApiError::internal("login protection lock poisoned"))?
+        .record_failure(ip, surface, identifier))
+}
+
+fn record_login_success(
+    state: &ServerState,
+    ip: IpAddr,
+    surface: LoginSurface,
+    identifier: &str,
+) -> Result<(), AdminApiError> {
+    state
+        .login_protection
+        .lock()
+        .map_err(|_| AdminApiError::internal("login protection lock poisoned"))?
+        .record_success(ip, surface, identifier);
+    Ok(())
+}
+
 fn persist_service(state: &ServerState, service: &AppLedgerService) -> Result<(), AdminApiError> {
     service
         .save_to_path(&state.ledger_state_path)
@@ -517,6 +734,29 @@ struct OrganizationWithMembers {
 struct AdminLoginRequest {
     identifier: String,
     password: String,
+    #[serde(default)]
+    turnstile_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlatformLoginRequest {
+    platform_token: String,
+    #[serde(default)]
+    turnstile_token: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlatformLoginResponse {
+    access_token: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminSecurityResponse {
+    turnstile_enabled: bool,
+    turnstile_site_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -561,6 +801,7 @@ struct ErrorResponse {
 struct AdminApiError {
     status: StatusCode,
     message: String,
+    retry_after_seconds: Option<u64>,
 }
 
 impl AdminApiError {
@@ -568,6 +809,7 @@ impl AdminApiError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: message.into(),
+            retry_after_seconds: None,
         }
     }
 
@@ -575,6 +817,7 @@ impl AdminApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             message: message.into(),
+            retry_after_seconds: None,
         }
     }
 
@@ -582,6 +825,7 @@ impl AdminApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            retry_after_seconds: None,
         }
     }
 
@@ -589,6 +833,7 @@ impl AdminApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
+            retry_after_seconds: None,
         }
     }
 
@@ -604,12 +849,20 @@ impl AdminApiError {
         Self {
             status,
             message: error.to_string(),
+            retry_after_seconds: None,
         }
     }
 
     fn from_auth(error: AuthError) -> Self {
-        let status = match error {
+        let retry_after_seconds = match &error {
+            AuthError::LoginRateLimited {
+                retry_after_seconds,
+            } => Some(*retry_after_seconds),
+            _ => None,
+        };
+        let status = match &error {
             AuthError::InvalidCredentials | AuthError::SessionNotFound => StatusCode::UNAUTHORIZED,
+            AuthError::LoginRateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             AuthError::AdminAccessDenied | AuthError::BusinessAppAccessDenied => {
                 StatusCode::FORBIDDEN
             }
@@ -622,24 +875,45 @@ impl AdminApiError {
             AuthError::LoginIdentifierRequired
             | AuthError::DisplayNameRequired
             | AuthError::PasswordRequired
+            | AuthError::PasswordPolicyViolation
             | AuthError::InstallationIdRequired => StatusCode::BAD_REQUEST,
         };
         Self {
             status,
             message: error.to_string(),
+            retry_after_seconds,
+        }
+    }
+
+    fn from_turnstile(error: TurnstileError) -> Self {
+        let status = match error {
+            TurnstileError::TokenRequired => StatusCode::BAD_REQUEST,
+            TurnstileError::Rejected => StatusCode::FORBIDDEN,
+            TurnstileError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        };
+        Self {
+            status,
+            message: error.to_string(),
+            retry_after_seconds: None,
         }
     }
 }
 
 impl IntoResponse for AdminApiError {
     fn into_response(self) -> Response {
-        (
+        let mut response = (
             self.status,
             Json(ErrorResponse {
                 error: self.message,
             }),
         )
-            .into_response()
+            .into_response();
+        if let Some(retry_after_seconds) = self.retry_after_seconds {
+            if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+                response.headers_mut().insert(RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
 
@@ -654,6 +928,10 @@ mod tests {
         ServerState::load(data_dir).expect("server state")
     }
 
+    fn peer_addr() -> ConnectInfo<SocketAddr> {
+        ConnectInfo("127.0.0.1:42000".parse().expect("peer address"))
+    }
+
     fn authorization_headers(token: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -664,7 +942,12 @@ mod tests {
     }
 
     fn platform_headers(state: &ServerState) -> HeaderMap {
-        authorization_headers(&state.admin_token)
+        let token = state
+            .platform_sessions
+            .lock()
+            .expect("platform sessions")
+            .issue();
+        authorization_headers(&token)
     }
 
     fn organization_request(name: &str, email: &str) -> CreateOrganizationRequest {
@@ -694,10 +977,12 @@ mod tests {
 
     async fn organization_admin_headers(state: &ServerState, email: &str) -> HeaderMap {
         let session = admin_login(
+            peer_addr(),
             State(state.clone()),
             Json(AdminLoginRequest {
                 identifier: email.to_string(),
                 password: "admin-password".to_string(),
+                turnstile_token: String::new(),
             }),
         )
         .await
@@ -727,6 +1012,36 @@ mod tests {
             installation_id: "admin-phone".to_string(),
         });
         assert_eq!(app_login.unwrap_err(), AuthError::BusinessAppAccessDenied);
+    }
+
+    #[tokio::test]
+    async fn platform_token_must_be_exchanged_for_a_session() {
+        let state = test_state();
+        let raw_token_error = list_organizations(
+            State(state.clone()),
+            authorization_headers(&state.admin_token),
+        )
+        .await
+        .expect_err("raw platform token is not an API session");
+        assert_eq!(raw_token_error.status, StatusCode::UNAUTHORIZED);
+
+        let session = platform_login(
+            peer_addr(),
+            State(state.clone()),
+            Json(PlatformLoginRequest {
+                platform_token: state.admin_token.to_string(),
+                turnstile_token: String::new(),
+            }),
+        )
+        .await
+        .expect("exchange platform token")
+        .0;
+        let organizations =
+            list_organizations(State(state), authorization_headers(&session.access_token))
+                .await
+                .expect("platform session is authorized")
+                .0;
+        assert!(organizations.is_empty());
     }
 
     #[tokio::test]
@@ -813,14 +1128,64 @@ mod tests {
         .expect("add employee");
 
         let error = admin_login(
+            peer_addr(),
             State(state),
             Json(AdminLoginRequest {
                 identifier: "employee@example.com".to_string(),
                 password: "employee-password".to_string(),
+                turnstile_token: String::new(),
             }),
         )
         .await
         .expect_err("business login rejected");
         assert_eq!(error.status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn repeated_bad_passwords_lock_admin_login() {
+        let state = test_state();
+        create_test_organization(&state, "First", "first-admin@example.com").await;
+
+        for _ in 0..4 {
+            let error = admin_login(
+                peer_addr(),
+                State(state.clone()),
+                Json(AdminLoginRequest {
+                    identifier: "first-admin@example.com".to_string(),
+                    password: "incorrect-password".to_string(),
+                    turnstile_token: String::new(),
+                }),
+            )
+            .await
+            .expect_err("bad password rejected");
+            assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        }
+
+        let locked = admin_login(
+            peer_addr(),
+            State(state.clone()),
+            Json(AdminLoginRequest {
+                identifier: "first-admin@example.com".to_string(),
+                password: "incorrect-password".to_string(),
+                turnstile_token: String::new(),
+            }),
+        )
+        .await
+        .expect_err("fifth failure locks login");
+        assert_eq!(locked.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(locked.retry_after_seconds, Some(15 * 60));
+
+        let still_locked = admin_login(
+            peer_addr(),
+            State(state),
+            Json(AdminLoginRequest {
+                identifier: "first-admin@example.com".to_string(),
+                password: "admin-password".to_string(),
+                turnstile_token: String::new(),
+            }),
+        )
+        .await
+        .expect_err("correct password waits for lockout expiry");
+        assert_eq!(still_locked.status, StatusCode::TOO_MANY_REQUESTS);
     }
 }

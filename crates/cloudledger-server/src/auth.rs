@@ -12,8 +12,14 @@ use argon2::{
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
+
+pub const MIN_PASSWORD_LENGTH: usize = 12;
+pub const MAX_PASSWORD_LENGTH: usize = 128;
+const APP_ACCESS_TOKEN_TTL: Duration = Duration::minutes(15);
+const APP_REFRESH_TOKEN_TTL: Duration = Duration::days(30);
+const ADMIN_SESSION_TTL: Duration = Duration::hours(8);
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AuthError {
@@ -27,12 +33,16 @@ pub enum AuthError {
     DisplayNameRequired,
     #[error("password is required")]
     PasswordRequired,
+    #[error("password must be between 12 and 128 characters")]
+    PasswordPolicyViolation,
     #[error("installation id is required")]
     InstallationIdRequired,
     #[error("installation is already bound to another account")]
     InstallationAlreadyBound,
     #[error("invalid credentials")]
     InvalidCredentials,
+    #[error("too many login attempts; try again in {retry_after_seconds} seconds")]
+    LoginRateLimited { retry_after_seconds: u64 },
     #[error("organization admin accounts cannot use the business app")]
     BusinessAppAccessDenied,
     #[error("business accounts cannot use the organization admin backend")]
@@ -205,8 +215,10 @@ impl AuthService {
 
         let document = fs::read_to_string(path)
             .map_err(|err| AuthError::Storage(format!("read {}: {err}", path.display())))?;
-        serde_json::from_str(&document)
-            .map_err(|err| AuthError::Storage(format!("parse {}: {err}", path.display())))
+        let mut service: Self = serde_json::from_str(&document)
+            .map_err(|err| AuthError::Storage(format!("parse {}: {err}", path.display())))?;
+        service.prune_expired_sessions();
+        Ok(service)
     }
 
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), AuthError> {
@@ -244,7 +256,7 @@ impl AuthService {
         let display_name = normalize_display_name(&input.display_name)?;
         let email = input.email.and_then(normalize_optional_email);
         let phone = input.phone.and_then(normalize_optional_phone);
-        let password = normalize_password(&input.password)?;
+        let password = validate_new_password(&input.password)?;
         require_login_identifier(&email, &phone)?;
         let installation_id = normalize_installation_id(&input.installation_id)?;
 
@@ -293,9 +305,8 @@ impl AuthService {
         let password = input
             .password
             .as_deref()
-            .map(str::trim)
-            .filter(|password| !password.is_empty())
-            .map(str::to_string);
+            .map(validate_new_password)
+            .transpose()?;
         let password_was_updated = password.is_some();
         require_login_identifier(&email, &phone)?;
         self.ensure_identifier_available(input.user_id, email.as_deref(), phone.as_deref())?;
@@ -361,9 +372,10 @@ impl AuthService {
         let phone = input.phone.and_then(normalize_optional_phone);
         require_login_identifier(&email, &phone)?;
         let installation_id = normalize_installation_id(&input.installation_id)?;
-        let user_id = self
-            .find_user_id(email.as_deref(), phone.as_deref())
-            .ok_or(AuthError::InvalidCredentials)?;
+        let Some(user_id) = self.find_user_id(email.as_deref(), phone.as_deref()) else {
+            consume_unknown_user_password_work(&input.password)?;
+            return Err(AuthError::InvalidCredentials);
+        };
         let user = self
             .users_by_id
             .get(&user_id)
@@ -380,9 +392,10 @@ impl AuthService {
         let email = input.email.and_then(normalize_optional_email);
         let phone = input.phone.and_then(normalize_optional_phone);
         require_login_identifier(&email, &phone)?;
-        let user_id = self
-            .find_user_id(email.as_deref(), phone.as_deref())
-            .ok_or(AuthError::InvalidCredentials)?;
+        let Some(user_id) = self.find_user_id(email.as_deref(), phone.as_deref()) else {
+            consume_unknown_user_password_work(&input.password)?;
+            return Err(AuthError::InvalidCredentials);
+        };
         let user = self
             .users_by_id
             .get(&user_id)
@@ -405,6 +418,9 @@ impl AuthService {
             .remove(&access_token)
             .ok_or(AuthError::SessionNotFound)?;
         if session.kind != SessionKind::App {
+            return Err(AuthError::SessionNotFound);
+        }
+        if session_expired(session.refreshed_at, APP_REFRESH_TOKEN_TTL) {
             return Err(AuthError::SessionNotFound);
         }
         if session.installation_id != installation_id {
@@ -436,6 +452,9 @@ impl AuthService {
         if session.kind != SessionKind::App {
             return Err(AuthError::InvalidCredentials);
         }
+        if session_expired(session.refreshed_at, APP_ACCESS_TOKEN_TTL) {
+            return Err(AuthError::InvalidCredentials);
+        }
         let user = self
             .users_by_id
             .get(&session.user_id)
@@ -459,6 +478,9 @@ impl AuthService {
             .get(access_token)
             .ok_or(AuthError::InvalidCredentials)?;
         if session.kind != SessionKind::Admin {
+            return Err(AuthError::InvalidCredentials);
+        }
+        if session_expired(session.created_at, ADMIN_SESSION_TTL) {
             return Err(AuthError::InvalidCredentials);
         }
         let user = self
@@ -509,6 +531,9 @@ impl AuthService {
             .ok_or(AuthError::InvalidCredentials)?
             .clone();
         if session.kind != SessionKind::App {
+            return Err(AuthError::InvalidCredentials);
+        }
+        if session_expired(session.refreshed_at, APP_ACCESS_TOKEN_TTL) {
             return Err(AuthError::InvalidCredentials);
         }
         let display_name = normalize_display_name(&input.display_name)?;
@@ -570,6 +595,7 @@ impl AuthService {
         user_id: Uuid,
         installation_id: String,
     ) -> Result<Session, AuthError> {
+        self.prune_expired_sessions();
         let user = self
             .users_by_id
             .get(&user_id)
@@ -599,6 +625,7 @@ impl AuthService {
     }
 
     fn issue_admin_session(&mut self, user_id: Uuid) -> Result<AdminSession, AuthError> {
+        self.prune_expired_sessions();
         let user = self
             .users_by_id
             .get(&user_id)
@@ -646,6 +673,34 @@ impl AuthService {
         self.installations_by_id
             .retain(|_, installed_user_id| *installed_user_id != user_id);
     }
+
+    fn prune_expired_sessions(&mut self) {
+        let expired_access_tokens = self
+            .sessions_by_access_token
+            .iter()
+            .filter_map(|(access_token, session)| {
+                let expired = match session.kind {
+                    SessionKind::App => {
+                        session_expired(session.refreshed_at, APP_REFRESH_TOKEN_TTL)
+                    }
+                    SessionKind::Admin => session_expired(session.created_at, ADMIN_SESSION_TTL),
+                };
+                expired.then_some(access_token.clone())
+            })
+            .collect::<Vec<_>>();
+        for access_token in expired_access_tokens {
+            if let Some(session) = self.sessions_by_access_token.remove(&access_token) {
+                if !session.refresh_token.is_empty() {
+                    self.access_tokens_by_refresh_token
+                        .remove(&session.refresh_token);
+                }
+            }
+        }
+    }
+}
+
+fn session_expired(timestamp: OffsetDateTime, ttl: Duration) -> bool {
+    OffsetDateTime::now_utc() - timestamp >= ttl
 }
 
 fn hash_password(password: &str) -> Result<String, AuthError> {
@@ -661,6 +716,10 @@ fn verify_password(password: &str, password_hash: &str) -> Result<(), AuthError>
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .map_err(|_| AuthError::InvalidCredentials)
+}
+
+fn consume_unknown_user_password_work(password: &str) -> Result<(), AuthError> {
+    hash_password(password).map(|_| ())
 }
 
 fn auth_user_dto(user: &StoredUser) -> AuthUserDto {
@@ -683,10 +742,11 @@ fn normalize_display_name(value: &str) -> Result<String, AuthError> {
     }
 }
 
-fn normalize_password(value: &str) -> Result<String, AuthError> {
-    let value = value.trim();
-    if value.is_empty() {
+fn validate_new_password(value: &str) -> Result<String, AuthError> {
+    if value.trim().is_empty() {
         Err(AuthError::PasswordRequired)
+    } else if !(MIN_PASSWORD_LENGTH..=MAX_PASSWORD_LENGTH).contains(&value.chars().count()) {
+        Err(AuthError::PasswordPolicyViolation)
     } else {
         Ok(value.to_string())
     }
@@ -832,6 +892,14 @@ mod tests {
         assert!(auth
             .authenticate_access_token(&admin_session.access_token)
             .is_err());
+
+        auth.sessions_by_access_token
+            .get_mut(&admin_session.access_token)
+            .expect("stored admin session")
+            .created_at = OffsetDateTime::now_utc() - Duration::hours(9);
+        assert!(auth
+            .authenticate_admin_access_token(&admin_session.access_token)
+            .is_err());
     }
 
     #[test]
@@ -842,7 +910,7 @@ mod tests {
             display_name: "Alice".to_string(),
             email: Some("alice@example.com".to_string()),
             phone: None,
-            password: "correct".to_string(),
+            password: "correct-password".to_string(),
             installation_id: "phone-1".to_string(),
         })
         .unwrap();
@@ -851,11 +919,54 @@ mod tests {
             auth.login(LoginInput {
                 email: Some("alice@example.com".to_string()),
                 phone: None,
-                password: "wrong".to_string(),
+                password: "wrong-password".to_string(),
                 installation_id: "phone-1".to_string(),
             })
             .unwrap_err(),
             AuthError::InvalidCredentials
+        );
+    }
+
+    #[test]
+    fn rejects_weak_new_passwords() {
+        let mut auth = AuthService::default();
+
+        assert_eq!(
+            auth.register(RegisterInput {
+                user_id: None,
+                display_name: "Alice".to_string(),
+                email: Some("alice@example.com".to_string()),
+                phone: None,
+                password: "too-short".to_string(),
+                installation_id: "phone-1".to_string(),
+            })
+            .unwrap_err(),
+            AuthError::PasswordPolicyViolation
+        );
+
+        let user_id = Uuid::new_v4();
+        auth.create_or_update_admin_user(AdminCreateUserInput {
+            user_id,
+            display_name: "Alice".to_string(),
+            email: Some("alice@example.com".to_string()),
+            phone: None,
+            password: Some("correct-password".to_string()),
+            account_kind: AccountKind::Business,
+            organization_id: None,
+        })
+        .unwrap();
+        assert_eq!(
+            auth.create_or_update_admin_user(AdminCreateUserInput {
+                user_id,
+                display_name: "Alice".to_string(),
+                email: Some("alice@example.com".to_string()),
+                phone: None,
+                password: Some(String::new()),
+                account_kind: AccountKind::Business,
+                organization_id: None,
+            })
+            .unwrap_err(),
+            AuthError::PasswordRequired
         );
     }
 
@@ -867,7 +978,7 @@ mod tests {
             display_name: "Alice".to_string(),
             email: Some("alice@example.com".to_string()),
             phone: None,
-            password: "correct".to_string(),
+            password: "correct-password".to_string(),
             installation_id: "phone-1".to_string(),
         })
         .unwrap();
@@ -876,7 +987,7 @@ mod tests {
             display_name: "Bob".to_string(),
             email: Some("bob@example.com".to_string()),
             phone: None,
-            password: "correct".to_string(),
+            password: "correct-password".to_string(),
             installation_id: "phone-2".to_string(),
         })
         .unwrap();
@@ -885,7 +996,7 @@ mod tests {
             auth.login(LoginInput {
                 email: Some("bob@example.com".to_string()),
                 phone: None,
-                password: "correct".to_string(),
+                password: "correct-password".to_string(),
                 installation_id: "phone-1".to_string(),
             })
             .unwrap_err(),
@@ -902,7 +1013,7 @@ mod tests {
                 display_name: "Alice".to_string(),
                 email: Some("alice@example.com".to_string()),
                 phone: None,
-                password: "correct".to_string(),
+                password: "correct-password".to_string(),
                 installation_id: "phone-1".to_string(),
             })
             .unwrap();
@@ -921,6 +1032,45 @@ mod tests {
                 .user
                 .id,
             refreshed.user.id
+        );
+    }
+
+    #[test]
+    fn expired_access_token_can_refresh_but_expired_refresh_token_cannot() {
+        let mut auth = AuthService::default();
+        let first = auth
+            .register(RegisterInput {
+                user_id: None,
+                display_name: "Alice".to_string(),
+                email: Some("alice@example.com".to_string()),
+                phone: None,
+                password: "correct-password".to_string(),
+                installation_id: "phone-1".to_string(),
+            })
+            .unwrap();
+        auth.sessions_by_access_token
+            .get_mut(&first.access_token)
+            .expect("stored app session")
+            .refreshed_at = OffsetDateTime::now_utc() - Duration::minutes(16);
+        assert!(auth.authenticate_access_token(&first.access_token).is_err());
+
+        let refreshed = auth
+            .refresh(RefreshInput {
+                refresh_token: first.refresh_token,
+                installation_id: "phone-1".to_string(),
+            })
+            .expect("refresh within refresh-token lifetime");
+        auth.sessions_by_access_token
+            .get_mut(&refreshed.access_token)
+            .expect("stored refreshed session")
+            .refreshed_at = OffsetDateTime::now_utc() - Duration::days(31);
+        assert_eq!(
+            auth.refresh(RefreshInput {
+                refresh_token: refreshed.refresh_token,
+                installation_id: "phone-1".to_string(),
+            })
+            .unwrap_err(),
+            AuthError::SessionNotFound
         );
     }
 }
