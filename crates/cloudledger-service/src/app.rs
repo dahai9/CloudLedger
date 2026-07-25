@@ -29,6 +29,8 @@ pub enum AppServiceError {
     OrganizationNotFound,
     #[error("membership was not found")]
     MembershipNotFound,
+    #[error("employee account already belongs to another organization")]
+    EmployeeBelongsToAnotherOrganization,
     #[error("transaction was not found")]
     TransactionNotFound,
     #[error("actor is not authorized for this action")]
@@ -45,12 +47,8 @@ pub enum AppServiceError {
     UnsupportedTransactionKind,
     #[error("organization must keep at least one owner")]
     LastOwnerDenied,
-    #[error("CloudLedger is already initialized")]
-    AlreadyInitialized,
     #[error("CloudLedger setup is incomplete")]
     SetupIncomplete,
-    #[error("CloudLedger currently supports exactly one organization")]
-    SingleOrganizationOnly,
     #[error("organization name is required")]
     InvalidOrganizationName,
     #[error("user display name is required")]
@@ -159,12 +157,12 @@ pub struct AppEnsureUserIdentityInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AppBootstrapOrganizationInput {
+pub struct AppCreateOrganizationInput {
     pub organization_name: String,
-    pub owner_user_id: Uuid,
-    pub owner_display_name: String,
-    pub owner_email: Option<String>,
-    pub owner_phone: Option<String>,
+    pub admin_user_id: Uuid,
+    pub admin_display_name: String,
+    pub admin_email: Option<String>,
+    pub admin_phone: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,7 +275,6 @@ impl AppLedgerService {
             }
         };
         service.schema_version = APP_STATE_SCHEMA_VERSION;
-        service.ensure_single_organization_invariant()?;
         service.save_to_path(path)?;
         Ok(service)
     }
@@ -566,14 +563,15 @@ impl AppLedgerService {
         let owner_count = self
             .organizations
             .keys()
-            .next()
             .map(|organization_id| self.owner_count(*organization_id))
-            .unwrap_or(0);
+            .sum();
         let reason = if organization_count == 0 {
             Some("missing_organization".to_string())
-        } else if organization_count > 1 {
-            Some("multiple_organizations".to_string())
-        } else if owner_count == 0 {
+        } else if self
+            .organizations
+            .keys()
+            .any(|organization_id| self.owner_count(*organization_id) == 0)
+        {
             Some("missing_owner".to_string())
         } else {
             None
@@ -587,70 +585,58 @@ impl AppLedgerService {
         }
     }
 
-    pub fn bootstrap_single_organization(
+    pub fn create_organization(
         &mut self,
-        input: AppBootstrapOrganizationInput,
+        input: AppCreateOrganizationInput,
     ) -> Result<MembershipDto, AppServiceError> {
-        self.ensure_single_organization_invariant()?;
-        if self.setup_status().initialized || !self.organizations.is_empty() {
-            return Err(AppServiceError::AlreadyInitialized);
-        }
-
         let organization_name = input.organization_name.trim();
         if organization_name.is_empty() {
             return Err(AppServiceError::InvalidOrganizationName);
         }
-        let owner_display_name = input.owner_display_name.trim();
-        if owner_display_name.is_empty() {
+        let admin_display_name = input.admin_display_name.trim();
+        if admin_display_name.is_empty() {
             return Err(AppServiceError::InvalidUserDisplayName);
         }
-        let owner_email = input.owner_email.and_then(normalize_optional_email);
-        let owner_phone = input.owner_phone.and_then(normalize_optional_phone);
-        if owner_email.is_none() && owner_phone.is_none() {
+        let admin_email = input.admin_email.and_then(normalize_optional_email);
+        let admin_phone = input.admin_phone.and_then(normalize_optional_phone);
+        if admin_email.is_none() && admin_phone.is_none() {
             return Err(AppServiceError::SetupIncomplete);
         }
 
-        let owner = User {
-            id: input.owner_user_id,
-            display_name: owner_display_name.to_string(),
-            email: owner_email,
-            phone: owner_phone,
+        let admin = User {
+            id: input.admin_user_id,
+            display_name: admin_display_name.to_string(),
+            email: admin_email,
+            phone: admin_phone,
             created_at: OffsetDateTime::now_utc(),
         };
-        let organization = Organization::new(organization_name, owner.id);
-        let personal_ledger = Ledger::personal(owner.id, format!("{owner_display_name} 私账"));
+        let organization = Organization::new(organization_name, admin.id);
         let public_ledger =
             Ledger::organization_public(organization.id, format!("{} 公账", organization.name));
-        let personal_cash = FinancialAccount::new(
-            personal_ledger.id,
-            "个人现金",
-            FinancialAccountKind::Cash,
-            Money::new(0, "CNY").expect("zero CNY is valid"),
-        );
         let company_bank = FinancialAccount::new(
             public_ledger.id,
             "公司银行账户",
             FinancialAccountKind::Bank,
             Money::new(0, "CNY").expect("zero CNY is valid"),
         );
-        let membership = Membership::new(organization.id, owner.id, MembershipRole::Owner);
+        let membership = Membership::new(organization.id, admin.id, MembershipRole::Owner);
         let membership_dto = MembershipDto {
             id: membership.id.to_string(),
             organization_id: membership.organization_id.to_string(),
             user_id: membership.user_id.to_string(),
-            display_name: owner.display_name.clone(),
-            email: owner.email.clone(),
-            phone: owner.phone.clone(),
+            display_name: admin.display_name.clone(),
+            email: admin.email.clone(),
+            phone: admin.phone.clone(),
             role: membership_role_name(membership.role).to_string(),
         };
 
-        self.current_user_id = owner.id;
-        self.users.insert(owner.id, owner);
+        if self.current_user_id.is_nil() {
+            self.current_user_id = admin.id;
+        }
+        self.users.insert(admin.id, admin);
         self.organizations.insert(organization.id, organization);
         self.memberships.push(membership);
-        self.accounts.insert(personal_cash.id, personal_cash);
         self.accounts.insert(company_bank.id, company_bank);
-        self.ledgers.insert(personal_ledger.id, personal_ledger);
         self.ledgers.insert(public_ledger.id, public_ledger);
         Ok(membership_dto)
     }
@@ -749,7 +735,6 @@ impl AppLedgerService {
         &mut self,
         input: AppAddOrganizationMemberInput,
     ) -> Result<MembershipDto, AppServiceError> {
-        self.ensure_single_organization_invariant()?;
         if !self.organizations.contains_key(&input.organization_id) {
             return Err(AppServiceError::OrganizationNotFound);
         }
@@ -774,6 +759,12 @@ impl AppLedgerService {
                 self.users.insert(user_id, user);
                 user_id
             });
+
+        if self.memberships.iter().any(|membership| {
+            membership.user_id == user_id && membership.organization_id != input.organization_id
+        }) {
+            return Err(AppServiceError::EmployeeBelongsToAnotherOrganization);
+        }
 
         if let Some(user) = self.users.get_mut(&user_id) {
             user.display_name = display_name.to_string();
@@ -811,7 +802,6 @@ impl AppLedgerService {
         &mut self,
         input: AppUpdateOrganizationMemberRoleInput,
     ) -> Result<MembershipDto, AppServiceError> {
-        self.ensure_single_organization_invariant()?;
         if !self.organizations.contains_key(&input.organization_id) {
             return Err(AppServiceError::OrganizationNotFound);
         }
@@ -839,7 +829,6 @@ impl AppLedgerService {
         organization_id: Uuid,
         membership_id: Uuid,
     ) -> Result<(), AppServiceError> {
-        self.ensure_single_organization_invariant()?;
         if !self.organizations.contains_key(&organization_id) {
             return Err(AppServiceError::OrganizationNotFound);
         }
@@ -1162,28 +1151,17 @@ impl AppLedgerService {
             .count()
     }
 
-    fn ensure_single_organization_invariant(&self) -> Result<(), AppServiceError> {
-        if self.organizations.len() > 1 {
-            return Err(AppServiceError::SingleOrganizationOnly);
-        }
-
-        let Some(organization_id) = self.organizations.keys().next().copied() else {
-            return Ok(());
-        };
-
-        let has_foreign_membership = self
-            .memberships
+    pub fn organization_admin_accounts(&self) -> Vec<(Uuid, Uuid)> {
+        self.memberships
             .iter()
-            .any(|membership| membership.organization_id != organization_id);
-        let has_foreign_public_ledger = self.ledgers.values().any(|ledger| {
-            ledger.kind == LedgerKind::OrganizationPublic
-                && ledger.organization_id != Some(organization_id)
-        });
-        if has_foreign_membership || has_foreign_public_ledger {
-            return Err(AppServiceError::SingleOrganizationOnly);
-        }
-
-        Ok(())
+            .filter(|membership| {
+                matches!(
+                    membership.role,
+                    MembershipRole::Owner | MembershipRole::Admin
+                )
+            })
+            .map(|membership| (membership.user_id, membership.organization_id))
+            .collect()
     }
 
     fn ensure_personal_ledger_for_user(
@@ -1324,83 +1302,94 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_single_organization_creates_owner_ledgers_and_accounts() {
+    fn create_organization_creates_admin_without_personal_ledger() {
         let mut service = AppLedgerService::uninitialized();
-        let owner_user_id = Uuid::new_v4();
+        let admin_user_id = Uuid::new_v4();
 
         let member = service
-            .bootstrap_single_organization(AppBootstrapOrganizationInput {
+            .create_organization(AppCreateOrganizationInput {
                 organization_name: "星河贸易".to_string(),
-                owner_user_id,
-                owner_display_name: "Owner".to_string(),
-                owner_email: Some("OWNER@Example.COM ".to_string()),
-                owner_phone: None,
+                admin_user_id,
+                admin_display_name: "Admin".to_string(),
+                admin_email: Some("ADMIN@Example.COM ".to_string()),
+                admin_phone: None,
             })
-            .expect("bootstrap organization");
+            .expect("create organization");
         let status = service.setup_status();
-        let overview = service.overview(owner_user_id);
+        let overview = service.overview(admin_user_id);
 
         assert!(status.initialized);
         assert_eq!(status.organization_count, 1);
         assert_eq!(status.owner_count, 1);
         assert_eq!(member.role, "owner");
-        assert_eq!(member.email.as_deref(), Some("owner@example.com"));
+        assert_eq!(member.email.as_deref(), Some("admin@example.com"));
         assert_eq!(service.organizations().len(), 1);
-        assert_eq!(overview.current_user.display_name, "Owner");
-        assert!(overview
+        assert_eq!(overview.current_user.display_name, "Admin");
+        assert!(!overview
             .ledgers
             .iter()
-            .any(|ledger| { ledger.kind == "personal" && ledger.name == "Owner 私账" }));
+            .any(|ledger| ledger.kind == "personal"));
         assert!(overview.ledgers.iter().any(|ledger| {
             ledger.kind == "organization_public" && ledger.name == "星河贸易 公账"
         }));
-        assert_eq!(overview.accounts.len(), 2);
+        assert_eq!(overview.accounts.len(), 1);
     }
 
     #[test]
-    fn bootstrap_rejects_second_organization() {
+    fn create_multiple_organizations_keeps_admins_scoped() {
         let mut service = AppLedgerService::uninitialized();
-        service
-            .bootstrap_single_organization(AppBootstrapOrganizationInput {
+        let first = service
+            .create_organization(AppCreateOrganizationInput {
                 organization_name: "星河贸易".to_string(),
-                owner_user_id: Uuid::new_v4(),
-                owner_display_name: "Owner".to_string(),
-                owner_email: Some("owner@example.com".to_string()),
-                owner_phone: None,
+                admin_user_id: Uuid::new_v4(),
+                admin_display_name: "First Admin".to_string(),
+                admin_email: Some("first-admin@example.com".to_string()),
+                admin_phone: None,
             })
-            .expect("first bootstrap");
+            .expect("first organization");
 
-        let result = service.bootstrap_single_organization(AppBootstrapOrganizationInput {
-            organization_name: "第二组织".to_string(),
-            owner_user_id: Uuid::new_v4(),
-            owner_display_name: "Second Owner".to_string(),
-            owner_email: Some("second@example.com".to_string()),
-            owner_phone: None,
-        });
+        let second = service
+            .create_organization(AppCreateOrganizationInput {
+                organization_name: "第二组织".to_string(),
+                admin_user_id: Uuid::new_v4(),
+                admin_display_name: "Second Admin".to_string(),
+                admin_email: Some("second-admin@example.com".to_string()),
+                admin_phone: None,
+            })
+            .expect("second organization");
 
-        assert!(matches!(result, Err(AppServiceError::AlreadyInitialized)));
-        assert_eq!(service.organizations().len(), 1);
+        assert_eq!(service.organizations().len(), 2);
+        assert_eq!(service.setup_status().owner_count, 2);
+        assert_ne!(first.organization_id, second.organization_id);
+        assert_eq!(service.organization_admin_accounts().len(), 2);
     }
 
     #[test]
-    fn loading_multiple_organizations_is_rejected() {
+    fn loading_multiple_organizations_is_supported() {
         let directory =
             std::env::temp_dir().join(format!("cloudledger-service-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).expect("create temp dir");
         let path = directory.join("ledger-state.json");
 
-        let mut service = AppLedgerService::seeded();
-        let owner_id = service.current_user_id();
-        let second = Organization::new("Second Organization", owner_id);
-        service.organizations.insert(second.id, second);
+        let mut service = AppLedgerService::uninitialized();
+        for (name, email) in [
+            ("First Organization", "first@example.com"),
+            ("Second Organization", "second@example.com"),
+        ] {
+            service
+                .create_organization(AppCreateOrganizationInput {
+                    organization_name: name.to_string(),
+                    admin_user_id: Uuid::new_v4(),
+                    admin_display_name: format!("{name} Admin"),
+                    admin_email: Some(email.to_string()),
+                    admin_phone: None,
+                })
+                .expect("create organization");
+        }
         service.save_to_path(&path).expect("save state");
 
-        let result = AppLedgerService::load_or_seed(&path);
-
-        assert!(matches!(
-            result,
-            Err(AppServiceError::SingleOrganizationOnly)
-        ));
+        let loaded = AppLedgerService::load_or_seed(&path).expect("load multi organization state");
+        assert_eq!(loaded.organizations().len(), 2);
 
         fs::remove_dir_all(directory).expect("remove temp dir");
     }

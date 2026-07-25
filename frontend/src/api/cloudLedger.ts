@@ -1,4 +1,5 @@
 import type { AccountDto, AuditLogDto, LedgerDto, LedgerOverview, TransactionDto } from "../api";
+import { cloudBaseUrl } from "../config";
 import type {
   ApprovalQueueItem,
   AuthSession,
@@ -35,7 +36,6 @@ export interface CloudLedgerApi {
 }
 
 let overviewCache: LedgerOverview | undefined;
-const cloudBaseUrl = import.meta.env.VITE_CLOUDLEDGER_CLOUD_URL ?? "http://192.168.1.229:8787";
 const sessionStorageKey = "cloudledger.session";
 const installationStorageKey = "cloudledger.installationId";
 
@@ -193,7 +193,7 @@ function authPayload(input: LoginDraft) {
 }
 
 async function authJson(path: string, body: unknown): Promise<AuthSession> {
-  const response = await fetch(`${cloudBaseUrl}${path}`, {
+  const response = await cloudFetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -214,7 +214,7 @@ async function authenticatedJson<T>(
     throw new AuthRequiredError();
   }
 
-  const response = await fetch(`${cloudBaseUrl}${path}`, {
+  const response = await cloudFetch(path, {
     method: options.method ?? "GET",
     headers: {
       Authorization: `Bearer ${session.accessToken}`,
@@ -244,7 +244,7 @@ async function authenticatedJson<T>(
 }
 
 async function refreshStoredSession(session: AuthSession) {
-  const response = await fetch(`${cloudBaseUrl}/auth/refresh`, {
+  const response = await cloudFetch("/auth/refresh", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -264,6 +264,15 @@ async function refreshStoredSession(session: AuthSession) {
 async function responseError(response: Response) {
   const body = (await response.json().catch(() => ({}))) as { error?: string };
   return new Error(body.error || `HTTP ${response.status}`);
+}
+
+async function cloudFetch(path: string, init?: RequestInit) {
+  try {
+    return await fetch(`${cloudBaseUrl}${path}`, init);
+  } catch (error) {
+    const detail = error instanceof DOMException && error.name === "AbortError" ? "请求超时" : "网络请求失败";
+    throw new Error(`无法连接后端 ${cloudBaseUrl}（${detail}）`, { cause: error });
+  }
 }
 
 function loadStoredSession(): AuthSession | undefined {
@@ -705,7 +714,7 @@ async function fetchCloudStatus(): Promise<UserSession["cloudStatus"]> {
   const timeout = window.setTimeout(() => controller.abort(), 2500);
 
   try {
-    const response = await fetch(`${cloudBaseUrl}/ready`, {
+    const response = await cloudFetch("/ready", {
       cache: "no-store",
       signal: controller.signal,
     });

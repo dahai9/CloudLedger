@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CloudLedger 后台</title>
+    <link rel="icon" href="data:," />
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f3f6f5;
+        --surface: #ffffff;
+        --surface-muted: #f7f9f8;
+        --ink: #17211d;
+        --muted: #63716b;
+        --line: #dce5e1;
+        --line-strong: #c5d3cd;
+        --green: #08776d;
+        --green-soft: #def3ee;
+        --blue: #315aa6;
+        --blue-soft: #e7efff;
+        --amber: #8b6100;
+        --amber-soft: #fff0bd;
+        --red: #b42318;
+        --red-soft: #fde8e5;
+        --shadow: 0 16px 42px rgb(23 33 29 / 8%);
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      * { box-sizing: border-box; }
+      body { margin: 0; background: var(--bg); color: var(--ink); }
+      button, input, select { font: inherit; letter-spacing: 0; }
+      button { min-height: 40px; border: 0; border-radius: 8px; padding: 0 14px; font-weight: 760; cursor: pointer; }
+      button:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity: .58; }
+      input, select { width: 100%; min-height: 42px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--ink); padding: 0 11px; }
+      input:focus, select:focus, button:focus-visible { outline: 3px solid rgb(8 119 109 / 20%); outline-offset: 2px; }
+      label { display: grid; gap: 6px; color: var(--muted); font-size: 13px; font-weight: 720; }
+      h1, h2, h3, p { margin: 0; }
+      .shell { width: min(1180px, calc(100% - 32px)); margin: 22px auto 48px; display: grid; gap: 16px; }
+      .topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+      .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+      .brand-mark { width: 42px; height: 42px; border-radius: 8px; display: grid; place-items: center; background: var(--ink); color: #fff; font-weight: 850; }
+      .brand h1 { font-size: 26px; line-height: 1.1; }
+      .brand p { margin-top: 4px; color: var(--muted); font-size: 13px; }
+      .top-actions, .inline-actions, .meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .primary { background: var(--green); color: #fff; }
+      .secondary { background: var(--green-soft); color: var(--green); }
+      .quiet { background: #eaf0ed; color: #283730; }
+      .danger { background: var(--red-soft); color: var(--red); }
+      .panel { border: 1px solid var(--line); border-radius: 8px; background: var(--surface); box-shadow: var(--shadow); }
+      .muted { color: var(--muted); font-size: 13px; }
+      .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+      .pill, .count, .role { display: inline-flex; align-items: center; width: fit-content; min-height: 28px; border-radius: 999px; padding: 0 10px; font-size: 12px; font-weight: 800; white-space: nowrap; }
+      .pill.platform { background: var(--blue-soft); color: var(--blue); }
+      .pill.organization, .role.approver { background: var(--green-soft); color: var(--green); }
+      .role.owner, .role.admin { background: var(--blue-soft); color: var(--blue); }
+      .role.accountant { background: #e5f4ff; color: #1f608e; }
+      .role.member { background: #edf2ef; color: #34453d; }
+      .role.viewer { background: var(--amber-soft); color: var(--amber); }
+      .count { background: #edf2ef; color: #34453d; }
+      .alert { border: 1px solid #edb8b1; border-radius: 8px; background: #fff7f6; color: var(--red); padding: 11px 13px; font-size: 13px; font-weight: 700; }
+
+      .auth-layout { width: min(760px, 100%); margin: 36px auto 0; display: grid; gap: 14px; }
+      .auth-panel { padding: 22px; display: grid; gap: 18px; }
+      .auth-copy { display: grid; gap: 7px; }
+      .auth-copy h2 { font-size: 24px; }
+      .segmented { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--line); border-radius: 8px; padding: 4px; background: var(--surface-muted); }
+      .segmented button { background: transparent; color: var(--muted); }
+      .segmented button.active { background: #fff; color: var(--ink); box-shadow: 0 2px 8px rgb(23 33 29 / 10%); }
+      .form { display: grid; gap: 14px; }
+      .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+      .form-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+
+      .metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+      .metric { border: 1px solid var(--line); border-radius: 8px; background: var(--surface); padding: 14px; }
+      .metric span { color: var(--muted); font-size: 12px; font-weight: 760; text-transform: uppercase; }
+      .metric strong { display: block; margin-top: 5px; font-size: 24px; }
+      .section-head { padding: 16px; display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; }
+      .section-title { display: grid; gap: 7px; min-width: 0; }
+      .section-title h2 { font-size: 22px; overflow-wrap: anywhere; }
+      .create-panel, .add-panel { padding: 17px; display: grid; gap: 15px; }
+      .org-list { display: grid; }
+      .org-row { padding: 15px 16px; display: grid; grid-template-columns: minmax(220px, 1.4fr) minmax(180px, 1fr) 180px; gap: 14px; align-items: center; border-top: 1px solid var(--line); }
+      .org-row:first-child { border-top: 0; }
+      .org-name, .person { display: grid; gap: 5px; min-width: 0; }
+      .org-name strong, .person strong, .contact { overflow-wrap: anywhere; }
+
+      .toolbar { padding: 13px 16px; border-top: 1px solid var(--line); background: var(--surface-muted); display: grid; grid-template-columns: minmax(220px, 1fr) 190px auto; gap: 10px; }
+      .member-table { overflow: hidden; }
+      .table-head, .member-row { display: grid; grid-template-columns: minmax(220px, 1.4fr) 135px minmax(180px, 1fr) 300px; gap: 12px; align-items: center; }
+      .table-head { min-height: 42px; padding: 0 16px; background: var(--surface-muted); border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; font-weight: 820; }
+      .member-row { padding: 14px 16px; border-bottom: 1px solid var(--line); }
+      .member-row:last-child { border-bottom: 0; }
+      .member-id { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+      .member-actions { display: flex; justify-content: flex-end; align-items: center; gap: 7px; flex-wrap: wrap; }
+      .role-control { display: grid; grid-template-columns: minmax(120px, 1fr) auto; gap: 7px; }
+      .row-extra { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 8px; }
+      .row-extra input { max-width: 280px; }
+      .locked { color: var(--blue); font-size: 12px; font-weight: 760; text-align: right; }
+      .empty { min-height: 190px; display: grid; place-items: center; padding: 28px; color: var(--muted); text-align: center; }
+      .toast { position: fixed; right: 18px; bottom: 18px; max-width: min(420px, calc(100% - 36px)); border: 1px solid var(--line); border-radius: 8px; background: #fff; box-shadow: var(--shadow); padding: 12px 14px; font-weight: 740; }
+      .toast.ok { border-color: #9fd6c8; color: var(--green); }
+      .toast.error { border-color: #edb8b1; color: var(--red); }
+
+      @media (max-width: 860px) {
+        .org-row, .table-head, .member-row, .toolbar { grid-template-columns: 1fr; }
+        .table-head { display: none; }
+        .member-actions, .row-extra { justify-content: flex-start; }
+        .locked { text-align: left; }
+      }
+      @media (max-width: 640px) {
+        .shell { width: min(100% - 20px, 1180px); margin-top: 12px; }
+        .topbar, .section-head { display: grid; }
+        .top-actions, .form-actions { justify-content: stretch; }
+        .top-actions button, .form-actions button { width: 100%; }
+        .form-grid, .metrics { grid-template-columns: 1fr; }
+        .role-control { grid-template-columns: 1fr auto; }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell" id="adminApp"></main>
+    <script>
+      const app = document.querySelector("#adminApp");
+      const employeeRoles = ["accountant", "approver", "member", "viewer"];
+      const roleLabels = {
+        owner: "组织管理员",
+        admin: "组织管理员",
+        accountant: "记账",
+        approver: "审批",
+        member: "成员",
+        viewer: "只读",
+      };
+      const state = {
+        token: sessionStorage.getItem("cloudledger.adminSession") || "",
+        principal: undefined,
+        organizations: [],
+        authMode: "organization",
+        loading: false,
+        pageError: "",
+        createOpen: false,
+        addOpen: false,
+        query: "",
+        roleFilter: "all",
+        busy: {},
+        resetId: "",
+        removeId: "",
+        toast: "",
+        toastTone: "ok",
+      };
+
+      render();
+      if (state.token) void loadSession();
+
+      function render() {
+        app.innerHTML = `${renderTopbar()}${state.pageError ? `<div class="alert">${escapeHtml(state.pageError)}</div>` : ""}${state.principal ? renderWorkspace() : renderAuth()}${state.toast ? `<div class="toast ${state.toastTone}" role="status">${escapeHtml(state.toast)}</div>` : ""}`;
+        bindEvents();
+      }
+
+      function renderTopbar() {
+        const scope = state.principal?.scope;
+        return `<header class="topbar">
+          <div class="brand"><div class="brand-mark">CL</div><div><h1>CloudLedger 后台</h1><p>${scope === "platform" ? "平台组织管理" : scope === "organization" ? "组织员工管理" : "安全管理入口"}</p></div></div>
+          <div class="top-actions">
+            ${scope ? `<span class="pill ${scope}">${scope === "platform" ? "平台管理员" : "组织管理员"}</span><button class="quiet" type="button" data-action="refresh" ${state.loading ? "disabled" : ""}>刷新</button><button class="quiet" type="button" data-action="logout">退出</button>` : ""}
+          </div>
+        </header>`;
+      }
+
+      function renderAuth() {
+        return `<section class="auth-layout">
+          <div class="panel auth-panel">
+            <div class="auth-copy"><h2>${state.authMode === "organization" ? "组织管理员登录" : "平台管理入口"}</h2><p class="muted">${state.authMode === "organization" ? "使用所属组织的后台账号。" : "使用服务器平台令牌创建和查看组织。"}</p></div>
+            <div class="segmented" aria-label="登录方式"><button type="button" class="${state.authMode === "organization" ? "active" : ""}" data-auth-mode="organization">组织账号</button><button type="button" class="${state.authMode === "platform" ? "active" : ""}" data-auth-mode="platform">平台令牌</button></div>
+            ${state.authMode === "organization" ? `<form class="form" id="organizationLoginForm"><label>邮箱或手机号<input id="loginIdentifier" autocomplete="username" required /></label><label>密码<input id="loginPassword" type="password" autocomplete="current-password" required /></label><div class="form-actions"><button class="primary" type="submit" ${state.loading ? "disabled" : ""}>${state.loading ? "登录中" : "登录"}</button></div></form>` : `<form class="form" id="platformLoginForm"><label>平台令牌<input id="platformToken" type="password" autocomplete="off" required /></label><div class="form-actions"><button class="primary" type="submit" ${state.loading ? "disabled" : ""}>${state.loading ? "验证中" : "进入平台"}</button></div></form>`}
+          </div>
+        </section>`;
+      }
+
+      function renderWorkspace() {
+        return state.principal.scope === "platform" ? renderPlatform() : renderOrganization();
+      }
+
+      function renderPlatform() {
+        const memberCount = state.organizations.reduce((total, item) => total + item.members.filter(isEmployee).length, 0);
+        return `<section class="metrics"><div class="metric"><span>Organizations</span><strong>${state.organizations.length}</strong></div><div class="metric"><span>Employees</span><strong>${memberCount}</strong></div><div class="metric"><span>Scope</span><strong>Platform</strong></div></section>
+          <section class="panel"><div class="section-head"><div class="section-title"><h2>组织</h2><p class="muted">平台入口只创建和查看组织。</p></div><button class="primary" type="button" data-action="toggle-create">${state.createOpen ? "关闭" : "创建组织"}</button></div>${state.createOpen ? renderCreateOrganization() : ""}${renderOrganizationList()}</section>`;
+      }
+
+      function renderCreateOrganization() {
+        return `<div class="create-panel"><form class="form" id="createOrganizationForm"><div class="form-grid"><label>组织名称<input id="organizationName" autocomplete="organization" required /></label><label>管理员显示名<input id="adminDisplayName" autocomplete="name" required /></label><label>管理员邮箱<input id="adminEmail" autocomplete="email" /></label><label>管理员手机号<input id="adminPhone" autocomplete="tel" /></label><label>管理员密码<input id="adminPassword" type="password" autocomplete="new-password" required /></label><label>确认密码<input id="adminPasswordConfirm" type="password" autocomplete="new-password" required /></label></div><div class="form-actions"><button class="primary" type="submit" ${state.loading ? "disabled" : ""}>创建</button></div></form></div>`;
+      }
+
+      function renderOrganizationList() {
+        if (!state.organizations.length) return `<div class="empty">尚未创建组织</div>`;
+        return `<div class="org-list">${state.organizations.map((item) => {
+          const admin = item.members.find(isAdminMember);
+          const employees = item.members.filter(isEmployee).length;
+          return `<div class="org-row"><div class="org-name"><strong>${escapeHtml(item.organization.name)}</strong><span class="muted mono">${escapeHtml(item.organization.id)}</span></div><div class="person"><strong>${escapeHtml(admin?.displayName || "未配置")}</strong><span class="muted">${escapeHtml(admin?.email || admin?.phone || "-")}</span></div><div class="meta"><span class="count">${employees} 名员工</span></div></div>`;
+        }).join("")}</div>`;
+      }
+
+      function renderOrganization() {
+        const item = state.organizations[0];
+        if (!item) return `<div class="panel empty">当前管理员未绑定有效组织</div>`;
+        const employees = filteredEmployees(item.members);
+        return `<section class="metrics"><div class="metric"><span>Organization</span><strong>${escapeHtml(item.organization.name)}</strong></div><div class="metric"><span>Employees</span><strong>${item.members.filter(isEmployee).length}</strong></div><div class="metric"><span>Admin</span><strong>${escapeHtml(state.principal.user?.displayName || "-")}</strong></div></section>
+          <section class="panel"><div class="section-head"><div class="section-title"><h2>${escapeHtml(item.organization.name)}</h2><div class="meta"><span class="pill organization">组织管理员</span><span class="muted mono">${escapeHtml(item.organization.id)}</span></div></div><button class="primary" type="button" data-action="toggle-add">${state.addOpen ? "关闭" : "新增员工"}</button></div>${state.addOpen ? renderAddEmployee() : ""}<div class="toolbar"><input id="memberQuery" value="${escapeHtml(state.query)}" placeholder="搜索姓名、邮箱或手机号" aria-label="搜索员工" /><select id="roleFilter" aria-label="按角色筛选"><option value="all">全部角色</option>${employeeRoles.map(role => `<option value="${role}" ${state.roleFilter === role ? "selected" : ""}>${roleLabels[role]}</option>`).join("")}</select><button class="quiet" type="button" data-action="clear-filter">清除</button></div></section>
+          <section class="panel member-table">${renderMemberTable(item, employees)}</section>`;
+      }
+
+      function renderAddEmployee() {
+        return `<div class="add-panel"><form class="form" id="addEmployeeForm"><div class="form-grid"><label>员工姓名<input id="employeeName" autocomplete="name" required /></label><label>角色<select id="employeeRole">${roleOptions("member")}</select></label><label>邮箱<input id="employeeEmail" autocomplete="email" /></label><label>手机号<input id="employeePhone" autocomplete="tel" /></label><label>初始密码<input id="employeePassword" type="password" autocomplete="new-password" required /></label><label>确认密码<input id="employeePasswordConfirm" type="password" autocomplete="new-password" required /></label></div><div class="form-actions"><button class="primary" type="submit" ${state.loading ? "disabled" : ""}>添加员工</button></div></form></div>`;
+      }
+
+      function renderMemberTable(item, employees) {
+        const admins = item.members.filter(isAdminMember);
+        const rows = [...admins, ...employees];
+        if (!rows.length) return `<div class="empty">没有符合条件的员工</div>`;
+        return `<div class="table-head"><span>账号</span><span>角色</span><span>联系方式</span><span>操作</span></div>${rows.map(member => renderMemberRow(item, member)).join("")}`;
+      }
+
+      function renderMemberRow(item, member) {
+        const admin = isAdminMember(member);
+        const busy = Boolean(state.busy[member.id]);
+        return `<div class="member-row" data-member-id="${escapeHtml(member.id)}"><div class="person"><strong>${escapeHtml(member.displayName)}</strong><span class="member-id mono">${escapeHtml(member.userId)}</span></div><span class="role ${escapeHtml(member.role)}">${roleLabels[member.role] || escapeHtml(member.role)}</span><div class="contact">${escapeHtml(member.email || member.phone || "-")}</div>${admin ? `<div class="locked">后台专用账号</div>` : `<div class="member-actions"><div class="role-control"><select name="memberRole-${escapeHtml(member.id)}" data-role-select ${busy ? "disabled" : ""}>${roleOptions(member.role)}</select><button class="secondary" type="button" data-action="save-role" ${busy ? "disabled" : ""}>保存</button></div><button class="quiet" type="button" data-action="toggle-reset" ${busy ? "disabled" : ""}>密码</button><button class="danger" type="button" data-action="remove" ${busy ? "disabled" : ""}>${state.removeId === member.id ? "确认删除" : "删除"}</button></div>`}${state.resetId === member.id && !admin ? `<div class="row-extra"><input name="resetPassword-${escapeHtml(member.id)}" data-reset-password type="password" autocomplete="new-password" placeholder="输入新密码" /><button class="secondary" type="button" data-action="save-password" ${busy ? "disabled" : ""}>重置密码</button></div>` : ""}</div>`;
+      }
+
+      function bindEvents() {
+        app.querySelectorAll("[data-auth-mode]").forEach(button => button.addEventListener("click", () => { state.authMode = button.dataset.authMode; state.pageError = ""; render(); }));
+        app.querySelector("#organizationLoginForm")?.addEventListener("submit", loginOrganization);
+        app.querySelector("#platformLoginForm")?.addEventListener("submit", loginPlatform);
+        app.querySelector("[data-action='logout']")?.addEventListener("click", logout);
+        app.querySelector("[data-action='refresh']")?.addEventListener("click", () => loadWorkspace(false));
+        app.querySelector("[data-action='toggle-create']")?.addEventListener("click", () => { state.createOpen = !state.createOpen; render(); });
+        app.querySelector("#createOrganizationForm")?.addEventListener("submit", createOrganization);
+        app.querySelector("[data-action='toggle-add']")?.addEventListener("click", () => { state.addOpen = !state.addOpen; render(); });
+        app.querySelector("#addEmployeeForm")?.addEventListener("submit", addEmployee);
+        app.querySelector("#memberQuery")?.addEventListener("input", event => { state.query = event.currentTarget.value; render(); app.querySelector("#memberQuery")?.focus(); });
+        app.querySelector("#roleFilter")?.addEventListener("change", event => { state.roleFilter = event.currentTarget.value; render(); });
+        app.querySelector("[data-action='clear-filter']")?.addEventListener("click", () => { state.query = ""; state.roleFilter = "all"; render(); });
+        app.querySelectorAll("[data-member-id]").forEach(row => bindMemberRow(row));
+      }
+
+      function bindMemberRow(row) {
+        const memberId = row.dataset.memberId;
+        row.querySelector("[data-action='save-role']")?.addEventListener("click", () => updateRole(memberId, row.querySelector("[data-role-select]").value));
+        row.querySelector("[data-action='toggle-reset']")?.addEventListener("click", () => { state.resetId = state.resetId === memberId ? "" : memberId; state.removeId = ""; render(); });
+        row.querySelector("[data-action='save-password']")?.addEventListener("click", () => resetPassword(memberId, row.querySelector("[data-reset-password]").value));
+        row.querySelector("[data-action='remove']")?.addEventListener("click", () => { if (state.removeId !== memberId) { state.removeId = memberId; state.resetId = ""; render(); return; } void removeEmployee(memberId); });
+      }
+
+      async function loginOrganization(event) {
+        event.preventDefault();
+        await run(async () => {
+          const session = await api("/admin/api/login", { method: "POST", body: JSON.stringify({ identifier: app.querySelector("#loginIdentifier").value.trim(), password: app.querySelector("#loginPassword").value }) }, false);
+          await acceptToken(session.accessToken);
+        }, "登录失败");
+      }
+
+      async function loginPlatform(event) {
+        event.preventDefault();
+        await run(async () => acceptToken(app.querySelector("#platformToken").value.trim()), "平台令牌验证失败");
+      }
+
+      async function acceptToken(token) {
+        state.token = token;
+        state.principal = await api("/admin/api/me");
+        sessionStorage.setItem("cloudledger.adminSession", token);
+        await loadWorkspace(true);
+      }
+
+      async function loadSession() {
+        await run(async () => {
+          state.principal = await api("/admin/api/me");
+          await loadWorkspace(true);
+        }, "登录状态已失效", true);
+      }
+
+      async function loadWorkspace(silent) {
+        try {
+          state.loading = true;
+          if (!silent) render();
+          state.organizations = await api("/admin/api/organizations");
+          state.pageError = "";
+        } catch (error) {
+          state.pageError = readableError(error, "加载失败");
+          if (error.status === 401 || error.status === 403) clearSession();
+        } finally {
+          state.loading = false;
+          render();
+        }
+      }
+
+      async function createOrganization(event) {
+        event.preventDefault();
+        const password = app.querySelector("#adminPassword").value;
+        if (password !== app.querySelector("#adminPasswordConfirm").value) return showToast("两次密码不一致", "error");
+        const email = app.querySelector("#adminEmail").value.trim();
+        const phone = app.querySelector("#adminPhone").value.trim();
+        if (!email && !phone) return showToast("管理员邮箱和手机号至少填写一个", "error");
+        await run(async () => {
+          await api("/admin/api/organizations", { method: "POST", body: JSON.stringify({ organizationName: app.querySelector("#organizationName").value.trim(), adminDisplayName: app.querySelector("#adminDisplayName").value.trim(), adminEmail: email || undefined, adminPhone: phone || undefined, adminPassword: password }) });
+          state.createOpen = false;
+          await loadWorkspace(true);
+          showToast("组织已创建");
+        }, "创建组织失败");
+      }
+
+      async function addEmployee(event) {
+        event.preventDefault();
+        const password = app.querySelector("#employeePassword").value;
+        if (password !== app.querySelector("#employeePasswordConfirm").value) return showToast("两次密码不一致", "error");
+        const email = app.querySelector("#employeeEmail").value.trim();
+        const phone = app.querySelector("#employeePhone").value.trim();
+        if (!email && !phone) return showToast("员工邮箱和手机号至少填写一个", "error");
+        const item = currentOrganization();
+        await run(async () => {
+          await api(`/admin/api/organizations/${item.organization.id}/members`, { method: "POST", body: JSON.stringify({ displayName: app.querySelector("#employeeName").value.trim(), email: email || undefined, phone: phone || undefined, password, role: app.querySelector("#employeeRole").value }) });
+          state.addOpen = false;
+          await loadWorkspace(true);
+          showToast("员工账号已创建");
+        }, "添加员工失败");
+      }
+
+      async function updateRole(memberId, role) {
+        await mutateMember(memberId, async item => api(`/admin/api/organizations/${item.organization.id}/members/${memberId}`, { method: "PATCH", body: JSON.stringify({ role }) }), "角色已更新", "更新角色失败");
+      }
+
+      async function resetPassword(memberId, password) {
+        if (!password.trim()) return showToast("请输入新密码", "error");
+        await mutateMember(memberId, async item => api(`/admin/api/organizations/${item.organization.id}/members/${memberId}/password`, { method: "PATCH", body: JSON.stringify({ password }) }), "密码已重置", "重置密码失败");
+      }
+
+      async function removeEmployee(memberId) {
+        await mutateMember(memberId, async item => api(`/admin/api/organizations/${item.organization.id}/members/${memberId}`, { method: "DELETE" }), "员工已移出组织", "删除员工失败");
+      }
+
+      async function mutateMember(memberId, mutation, success, fallback) {
+        state.busy[memberId] = true;
+        render();
+        try {
+          await mutation(currentOrganization());
+          state.resetId = "";
+          state.removeId = "";
+          await loadWorkspace(true);
+          showToast(success);
+        } catch (error) {
+          showToast(readableError(error, fallback), "error");
+        } finally {
+          delete state.busy[memberId];
+          render();
+        }
+      }
+
+      async function logout() {
+        try { await api("/admin/api/logout", { method: "POST" }); } catch (_) {}
+        clearSession();
+        render();
+      }
+
+      async function run(action, fallback, clearOnFailure = false) {
+        state.loading = true;
+        state.pageError = "";
+        try { await action(); } catch (error) { state.pageError = readableError(error, fallback); if (clearOnFailure || error.status === 401) clearSession(); } finally { state.loading = false; render(); }
+      }
+
+      async function api(path, options = {}, authorized = true) {
+        const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+        if (authorized && state.token) headers.Authorization = `Bearer ${state.token}`;
+        const response = await fetch(path, { ...options, headers });
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          const error = new Error(body.error || `HTTP ${response.status}`);
+          error.status = response.status;
+          throw error;
+        }
+        if (response.status === 204) return undefined;
+        return response.json();
+      }
+
+      function clearSession() {
+        state.token = "";
+        state.principal = undefined;
+        state.organizations = [];
+        sessionStorage.removeItem("cloudledger.adminSession");
+      }
+
+      function currentOrganization() { return state.organizations[0]; }
+      function isAdminMember(member) { return member.role === "owner" || member.role === "admin"; }
+      function isEmployee(member) { return !isAdminMember(member); }
+      function filteredEmployees(members) {
+        const query = state.query.trim().toLowerCase();
+        return members.filter(isEmployee).filter(member => (state.roleFilter === "all" || member.role === state.roleFilter) && (!query || [member.displayName, member.email, member.phone].some(value => value?.toLowerCase().includes(query))));
+      }
+      function roleOptions(selected) { return employeeRoles.map(role => `<option value="${role}" ${role === selected ? "selected" : ""}>${roleLabels[role]}</option>`).join(""); }
+      function showToast(message, tone = "ok") { state.toast = message; state.toastTone = tone; render(); window.setTimeout(() => { if (state.toast === message) { state.toast = ""; render(); } }, 2400); }
+      function readableError(error, fallback) {
+        const raw = error instanceof Error ? error.message : String(error || fallback);
+        if (raw.includes("organization admin accounts cannot use")) return "管理员账号不能用于前台业务。";
+        if (raw.includes("business accounts cannot use")) return "该账号不是组织管理员。";
+        if (raw.includes("another organization")) return "不能管理其他组织。";
+        if (raw.includes("already registered")) return "邮箱或手机号已被使用。";
+        if (raw.includes("already belongs to another organization")) return "该员工账号已属于其他组织。";
+        if (raw.includes("invalid credentials")) return "账号或密码错误。";
+        return raw || fallback;
+      }
+      function escapeHtml(value) { return String(value ?? "").replace(/[&<>'"]/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]); }
+    </script>
+  </body>
+</html>

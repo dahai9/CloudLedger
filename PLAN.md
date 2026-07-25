@@ -32,7 +32,7 @@ development and smoke testing.
 - `crates/cloudledger-db`: repository traits plus in-memory and SQLite storage
   drafts.
 - `crates/cloudledger-service`: application services for posting entries,
-  approval decisions, dashboard DTOs, setup/bootstrap app state, server-side
+  approval decisions, dashboard DTOs, multi-organization app state, server-side
   organization membership management, and Tauri-facing use cases.
 - `crates/cloudledger-server`: cloud sync and authentication scaffold with
   Argon2 password hashing plus a separate admin backend for organization and
@@ -67,7 +67,7 @@ development and smoke testing.
    - Build and verify desktop dev mode first, then Android debug APK.
 
 4. Cloud Sync
-  - Turn the server scaffold into real APIs for admin-created accounts, login,
+   - Turn the server scaffold into real APIs for admin-created accounts, login,
     refresh token rotation, public-ledger sync, and audit-log upload.
    - Keep organization membership and account relationship management on the
      server-side admin backend, never in the Android app.
@@ -108,9 +108,11 @@ development and smoke testing.
   - `POST /app/transactions`
   - `POST /app/approvals/decide`
   - `GET /admin`
-  - `GET /admin/api/setup`
-  - `POST /admin/api/setup`
+  - `POST /admin/api/login`
+  - `POST /admin/api/logout`
+  - `GET /admin/api/me`
   - `GET /admin/api/organizations`
+  - `POST /admin/api/organizations`
   - `GET /admin/api/organizations/:organization_id/members`
   - `POST /admin/api/organizations/:organization_id/members`
   - `PATCH /admin/api/organizations/:organization_id/members/:membership_id`
@@ -122,11 +124,12 @@ development and smoke testing.
     Android LAN testing.
   - Admin backend uses `CLOUDLEDGER_ADMIN_BIND_ADDR`, defaulting to
     `127.0.0.1:8788`; LAN admin testing must bind a specific private IP such as
-    `192.168.1.229:8788`. Binding admin to `0.0.0.0` or public IPs is rejected.
+    `10.0.0.42:8788`. Binding admin to `0.0.0.0` or public IPs is rejected.
 - Frontend API boundary:
   - browser/mock mode for fast UI development.
-  - HTTP adapter for the real app runtime, pointed at
-    `VITE_CLOUDLEDGER_CLOUD_URL`.
+  - HTTP adapter for the real app runtime, pointed at the runtime
+    `frontend/public/config.js` `apiBaseUrl`. The build-time
+    `VITE_CLOUDLEDGER_CLOUD_URL` value remains a fallback.
 
 ## Validation Plan
 
@@ -166,10 +169,14 @@ nix develop path:. -c npm run tauri:android:build -- --debug --target aarch64
 - Account and organization relationships are managed by the server-side admin
   backend on the separate admin port. The admin port defaults to localhost and
   can only be moved to loopback, link-local, or private LAN addresses.
-- Fresh server data starts uninitialized. The admin setup wizard creates the
-  single organization, owner login identity, owner private ledger, organization
-  public ledger, and default accounts. The current backend enforces a
-  single-organization invariant.
+- The platform token can create and list multiple organizations. Each new
+  organization receives an independent backend-only administrator account, an
+  organization public ledger, and a default company bank account.
+- Organization administrators authenticate with admin-only sessions and can
+  manage employees only inside their assigned organization. They cannot log in
+  to the business frontend, and employee accounts cannot log in to the admin
+  backend or be shared across organizations. Existing persisted `owner/admin`
+  accounts migrate to this split at server startup.
 - Each user sees their own private ledger first, while permitted organization
   members can see the configured organization's public ledger through
   membership.
@@ -192,20 +199,18 @@ nix develop path:. -c npm run tauri:android:build -- --debug --target aarch64
 - Development server ledger state is persisted as `ledger-state.json`, with
   schema versioning, atomic replacement, and a `ledger-state.json.bak` recovery
   copy. Auth state is persisted as `auth-state.json`.
-- The frontend shows dev-cloud status from
-  `VITE_CLOUDLEDGER_CLOUD_URL`, defaulting to
-  `http://192.168.1.229:8787` for the current LAN test setup. The app checks
-  `/ready` and displays a short server ID so the active development cloud can
-  be identified from the phone.
+- The frontend shows dev-cloud status from runtime `config.js`, then falls back
+  to `VITE_CLOUDLEDGER_CLOUD_URL`. With neither configured, a web build uses the
+  current page hostname on port `8787`. The app checks `/ready` and displays a
+  short server ID so the active development cloud can be identified.
 - The development server persists its cloud identity under
   `.cloudledger-server/server-id` by default, or under
   `CLOUDLEDGER_SERVER_DATA_DIR` when set.
 - Debug APK generation and installation have been proven on a connected Android
   phone. The validated debug artifact path is
   `src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`.
-- The current phone/LAN validation target is developer machine
-  `192.168.1.229:8787`; phone-side ADB validation should use the current phone
-  WLAN address reported by `adb shell ip -4 addr`.
+- Phone-side validation should use the developer machine's current private LAN
+  address and the phone WLAN address reported by `adb shell ip -4 addr`.
 
 ## Assumptions
 

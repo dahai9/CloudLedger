@@ -233,12 +233,15 @@ impl ApiError {
     pub(crate) fn from_auth(error: AuthError) -> Self {
         let status = match error {
             AuthError::InvalidCredentials | AuthError::SessionNotFound => StatusCode::UNAUTHORIZED,
+            AuthError::BusinessAppAccessDenied | AuthError::AdminAccessDenied => {
+                StatusCode::FORBIDDEN
+            }
             AuthError::EmailAlreadyRegistered
             | AuthError::PhoneAlreadyRegistered
             | AuthError::InstallationAlreadyBound => StatusCode::CONFLICT,
-            AuthError::Storage(_) | AuthError::PasswordHashFailed => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            AuthError::Storage(_)
+            | AuthError::PasswordHashFailed
+            | AuthError::AdminOrganizationRequired => StatusCode::INTERNAL_SERVER_ERROR,
             AuthError::LoginIdentifierRequired
             | AuthError::DisplayNameRequired
             | AuthError::PasswordRequired

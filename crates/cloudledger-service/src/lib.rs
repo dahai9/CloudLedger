@@ -3,7 +3,7 @@ mod error;
 mod service;
 
 pub use app::{
-    AccountDto, AppAddOrganizationMemberInput, AppBootstrapOrganizationInput,
+    AccountDto, AppAddOrganizationMemberInput, AppCreateOrganizationInput,
     AppCreateTransactionInput, AppDecideApprovalInput, AppEnsureUserIdentityInput,
     AppLedgerService, AppServiceError, AppSetupStatus, AppUpdateOrganizationMemberRoleInput,
     AuditLogDto, LedgerDto, LedgerOverview, MembershipDto, OrganizationDto, TransactionDto,

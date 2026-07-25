@@ -33,6 +33,12 @@ pub enum AuthError {
     InstallationAlreadyBound,
     #[error("invalid credentials")]
     InvalidCredentials,
+    #[error("organization admin accounts cannot use the business app")]
+    BusinessAppAccessDenied,
+    #[error("business accounts cannot use the organization admin backend")]
+    AdminAccessDenied,
+    #[error("organization admin account is missing its organization")]
+    AdminOrganizationRequired,
     #[error("session was not found")]
     SessionNotFound,
     #[error("password hashing failed")]
@@ -48,6 +54,16 @@ pub struct AuthUserDto {
     pub display_name: String,
     pub email: Option<String>,
     pub phone: Option<String>,
+    pub account_kind: AccountKind,
+    pub organization_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountKind {
+    #[default]
+    Business,
+    OrganizationAdmin,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +80,20 @@ pub struct Session {
 pub struct AuthenticatedSession {
     pub user: AuthUserDto,
     pub installation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminSession {
+    pub user: AuthUserDto,
+    pub access_token: String,
+    pub organization_id: Uuid,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminAuthenticatedSession {
+    pub user: AuthUserDto,
+    pub organization_id: Uuid,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +113,8 @@ pub struct AdminCreateUserInput {
     pub email: Option<String>,
     pub phone: Option<String>,
     pub password: Option<String>,
+    pub account_kind: AccountKind,
+    pub organization_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +123,13 @@ pub struct LoginInput {
     pub phone: Option<String>,
     pub password: String,
     pub installation_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminLoginInput {
+    pub email: Option<String>,
+    pub phone: Option<String>,
+    pub password: String,
 }
 
 #[derive(Debug, Clone)]
@@ -112,7 +151,19 @@ struct StoredUser {
     email: Option<String>,
     phone: Option<String>,
     password_hash: String,
+    #[serde(default)]
+    account_kind: AccountKind,
+    #[serde(default)]
+    organization_id: Option<Uuid>,
     created_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionKind {
+    #[default]
+    App,
+    Admin,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +173,8 @@ struct StoredSession {
     installation_id: String,
     access_token: String,
     refresh_token: String,
+    #[serde(default)]
+    kind: SessionKind,
     created_at: OffsetDateTime,
     refreshed_at: OffsetDateTime,
 }
@@ -214,6 +267,8 @@ impl AuthService {
             email,
             phone,
             password_hash: hash_password(&password)?,
+            account_kind: AccountKind::Business,
+            organization_id: None,
             created_at: OffsetDateTime::now_utc(),
         };
         self.bind_installation(&installation_id, user.id)?;
@@ -241,6 +296,7 @@ impl AuthService {
             .map(str::trim)
             .filter(|password| !password.is_empty())
             .map(str::to_string);
+        let password_was_updated = password.is_some();
         require_login_identifier(&email, &phone)?;
         self.ensure_identifier_available(input.user_id, email.as_deref(), phone.as_deref())?;
 
@@ -274,6 +330,8 @@ impl AuthService {
             email,
             phone,
             password_hash,
+            account_kind: input.account_kind,
+            organization_id: input.organization_id,
             created_at,
         };
         if let Some(email) = &user.email {
@@ -284,6 +342,14 @@ impl AuthService {
         }
         let user_id = user.id;
         self.users_by_id.insert(user_id, user);
+        if password_was_updated
+            || existing_user.as_ref().is_some_and(|existing| {
+                existing.account_kind != input.account_kind
+                    || existing.organization_id != input.organization_id
+            })
+        {
+            self.revoke_user_sessions(user_id);
+        }
         self.users_by_id
             .get(&user_id)
             .map(auth_user_dto)
@@ -303,8 +369,29 @@ impl AuthService {
             .get(&user_id)
             .ok_or(AuthError::InvalidCredentials)?;
         verify_password(&input.password, &user.password_hash)?;
+        if user.account_kind != AccountKind::Business {
+            return Err(AuthError::BusinessAppAccessDenied);
+        }
         self.bind_installation(&installation_id, user_id)?;
         self.issue_session(user_id, installation_id)
+    }
+
+    pub fn admin_login(&mut self, input: AdminLoginInput) -> Result<AdminSession, AuthError> {
+        let email = input.email.and_then(normalize_optional_email);
+        let phone = input.phone.and_then(normalize_optional_phone);
+        require_login_identifier(&email, &phone)?;
+        let user_id = self
+            .find_user_id(email.as_deref(), phone.as_deref())
+            .ok_or(AuthError::InvalidCredentials)?;
+        let user = self
+            .users_by_id
+            .get(&user_id)
+            .ok_or(AuthError::InvalidCredentials)?;
+        verify_password(&input.password, &user.password_hash)?;
+        if user.account_kind != AccountKind::OrganizationAdmin {
+            return Err(AuthError::AdminAccessDenied);
+        }
+        self.issue_admin_session(user_id)
     }
 
     pub fn refresh(&mut self, input: RefreshInput) -> Result<Session, AuthError> {
@@ -317,6 +404,9 @@ impl AuthService {
             .sessions_by_access_token
             .remove(&access_token)
             .ok_or(AuthError::SessionNotFound)?;
+        if session.kind != SessionKind::App {
+            return Err(AuthError::SessionNotFound);
+        }
         if session.installation_id != installation_id {
             return Err(AuthError::InstallationAlreadyBound);
         }
@@ -343,14 +433,68 @@ impl AuthService {
             .sessions_by_access_token
             .get(access_token)
             .ok_or(AuthError::InvalidCredentials)?;
+        if session.kind != SessionKind::App {
+            return Err(AuthError::InvalidCredentials);
+        }
         let user = self
             .users_by_id
             .get(&session.user_id)
             .ok_or(AuthError::InvalidCredentials)?;
+        if user.account_kind != AccountKind::Business {
+            return Err(AuthError::BusinessAppAccessDenied);
+        }
         Ok(AuthenticatedSession {
             user: auth_user_dto(user),
             installation_id: session.installation_id.clone(),
         })
+    }
+
+    pub fn authenticate_admin_access_token(
+        &self,
+        access_token: &str,
+    ) -> Result<AdminAuthenticatedSession, AuthError> {
+        let access_token = normalize_bearer_token(access_token);
+        let session = self
+            .sessions_by_access_token
+            .get(access_token)
+            .ok_or(AuthError::InvalidCredentials)?;
+        if session.kind != SessionKind::Admin {
+            return Err(AuthError::InvalidCredentials);
+        }
+        let user = self
+            .users_by_id
+            .get(&session.user_id)
+            .ok_or(AuthError::InvalidCredentials)?;
+        if user.account_kind != AccountKind::OrganizationAdmin {
+            return Err(AuthError::AdminAccessDenied);
+        }
+        let organization_id = user
+            .organization_id
+            .ok_or(AuthError::AdminOrganizationRequired)?;
+        Ok(AdminAuthenticatedSession {
+            user: auth_user_dto(user),
+            organization_id,
+        })
+    }
+
+    pub fn mark_organization_admin(&mut self, user_id: Uuid, organization_id: Uuid) -> bool {
+        let Some(user) = self.users_by_id.get_mut(&user_id) else {
+            return false;
+        };
+        if user.account_kind == AccountKind::OrganizationAdmin
+            && user.organization_id == Some(organization_id)
+        {
+            return false;
+        }
+
+        user.account_kind = AccountKind::OrganizationAdmin;
+        user.organization_id = Some(organization_id);
+        self.revoke_user_sessions(user_id);
+        true
+    }
+
+    pub fn account_kind(&self, user_id: Uuid) -> Option<AccountKind> {
+        self.users_by_id.get(&user_id).map(|user| user.account_kind)
     }
 
     pub fn update_profile(
@@ -364,11 +508,17 @@ impl AuthService {
             .get(access_token)
             .ok_or(AuthError::InvalidCredentials)?
             .clone();
+        if session.kind != SessionKind::App {
+            return Err(AuthError::InvalidCredentials);
+        }
         let display_name = normalize_display_name(&input.display_name)?;
         let user = self
             .users_by_id
             .get_mut(&session.user_id)
             .ok_or(AuthError::InvalidCredentials)?;
+        if user.account_kind != AccountKind::Business {
+            return Err(AuthError::BusinessAppAccessDenied);
+        }
         user.display_name = display_name;
         Ok(AuthenticatedSession {
             user: auth_user_dto(user),
@@ -432,6 +582,7 @@ impl AuthService {
             installation_id: installation_id.clone(),
             access_token: access_token.clone(),
             refresh_token: refresh_token.clone(),
+            kind: SessionKind::App,
             created_at: now,
             refreshed_at: now,
         };
@@ -445,6 +596,55 @@ impl AuthService {
             refresh_token,
             installation_id,
         })
+    }
+
+    fn issue_admin_session(&mut self, user_id: Uuid) -> Result<AdminSession, AuthError> {
+        let user = self
+            .users_by_id
+            .get(&user_id)
+            .ok_or(AuthError::InvalidCredentials)?;
+        let organization_id = user
+            .organization_id
+            .ok_or(AuthError::AdminOrganizationRequired)?;
+        let now = OffsetDateTime::now_utc();
+        let access_token = format!("admin_access_{}", Uuid::new_v4());
+        self.sessions_by_access_token.insert(
+            access_token.clone(),
+            StoredSession {
+                user_id,
+                installation_id: String::new(),
+                access_token: access_token.clone(),
+                refresh_token: String::new(),
+                kind: SessionKind::Admin,
+                created_at: now,
+                refreshed_at: now,
+            },
+        );
+        Ok(AdminSession {
+            user: auth_user_dto(user),
+            access_token,
+            organization_id,
+        })
+    }
+
+    fn revoke_user_sessions(&mut self, user_id: Uuid) {
+        let access_tokens = self
+            .sessions_by_access_token
+            .iter()
+            .filter_map(|(access_token, session)| {
+                (session.user_id == user_id).then_some(access_token.clone())
+            })
+            .collect::<Vec<_>>();
+        for access_token in access_tokens {
+            if let Some(session) = self.sessions_by_access_token.remove(&access_token) {
+                if !session.refresh_token.is_empty() {
+                    self.access_tokens_by_refresh_token
+                        .remove(&session.refresh_token);
+                }
+            }
+        }
+        self.installations_by_id
+            .retain(|_, installed_user_id| *installed_user_id != user_id);
     }
 }
 
@@ -469,6 +669,8 @@ fn auth_user_dto(user: &StoredUser) -> AuthUserDto {
         display_name: user.display_name.clone(),
         email: user.email.clone(),
         phone: user.phone.clone(),
+        account_kind: user.account_kind,
+        organization_id: user.organization_id,
     }
 }
 
@@ -574,6 +776,8 @@ mod tests {
                 email: Some("Alice@Example.com".to_string()),
                 phone: None,
                 password: Some("correct horse battery staple".to_string()),
+                account_kind: AccountKind::Business,
+                organization_id: None,
             })
             .unwrap();
         let session = auth
@@ -587,6 +791,47 @@ mod tests {
 
         assert_eq!(created.id, user_id);
         assert_eq!(session.user.id, user_id);
+    }
+
+    #[test]
+    fn organization_admin_uses_only_admin_sessions() {
+        let mut auth = AuthService::default();
+        let organization_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        auth.create_or_update_admin_user(AdminCreateUserInput {
+            user_id,
+            display_name: "Organization Admin".to_string(),
+            email: Some("admin@example.com".to_string()),
+            phone: None,
+            password: Some("correct horse battery staple".to_string()),
+            account_kind: AccountKind::OrganizationAdmin,
+            organization_id: Some(organization_id),
+        })
+        .unwrap();
+
+        let app_login = auth.login(LoginInput {
+            email: Some("admin@example.com".to_string()),
+            phone: None,
+            password: "correct horse battery staple".to_string(),
+            installation_id: "phone-admin".to_string(),
+        });
+        assert_eq!(app_login.unwrap_err(), AuthError::BusinessAppAccessDenied);
+
+        let admin_session = auth
+            .admin_login(AdminLoginInput {
+                email: Some("admin@example.com".to_string()),
+                phone: None,
+                password: "correct horse battery staple".to_string(),
+            })
+            .unwrap();
+        let authenticated = auth
+            .authenticate_admin_access_token(&admin_session.access_token)
+            .unwrap();
+        assert_eq!(authenticated.user.id, user_id);
+        assert_eq!(authenticated.organization_id, organization_id);
+        assert!(auth
+            .authenticate_access_token(&admin_session.access_token)
+            .is_err());
     }
 
     #[test]

@@ -43,7 +43,16 @@ impl ServerState {
         let ledger_state_path = data_dir.join(LEDGER_STATE_FILE);
         let ledger_service = AppLedgerService::load_or_seed(&ledger_state_path)?;
         let auth_state_path = data_dir.join(AUTH_STATE_FILE);
-        let auth_service = AuthService::load_or_default(&auth_state_path)?;
+        let mut auth_service = AuthService::load_or_default(&auth_state_path)?;
+        let migrated_admin_accounts = ledger_service
+            .organization_admin_accounts()
+            .into_iter()
+            .fold(false, |changed, (user_id, organization_id)| {
+                auth_service.mark_organization_admin(user_id, organization_id) || changed
+            });
+        if migrated_admin_accounts {
+            auth_service.save_to_path(&auth_state_path)?;
+        }
 
         Ok(Self {
             server_id,
@@ -92,6 +101,8 @@ fn load_or_create_admin_token(path: &Path) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::{AccountKind, AdminCreateUserInput, AuthError, LoginInput};
+    use cloudledger_service::AppCreateOrganizationInput;
 
     #[test]
     fn server_id_is_stable_in_data_dir() {
@@ -103,6 +114,62 @@ mod tests {
         assert_eq!(first.server_id, second.server_id);
         assert_eq!(first.admin_token, second.admin_token);
 
+        fs::remove_dir_all(data_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn existing_owner_account_migrates_to_backend_only_admin() {
+        let data_dir = std::env::temp_dir().join(format!("cloudledger-server-{}", Uuid::new_v4()));
+        fs::create_dir_all(&data_dir).expect("create data dir");
+        let admin_user_id = Uuid::new_v4();
+        let mut ledger_service = AppLedgerService::uninitialized();
+        ledger_service
+            .create_organization(AppCreateOrganizationInput {
+                organization_name: "Existing Organization".to_string(),
+                admin_user_id,
+                admin_display_name: "Existing Owner".to_string(),
+                admin_email: Some("owner@example.com".to_string()),
+                admin_phone: None,
+            })
+            .expect("create existing organization");
+        ledger_service
+            .save_to_path(data_dir.join(LEDGER_STATE_FILE))
+            .expect("save ledger state");
+
+        let mut auth_service = AuthService::default();
+        auth_service
+            .create_or_update_admin_user(AdminCreateUserInput {
+                user_id: admin_user_id,
+                display_name: "Existing Owner".to_string(),
+                email: Some("owner@example.com".to_string()),
+                phone: None,
+                password: Some("owner-password".to_string()),
+                account_kind: AccountKind::Business,
+                organization_id: None,
+            })
+            .expect("create legacy business auth user");
+        auth_service
+            .save_to_path(data_dir.join(AUTH_STATE_FILE))
+            .expect("save auth state");
+
+        let state = ServerState::load(data_dir.clone()).expect("load and migrate server state");
+        let mut auth = state.auth_service.lock().expect("auth lock");
+        assert_eq!(
+            auth.account_kind(admin_user_id),
+            Some(AccountKind::OrganizationAdmin)
+        );
+        assert_eq!(
+            auth.login(LoginInput {
+                email: Some("owner@example.com".to_string()),
+                phone: None,
+                password: "owner-password".to_string(),
+                installation_id: "legacy-phone".to_string(),
+            })
+            .unwrap_err(),
+            AuthError::BusinessAppAccessDenied
+        );
+
+        drop(auth);
         fs::remove_dir_all(data_dir).expect("remove temp dir");
     }
 }

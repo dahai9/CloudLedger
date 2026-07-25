@@ -1184,6 +1184,12 @@ function friendlyError(error: unknown, fallback: string) {
   if (message.includes("transaction was not found")) {
     return "流水不存在或已被移除";
   }
+  if (message.includes("organization admin accounts cannot use the business app")) {
+    return "组织管理员账号只能登录后台，不能用于前台业务";
+  }
+  if (message.includes("invalid credentials")) {
+    return "账号或密码错误";
+  }
 
   return message || fallback;
 }

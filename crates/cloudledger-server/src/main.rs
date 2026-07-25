@@ -18,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
         state.server_id
     );
     println!(
-        "cloudledger-server admin listening on http://{admin_addr}/admin; token file: {}",
+        "cloudledger-server admin listening on http://{admin_addr}/admin; platform token file: {}",
         state.data_dir.join("admin-token").display()
     );
     let api_server = axum::serve(listener, cloudledger_server::router(state.clone()));

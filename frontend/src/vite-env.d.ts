@@ -8,3 +8,9 @@ interface ImportMetaEnv {
 interface ImportMeta {
   readonly env: ImportMetaEnv;
 }
+
+interface Window {
+  readonly __CLOUDLEDGER_CONFIG__?: {
+    readonly apiBaseUrl?: string;
+  };
+}

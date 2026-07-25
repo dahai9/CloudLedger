@@ -39,22 +39,40 @@ nix develop path:. -c cargo run -p cloudledger-server
 
 The mobile API listens on `CLOUDLEDGER_BIND_ADDR`, defaulting to
 `0.0.0.0:8787` so the Android test phone can reach it on the LAN. The mobile
-frontend checks `VITE_CLOUDLEDGER_CLOUD_URL`, defaulting to
-`http://192.168.1.229:8787` for the current test network. Override it when the
-developer machine IP changes.
+frontend reads its runtime backend from `frontend/public/config.js`. Set
+`apiBaseUrl` there before an Android build, or edit `dist/config.js` when
+deploying the web build. An empty value makes the web development UI use the
+current page hostname on port `8787`. `VITE_CLOUDLEDGER_CLOUD_URL` remains a
+build-time fallback when the runtime value is empty.
+
+For example, an Android build that reaches the development machine over LAN can
+use:
+
+```js
+window.__CLOUDLEDGER_CONFIG__ = {
+  apiBaseUrl: "http://10.0.0.42:8787",
+};
+```
 
 The admin backend is intentionally separated from the mobile API. It listens on
 `CLOUDLEDGER_ADMIN_BIND_ADDR`, defaulting to `127.0.0.1:8788`. For LAN admin
 testing bind it to a specific private address, for example
-`192.168.1.229:8788`; the server rejects `0.0.0.0` and public IPs for this
-admin port. The admin token comes from `CLOUDLEDGER_ADMIN_TOKEN` or from the
-server data directory's `admin-token` file.
+`10.0.0.42:8788`; the server rejects `0.0.0.0` and public IPs for this admin
+port. The platform token comes from `CLOUDLEDGER_ADMIN_TOKEN` or the server data
+directory's `admin-token` file.
 
-Fresh server data starts uninitialized. After entering the admin token at
-`/admin`, the setup wizard creates the single organization, the owner login
-identity, the owner private ledger, the organization public ledger, and default
-accounts. Current CloudLedger deployments are single-organization only; later
-admin work manages members inside that one organization.
+The `/admin` page has separate platform and organization entry points. The
+platform token creates and lists organizations. Every organization is created
+with its own organization-admin login, public ledger, and default company bank
+account. Organization admins log in with their own email/phone and password and
+can manage employees only inside their organization.
+
+New organization-admin accounts are backend-only identities and do not receive
+a personal ledger; `POST /auth/login` rejects them. Employee accounts use the
+mobile/Web business frontend, belong to one organization only, and cannot log in
+to the organization admin backend. Existing persisted `owner` or `admin`
+membership accounts are migrated to backend-only organization admins when the
+server starts.
 
 The mobile API owns app login and ledger operations:
 
@@ -80,7 +98,7 @@ With a phone connected through ADB:
 
 ```bash
 adb devices
-adb shell curl -sS --connect-timeout 5 http://192.168.1.229:8787/ready
+adb shell curl -sS --connect-timeout 5 http://10.0.0.42:8787/ready
 adb shell pm clear com.cloudledger.app
 adb install -r src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
 adb shell am start -n com.cloudledger.app/.MainActivity
@@ -98,9 +116,10 @@ Use the server-side admin backend to manage organization/account relationships:
 CLOUDLEDGER_ADMIN_BIND_ADDR=127.0.0.1:8788 nix develop path:. -c cargo run -p cloudledger-server
 ```
 
-Then open `http://127.0.0.1:8788/admin` from the development machine and enter
-the admin token from `.cloudledger-server/admin-token`. On a new data directory,
-complete the setup wizard before logging in from the Android app.
+Then open `http://127.0.0.1:8788/admin`. Use the platform-token tab with
+`.cloudledger-server/admin-token` to create organizations. Afterwards, each
+organization administrator uses the organization-account tab to create and
+manage that organization's employee accounts.
 
 For the public ledger approval smoke tests:
 
