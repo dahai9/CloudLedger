@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 export type LedgerKind = "personal" | "organization_public";
 export type TransactionKind = "income" | "expense" | "transfer";
 export type ApprovalState = "draft" | "submitted" | "approved" | "rejected" | "voided";
+export type PaymentState = "not_applicable" | "pending_payment" | "paid_pending_receipt" | "received";
 
 export interface UserDto {
   id: string;
@@ -36,8 +37,12 @@ export interface TransactionDto {
   currency: string;
   description: string;
   approvalState: ApprovalState;
+  paymentState: PaymentState;
   createdBy: string;
   createdByUserId: string;
+  approvedAt?: string;
+  paidAt?: string;
+  receivedAt?: string;
   occurredAt: string;
 }
 
@@ -62,6 +67,8 @@ export interface LedgerOverview {
   monthlyIncomeMinor: number;
   monthlyExpenseMinor: number;
   pendingApprovalCount: number;
+  pendingPaymentCount: number;
+  pendingReceiptCount: number;
 }
 
 export interface CreateTransactionInput {
@@ -79,6 +86,10 @@ export interface DecideApprovalInput {
   decisionNote?: string;
 }
 
+export interface TransactionActionInput {
+  transactionId: string;
+}
+
 export async function loadOverview(): Promise<LedgerOverview> {
   return invoke<LedgerOverview>("get_overview");
 }
@@ -93,4 +104,16 @@ export async function decideApproval(
   input: DecideApprovalInput
 ): Promise<TransactionDto> {
   return invoke<TransactionDto>("decide_approval", { input });
+}
+
+export async function markTransactionPaid(
+  input: TransactionActionInput
+): Promise<TransactionDto> {
+  return invoke<TransactionDto>("mark_transaction_paid", { input });
+}
+
+export async function confirmTransactionReceipt(
+  input: TransactionActionInput
+): Promise<TransactionDto> {
+  return invoke<TransactionDto>("confirm_transaction_receipt", { input });
 }

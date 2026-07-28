@@ -15,8 +15,13 @@ development and smoke testing.
 
 - Support login identities, organizations, memberships, personal ledgers, and
   company public ledgers.
+- Target small organizations with one or two business owners and roughly two to
+  five employees. Every business account can record transactions.
 - Keep private ledgers visible only to their owners. Organization admins must
   not automatically see member private-ledger entries.
+- Keep organization administration separate from business work: backend-only
+  administrators manage accounts, while business owners approve and pay public
+  expense applications and employees confirm receipt.
 - Treat company public ledgers as a lightweight quasi-financial system:
   sensitive mutations require audit records, deletion is soft deletion, and
   company entries can enter an approval flow.
@@ -30,12 +35,13 @@ development and smoke testing.
 - `crates/cloudledger-core`: pure domain model, money handling, ledger scope,
   membership roles, permissions, journal entries, and approval rules.
 - `crates/cloudledger-db`: repository traits plus in-memory and SQLite storage
-  drafts.
+  for the client-side local/offline cache boundary.
 - `crates/cloudledger-service`: application services for posting entries,
   approval decisions, dashboard DTOs, multi-organization app state, server-side
   organization membership management, and Tauri-facing use cases.
 - `crates/cloudledger-server`: cloud sync and authentication scaffold with
-  Argon2 password hashing plus a separate admin backend for organization and
+  Argon2 password hashing, PostgreSQL-authoritative shared storage, model-driven
+  SQLx file migrations, plus a separate admin backend for organization and
   account relationship management.
 - `src-tauri`: Tauri v2 shell exposing Rust commands to the frontend.
 - `frontend`: Android-first Vite/TypeScript UI with server-backed login, a
@@ -137,12 +143,15 @@ development and smoke testing.
   - `DELETE /{admin_path}/api/organizations/:organization_id/members/:membership_id`
   - future sync endpoints for ledger pull/push and audit-log upload.
 - Server ports:
-  - Mobile API uses `CLOUDLEDGER_BIND_ADDR`, defaulting to `0.0.0.0:8787` for
+  - Backend deployment settings are consolidated in
+    `.cloudledger-server/config.toml`, with `--config <path>` available for an
+    explicit alternate file.
+  - Mobile API uses `server.api_bind_addr`, defaulting to `0.0.0.0:8787` for
     Android LAN testing.
-  - Admin backend uses `CLOUDLEDGER_ADMIN_BIND_ADDR`, defaulting to
-    `127.0.0.1:8788`; LAN admin testing must bind a specific private IP such as
-    `10.0.0.42:8788` and configure Cloudflare Turnstile. Binding admin to
-    `0.0.0.0` or public IPs is rejected.
+  - Admin backend uses `server.admin_bind_addr`, defaulting to `127.0.0.1:8788`;
+    LAN admin testing must bind a specific private IP such as `10.0.0.42:8788`
+    and configure Cloudflare Turnstile. Binding admin to `0.0.0.0` or public IPs
+    is rejected.
 - Frontend API boundary:
   - browser/mock mode for fast UI development.
   - HTTP adapter for the real app runtime, pointed at the runtime
@@ -157,6 +166,7 @@ Run the fast local checks:
 cargo fmt --all -- --check
 CARGO_TARGET_DIR=target cargo clippy -p cloudledger-core -p cloudledger-db -p cloudledger-service -p cloudledger-server --all-targets -- -D warnings
 CARGO_TARGET_DIR=target cargo test -p cloudledger-core -p cloudledger-db -p cloudledger-service -p cloudledger-server
+CLOUDLEDGER_TEST_DATABASE_URL=postgres://cloudledger:password@127.0.0.1:15433/cloudledger_test CARGO_TARGET_DIR=target cargo test -p cloudledger-server storage::postgres::tests::postgres_storage_end_to_end -- --ignored --test-threads=1
 npm run build
 npm audit --audit-level=moderate
 npm --prefix frontend audit --audit-level=moderate
@@ -201,29 +211,45 @@ nix develop path:. -c npm run tauri:android:build -- --debug --target aarch64
 - Server-side transaction and approval routes no longer trust a renderer-
   provided actor user ID; they inject the authenticated access-token user before
   authorization.
-- Public-ledger transactions now enter a real approval flow: pending entries do
-  not affect posted balances, eligible approvers can approve or reject them,
-  submitters cannot approve their own entries, rejection requires a reason, and
-  every decision writes an audit log entry with the transaction resource ID.
+- Business membership now has two active roles: `business_owner` (老板) and
+  `employee` (员工). Legacy approver roles migrate to business owners; legacy
+  accountant/member/viewer roles migrate to employees. Technical `owner/admin`
+  memberships remain backend-only and have no business-ledger permissions.
+- Employee public expenses follow a reimbursement workflow: submitted expenses
+  await a business owner, approval changes them to approved/pending-payment,
+  marking payment posts the expense to the public account, and the original
+  applicant closes the workflow by confirming receipt. Approval alone does not
+  reduce the public-account balance.
+- In a one-owner organization, that owner's public entries auto-approve because
+  no independent business approver exists. With two owners, an owner's entry
+  requires the other owner; self-approval remains forbidden. Rejection requires
+  a reason, and submission, approval, payment, and receipt all write audit
+  events.
 - Public-ledger approval validation uses admin-created members in real server
   flows; seeded Acme/Alice/Bob data remains only as an explicit service-layer
   test fixture.
 - Audit logs are returned only when the actor has `ViewAuditLog` permission for
-  that ledger. Member-level public-ledger users can still see the public ledger
-  without receiving the audit trail.
+  that ledger. Business owners and employees can inspect their shared public
+  ledger's audit trail; backend-only organization administrators cannot access
+  the business ledger.
 - MVP transaction creation rejects unsupported transfer entries and currency
   mismatches between the transaction and selected account, keeping posted
   balances deterministic.
-- Development server ledger state is persisted as `ledger-state.json`, with
-  schema versioning, atomic replacement, and a `ledger-state.json.bak` recovery
-  copy. Auth state is persisted as `auth-state.json`.
+- PostgreSQL is authoritative for backend domain and authentication data. Its
+  typed relational schema is designed before implementation and versioned in
+  immutable SQLx migration files; organization plus authentication changes
+  commit in one transaction.
+- Existing `ledger-state.json` and `auth-state.json` files are read-only import
+  sources when PostgreSQL is empty. After import, database state wins and the
+  JSON files are not read again. SQLite remains reserved for the client-side
+  local/offline cache.
 - The frontend shows dev-cloud status from runtime `config.js`, then falls back
   to `VITE_CLOUDLEDGER_CLOUD_URL`. With neither configured, a web build uses the
   current page hostname on port `8787`. The app checks `/ready` and displays a
   short server ID so the active development cloud can be identified.
 - The development server persists its cloud identity under
-  `.cloudledger-server/server-id` by default, or under
-  `CLOUDLEDGER_SERVER_DATA_DIR` when set.
+  `.cloudledger-server/server-id` by default, or under the backend config's
+  `server.data_dir` when changed.
 - Debug APK generation and installation have been proven on a connected Android
   phone. The validated debug artifact path is
   `src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`.

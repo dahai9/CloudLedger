@@ -3,9 +3,10 @@ mod error;
 mod service;
 
 pub use app::{
-    AccountDto, AppAddOrganizationMemberInput, AppCreateOrganizationInput,
-    AppCreateTransactionInput, AppDecideApprovalInput, AppEnsureUserIdentityInput,
-    AppLedgerService, AppServiceError, AppSetupStatus, AppUpdateOrganizationMemberRoleInput,
+    AccountDto, AppAddOrganizationMemberInput, AppConfirmTransactionReceiptInput,
+    AppCreateOrganizationInput, AppCreateTransactionInput, AppDecideApprovalInput,
+    AppEnsureUserIdentityInput, AppLedgerService, AppLedgerSnapshot, AppMarkTransactionPaidInput,
+    AppServiceError, AppSetupStatus, AppUpdateOrganizationMemberRoleInput, ApprovalDecision,
     AuditLogDto, LedgerDto, LedgerOverview, MembershipDto, OrganizationDto, TransactionDto,
     UserDto,
 };

@@ -14,9 +14,11 @@ rand_core = { workspace = true, features = ["getrandom"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
+toml.workspace = true
 tower-http.workspace = true
 uuid.workspace = true

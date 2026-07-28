@@ -532,6 +532,12 @@ function renderDashboard(dashboard: LedgerDashboard) {
 
 function renderBalancePanel(dashboard: LedgerDashboard) {
   const { ledger } = dashboard;
+  const pendingPaymentCount = dashboard.recentTransactions.filter(
+    (transaction) => transaction.paymentState === "pending_payment",
+  ).length;
+  const pendingReceiptCount = dashboard.recentTransactions.filter(
+    (transaction) => transaction.paymentState === "paid_pending_receipt",
+  ).length;
   const organization = ledger.organizationName
     ? `<span class="context-pill">${escapeHtml(ledger.organizationName)}</span>`
     : "";
@@ -546,6 +552,8 @@ function renderBalancePanel(dashboard: LedgerDashboard) {
       <div class="balance-meta">
         ${organization}
         <span class="context-pill">${ledger.pendingCount} 待审</span>
+        <span class="context-pill">${pendingPaymentCount} 待打款</span>
+        <span class="context-pill">${pendingReceiptCount} 待确认</span>
         <span class="context-pill">${ledger.auditUnreadCount} 审计</span>
       </div>
       <p class="sync-line">最近流水 ${formatDate(ledger.lastSyncedAt)}</p>
@@ -627,7 +635,7 @@ function renderQuickEntry(dashboard: LedgerDashboard) {
           ${dashboard.ledger.kind === "organization" ? "checked disabled" : ""}
           ${dashboard.ledger.kind !== "organization" && form.submitForApproval ? "checked" : ""}
         />
-        <span>${dashboard.ledger.kind === "organization" ? "公账自动审批" : "提交审批"}</span>
+        <span>${dashboard.ledger.kind === "organization" ? "公账审批流程" : "提交审批"}</span>
       </label>
 
       <button class="primary-button" type="submit" ${state.loading ? "disabled" : ""}>
@@ -701,7 +709,7 @@ function renderTransactionList(dashboard: LedgerDashboard) {
       <div class="transaction-list">
         ${
           filtered.length > 0
-            ? filtered.map((transaction) => renderTransactionRow(transaction, dashboard.ledger.currency)).join("")
+            ? filtered.map((transaction) => renderTransactionRow(transaction, dashboard)).join("")
             : `<p class="empty-copy">暂无流水</p>`
         }
       </div>
@@ -726,8 +734,9 @@ function renderFilterButton(filter: TransactionFilter, label: string) {
 
 function renderTransactionRow(
   transaction: LedgerDashboard["recentTransactions"][number],
-  currency: string,
+  dashboard: LedgerDashboard,
 ) {
+  const currency = dashboard.ledger.currency;
   const signedAmount = `${transaction.direction === "expense" ? "-" : "+"}${formatMoney(
     transaction.amountCents,
     currency,
@@ -747,11 +756,39 @@ function renderTransactionRow(
       <div class="row-meta">
         <span>${formatDate(transaction.occurredAt)}</span>
         <span class="status-chip ${statusClass(transaction.approvalState)}">
-          ${approvalStateLabel(transaction.approvalState)}
+          ${transactionStateLabel(transaction)}
         </span>
       </div>
+      ${renderTransactionActions(transaction, dashboard)}
     </article>
   `;
+}
+
+function renderTransactionActions(
+  transaction: LedgerDashboard["recentTransactions"][number],
+  dashboard: LedgerDashboard,
+) {
+  const canMarkPaid =
+    dashboard.ledger.role === "business_owner" && transaction.paymentState === "pending_payment";
+  const canConfirmReceipt =
+    transaction.paymentState === "paid_pending_receipt" &&
+    transaction.createdByUserId === state.currentUser?.id;
+  if (!canMarkPaid && !canConfirmReceipt) {
+    return "";
+  }
+
+  return `<div class="transaction-actions">
+    ${
+      canMarkPaid
+        ? `<button class="secondary-button" type="button" data-payment-action="mark-paid" data-transaction-id="${escapeHtml(transaction.id)}">标记已打款</button>`
+        : ""
+    }
+    ${
+      canConfirmReceipt
+        ? `<button class="primary-button" type="button" data-payment-action="confirm-receipt" data-transaction-id="${escapeHtml(transaction.id)}">确认收到款项</button>`
+        : ""
+    }
+  </div>`;
 }
 
 function renderApprovalPanel(dashboard: LedgerDashboard) {
@@ -804,7 +841,7 @@ function renderApprovalRow(item: LedgerDashboard["approvalQueue"][number], curre
         </button>
       </div>
     `
-    : `<p class="approval-note">仅审批人或所有者可处理，且不能审批自己提交的流水</p>`;
+    : `<p class="approval-note">仅其他老板可审批，不能审批自己提交的流水</p>`;
 
   return `
     <article class="approval-row">
@@ -860,7 +897,7 @@ function renderBottomNav(dashboard: LedgerDashboard) {
   return `
     <nav class="bottom-nav" aria-label="主导航">
       ${renderNavButton("activity", "流水", dashboard.recentTransactions.length)}
-      ${renderNavButton("approval", "审批", dashboard.approvalQueue.length)}
+      ${dashboard.ledger.role === "business_owner" ? renderNavButton("approval", "审批", dashboard.approvalQueue.length) : ""}
       ${renderNavButton("audit", "审计", dashboard.auditTrail.length)}
     </nav>
   `;
@@ -1034,6 +1071,16 @@ function bindEvents() {
     });
   });
 
+  app.querySelectorAll<HTMLButtonElement>("[data-payment-action]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const transactionId = button.dataset.transactionId;
+      const action = button.dataset.paymentAction;
+      if (transactionId && (action === "mark-paid" || action === "confirm-receipt")) {
+        void updatePaymentState(transactionId, action);
+      }
+    });
+  });
+
   app.querySelector<HTMLButtonElement>("#retryButton")?.addEventListener("click", () => {
     void loadInitialState();
   });
@@ -1093,13 +1140,47 @@ async function decideApproval(transactionId: string, decision: "approve" | "reje
     state.loading = true;
     state.pendingAction = transactionId;
     render();
-    await cloudLedgerApi.decideApproval(transactionId, decision, decisionNote);
+    const transaction = await cloudLedgerApi.decideApproval(transactionId, decision, decisionNote);
     await refreshDashboard();
     state.view = "activity";
     state.filter = decision === "approve" ? "approved" : "rejected";
-    showToast(decision === "approve" ? "已批准入账" : "已驳回流水");
+    showToast(
+      decision === "approve"
+        ? transaction.paymentState === "pending_payment"
+          ? "已批准，等待打款"
+          : "已批准入账"
+        : "已驳回流水",
+    );
   } catch (error) {
     showToast(friendlyError(error, "审批失败"));
+  } finally {
+    state.loading = false;
+    state.pendingAction = undefined;
+    render();
+  }
+}
+
+async function updatePaymentState(
+  transactionId: string,
+  action: "mark-paid" | "confirm-receipt",
+) {
+  if (state.pendingAction) {
+    return;
+  }
+  try {
+    state.loading = true;
+    state.pendingAction = transactionId;
+    render();
+    if (action === "mark-paid") {
+      await cloudLedgerApi.markTransactionPaid(transactionId);
+    } else {
+      await cloudLedgerApi.confirmTransactionReceipt(transactionId);
+    }
+    await refreshDashboard();
+    state.view = "activity";
+    showToast(action === "mark-paid" ? "已标记打款，等待申请人确认" : "已确认收到款项");
+  } catch (error) {
+    showToast(friendlyError(error, action === "mark-paid" ? "标记打款失败" : "确认收款失败"));
   } finally {
     state.loading = false;
     state.pendingAction = undefined;
@@ -1134,12 +1215,18 @@ async function submitQuickEntry() {
     state.loading = true;
     state.pendingAction = "create";
     render();
-    await cloudLedgerApi.createTransaction(draft);
+    const transaction = await cloudLedgerApi.createTransaction(draft);
     state.form.amount = "";
     state.form.memo = "";
     await refreshDashboard();
     state.view = "activity";
-    showToast(state.form.submitForApproval ? "已提交审批" : "已保存流水");
+    showToast(
+      transaction.paymentState === "pending_payment"
+        ? "已自动批准，等待打款"
+        : transaction.approvalState === "pending"
+          ? "已提交审批"
+          : "已保存流水",
+    );
   } catch (error) {
     showToast(friendlyError(error, "保存失败"));
   } finally {
@@ -1171,6 +1258,12 @@ function friendlyError(error: unknown, fallback: string) {
   }
   if (message.includes("not pending approval")) {
     return "这笔流水已不在待审批状态";
+  }
+  if (message.includes("not waiting for payment")) {
+    return "这笔流水已不在当前付款状态";
+  }
+  if (message.includes("only the applicant can confirm receipt")) {
+    return "只有申请人可以确认收到款项";
   }
   if (message.includes("not authorized")) {
     return "当前账号没有权限执行此操作";
@@ -1236,26 +1329,22 @@ function roleLabel(role: Ledger["role"]) {
   const labels: Record<Ledger["role"], string> = {
     owner: "所有者",
     admin: "管理员",
-    accountant: "会计",
-    approver: "审批",
-    member: "成员",
-    auditor: "审计员",
-    viewer: "只读",
+    business_owner: "老板",
+    employee: "员工",
   };
 
   return labels[role];
 }
 
-function approvalStateLabel(stateValue: ApprovalState) {
-  const labels: Record<ApprovalState, string> = {
-    draft: "草稿",
-    pending: "审批中",
-    approved: "已入账",
-    rejected: "已驳回",
-    deleted: "已删除",
-  };
-
-  return labels[stateValue];
+function transactionStateLabel(transaction: LedgerDashboard["recentTransactions"][number]) {
+  if (transaction.approvalState === "pending") return "待老板审批";
+  if (transaction.approvalState === "rejected") return "已驳回";
+  if (transaction.approvalState === "deleted") return "已作废";
+  if (transaction.approvalState === "draft") return "草稿";
+  if (transaction.paymentState === "pending_payment") return "已批准待打款";
+  if (transaction.paymentState === "paid_pending_receipt") return "已打款待确认";
+  if (transaction.paymentState === "received") return "已完成";
+  return "已入账";
 }
 
 function statusClass(stateValue: ApprovalState) {
@@ -1276,6 +1365,9 @@ function auditActionLabel(action: LedgerDashboard["auditTrail"][number]["action"
     transaction_submitted: "提交",
     transaction_approved: "批准",
     transaction_rejected: "驳回",
+    transaction_paid: "打款",
+    transaction_received: "确认收款",
+    transaction_auto_approved: "自动批准",
     transaction_deleted: "删除",
   };
 

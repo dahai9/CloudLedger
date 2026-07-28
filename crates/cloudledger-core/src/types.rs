@@ -74,6 +74,8 @@ impl Membership {
 pub enum MembershipRole {
     Owner,
     Admin,
+    BusinessOwner,
+    Employee,
     Accountant,
     Approver,
     Member,
@@ -198,6 +200,16 @@ pub enum ApprovalState {
     Voided,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaymentState {
+    #[default]
+    NotApplicable,
+    PendingPayment,
+    PaidPendingReceipt,
+    Received,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     pub id: Uuid,
@@ -209,9 +221,21 @@ pub struct Transaction {
     pub occurred_at: OffsetDateTime,
     pub description: String,
     pub approval_state: ApprovalState,
+    #[serde(default)]
+    pub payment_state: PaymentState,
     pub created_by: Uuid,
     pub submitted_by: Option<Uuid>,
     pub approved_by: Option<Uuid>,
+    #[serde(default)]
+    pub approved_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub paid_by: Option<Uuid>,
+    #[serde(default)]
+    pub paid_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub received_by: Option<Uuid>,
+    #[serde(default)]
+    pub received_at: Option<OffsetDateTime>,
     pub version: i64,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
@@ -239,9 +263,15 @@ impl Transaction {
             occurred_at: now,
             description: description.into(),
             approval_state: ApprovalState::Draft,
+            payment_state: PaymentState::NotApplicable,
             created_by,
             submitted_by: None,
             approved_by: None,
+            approved_at: None,
+            paid_by: None,
+            paid_at: None,
+            received_by: None,
+            received_at: None,
             version: 1,
             created_at: now,
             updated_at: now,

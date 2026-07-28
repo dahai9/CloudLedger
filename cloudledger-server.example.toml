@@ -1,0 +1,29 @@
+[server]
+api_bind_addr = "0.0.0.0:8787"
+admin_bind_addr = "127.0.0.1:8788"
+data_dir = ".cloudledger-server"
+
+[database]
+# The database and login must exist before CloudLedger starts. Percent-encode
+# reserved characters in the username or password.
+url = "postgres://cloudledger:change-this-password@127.0.0.1:5432/cloudledger"
+max_connections = 10
+connect_timeout_seconds = 10
+
+[admin]
+# Leave these empty only before the first start. The server replaces them with
+# high-entropy values and writes the completed file with mode 0600 on Unix.
+path = ""
+token = ""
+
+[security.login]
+max_failures_per_login = 5
+max_failures_per_ip = 20
+window_seconds = 900
+lockout_seconds = 900
+
+[security.turnstile]
+# Configure both keys when the admin service is reachable beyond loopback.
+site_key = ""
+secret_key = ""
+verify_url = "https://challenges.cloudflare.com/turnstile/v0/siteverify"

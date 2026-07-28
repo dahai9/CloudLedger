@@ -148,17 +148,25 @@ async fn admin_login(
     } else {
         (None, Some(identifier.clone()))
     };
-    let mut auth = lock_auth(&state)?;
-    let login_result = auth.admin_login(AdminLoginInput {
-        email,
-        phone,
-        password: request.password,
-    });
+    let _write_guard = state.write_gate.lock().await;
+    let (login_result, staged_auth) = {
+        let auth = lock_auth(&state)?;
+        let mut staged_auth = auth.clone();
+        let login_result = staged_auth.admin_login(AdminLoginInput {
+            email,
+            phone,
+            password: request.password,
+        });
+        (login_result, staged_auth)
+    };
     if login_result.is_ok() {
-        auth.save_to_path(&state.auth_state_path)
-            .map_err(AdminApiError::from_auth)?;
+        state
+            .storage
+            .save_auth(staged_auth.snapshot())
+            .await
+            .map_err(AdminApiError::from_storage)?;
+        *lock_auth(&state)? = staged_auth;
     }
-    drop(auth);
     let session = match login_result {
         Ok(session) => {
             record_login_success(
@@ -242,15 +250,26 @@ async fn admin_logout(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> Result<StatusCode, AdminApiError> {
-    let principal = authenticate_principal(&headers, &state)?;
     let token = bearer_token(&headers)?;
+    let _write_guard = state.write_gate.lock().await;
+    let principal = authenticate_principal(&headers, &state)?;
     match principal {
         AdminPrincipal::Platform => lock_platform_sessions(&state)?.revoke(token),
         AdminPrincipal::Organization(_) => {
-            let mut auth = lock_auth(&state)?;
-            auth.logout(token).map_err(AdminApiError::from_auth)?;
-            auth.save_to_path(&state.auth_state_path)
-                .map_err(AdminApiError::from_auth)?;
+            let staged_auth = {
+                let auth = lock_auth(&state)?;
+                let mut staged_auth = auth.clone();
+                staged_auth
+                    .logout(token)
+                    .map_err(AdminApiError::from_auth)?;
+                staged_auth
+            };
+            state
+                .storage
+                .save_auth(staged_auth.snapshot())
+                .await
+                .map_err(AdminApiError::from_storage)?;
+            *lock_auth(&state)? = staged_auth;
         }
     }
     Ok(StatusCode::NO_CONTENT)
@@ -306,6 +325,7 @@ async fn create_organization(
     headers: HeaderMap,
     Json(request): Json<CreateOrganizationRequest>,
 ) -> Result<Json<OrganizationWithMembers>, AdminApiError> {
+    let _write_guard = state.write_gate.lock().await;
     require_platform(authenticate_principal(&headers, &state)?)?;
     let CreateOrganizationRequest {
         organization_name,
@@ -315,11 +335,11 @@ async fn create_organization(
         admin_password,
     } = request;
 
-    let mut auth = lock_auth(&state)?;
-    let mut service = lock_service(&state)?;
-    let original_service = service.clone();
-    let mut staged_auth = auth.clone();
-    let mut staged_service = original_service.clone();
+    let (mut staged_auth, mut staged_service) = {
+        let auth = lock_auth(&state)?;
+        let service = lock_service(&state)?;
+        (auth.clone(), service.clone())
+    };
     let admin_user_id = Uuid::new_v4();
     let admin_member = staged_service
         .create_organization(AppCreateOrganizationInput {
@@ -345,14 +365,7 @@ async fn create_organization(
         .map_err(AdminApiError::from_auth)?;
     let response = organization_with_members(&staged_service, organization_id)?;
 
-    persist_staged_state(
-        &state,
-        &mut auth,
-        &mut service,
-        staged_auth,
-        staged_service,
-        original_service,
-    )?;
+    persist_staged_state(&state, staged_auth, staged_service).await?;
     Ok(Json(response))
 }
 
@@ -376,6 +389,7 @@ async fn add_member(
     Path(organization_id): Path<Uuid>,
     Json(request): Json<AddMemberRequest>,
 ) -> Result<Json<MembershipDto>, AdminApiError> {
+    let _write_guard = state.write_gate.lock().await;
     require_organization_admin(authenticate_principal(&headers, &state)?, organization_id)?;
     require_employee_role(request.role)?;
     let AddMemberRequest {
@@ -386,11 +400,11 @@ async fn add_member(
         role,
     } = request;
 
-    let mut auth = lock_auth(&state)?;
-    let mut service = lock_service(&state)?;
-    let original_service = service.clone();
-    let mut staged_auth = auth.clone();
-    let mut staged_service = original_service.clone();
+    let (mut staged_auth, mut staged_service) = {
+        let auth = lock_auth(&state)?;
+        let service = lock_service(&state)?;
+        (auth.clone(), service.clone())
+    };
     let member = staged_service
         .add_organization_member(AppAddOrganizationMemberInput {
             organization_id,
@@ -401,14 +415,7 @@ async fn add_member(
         })
         .map_err(AdminApiError::from_service)?;
     sync_business_auth_user(&mut staged_auth, &member, password)?;
-    persist_staged_state(
-        &state,
-        &mut auth,
-        &mut service,
-        staged_auth,
-        staged_service,
-        original_service,
-    )?;
+    persist_staged_state(&state, staged_auth, staged_service).await?;
     Ok(Json(member))
 }
 
@@ -418,20 +425,25 @@ async fn update_member_role(
     Path((organization_id, membership_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<UpdateMemberRoleRequest>,
 ) -> Result<Json<MembershipDto>, AdminApiError> {
+    let _write_guard = state.write_gate.lock().await;
     require_organization_admin(authenticate_principal(&headers, &state)?, organization_id)?;
     require_employee_role(request.role)?;
-    let auth = lock_auth(&state)?;
-    let mut service = lock_service(&state)?;
-    let member = find_member(&service, organization_id, membership_id)?;
-    require_business_member(&auth, &member)?;
-    let member = service
-        .update_organization_member_role(AppUpdateOrganizationMemberRoleInput {
-            organization_id,
-            membership_id,
-            role: request.role,
-        })
-        .map_err(AdminApiError::from_service)?;
-    persist_service(&state, &service)?;
+    let (member, staged_service) = {
+        let auth = lock_auth(&state)?;
+        let service = lock_service(&state)?;
+        let mut staged_service = service.clone();
+        let member = find_member(&staged_service, organization_id, membership_id)?;
+        require_business_member(&auth, &member)?;
+        let member = staged_service
+            .update_organization_member_role(AppUpdateOrganizationMemberRoleInput {
+                organization_id,
+                membership_id,
+                role: request.role,
+            })
+            .map_err(AdminApiError::from_service)?;
+        (member, staged_service)
+    };
+    persist_service(&state, staged_service).await?;
     Ok(Json(member))
 }
 
@@ -440,15 +452,20 @@ async fn remove_member(
     headers: HeaderMap,
     Path((organization_id, membership_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, AdminApiError> {
+    let _write_guard = state.write_gate.lock().await;
     require_organization_admin(authenticate_principal(&headers, &state)?, organization_id)?;
-    let auth = lock_auth(&state)?;
-    let mut service = lock_service(&state)?;
-    let member = find_member(&service, organization_id, membership_id)?;
-    require_business_member(&auth, &member)?;
-    service
-        .remove_organization_member(organization_id, membership_id)
-        .map_err(AdminApiError::from_service)?;
-    persist_service(&state, &service)?;
+    let staged_service = {
+        let auth = lock_auth(&state)?;
+        let service = lock_service(&state)?;
+        let mut staged_service = service.clone();
+        let member = find_member(&staged_service, organization_id, membership_id)?;
+        require_business_member(&auth, &member)?;
+        staged_service
+            .remove_organization_member(organization_id, membership_id)
+            .map_err(AdminApiError::from_service)?;
+        staged_service
+    };
+    persist_service(&state, staged_service).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -458,16 +475,23 @@ async fn reset_member_password(
     Path((organization_id, membership_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<ResetPasswordRequest>,
 ) -> Result<Json<MembershipDto>, AdminApiError> {
+    let _write_guard = state.write_gate.lock().await;
     require_organization_admin(authenticate_principal(&headers, &state)?, organization_id)?;
+    let (member, staged_auth) = {
+        let auth = lock_auth(&state)?;
+        let service = lock_service(&state)?;
+        let member = find_member(&service, organization_id, membership_id)?;
+        require_business_member(&auth, &member)?;
+        let mut staged_auth = auth.clone();
+        sync_business_auth_user(&mut staged_auth, &member, Some(request.password))?;
+        (member, staged_auth)
+    };
+    state
+        .storage
+        .save_auth(staged_auth.snapshot())
+        .await
+        .map_err(AdminApiError::from_storage)?;
     let mut auth = lock_auth(&state)?;
-    let service = lock_service(&state)?;
-    let member = find_member(&service, organization_id, membership_id)?;
-    require_business_member(&auth, &member)?;
-    let mut staged_auth = auth.clone();
-    sync_business_auth_user(&mut staged_auth, &member, Some(request.password))?;
-    staged_auth
-        .save_to_path(&state.auth_state_path)
-        .map_err(AdminApiError::from_auth)?;
     *auth = staged_auth;
     Ok(Json(member))
 }
@@ -525,15 +549,12 @@ fn sync_business_auth_user(
 fn require_employee_role(role: MembershipRole) -> Result<(), AdminApiError> {
     if matches!(
         role,
-        MembershipRole::Accountant
-            | MembershipRole::Approver
-            | MembershipRole::Member
-            | MembershipRole::Viewer
+        MembershipRole::BusinessOwner | MembershipRole::Employee
     ) {
         Ok(())
     } else {
         Err(AdminApiError::bad_request(
-            "employee role must be accountant, approver, member, or viewer",
+            "business role must be business_owner or employee",
         ))
     }
 }
@@ -687,27 +708,31 @@ fn record_login_success(
     Ok(())
 }
 
-fn persist_service(state: &ServerState, service: &AppLedgerService) -> Result<(), AdminApiError> {
-    service
-        .save_to_path(&state.ledger_state_path)
-        .map_err(AdminApiError::from_service)
+async fn persist_service(
+    state: &ServerState,
+    staged_service: AppLedgerService,
+) -> Result<(), AdminApiError> {
+    state
+        .storage
+        .save_ledger(staged_service.snapshot())
+        .await
+        .map_err(AdminApiError::from_storage)?;
+    *lock_service(state)? = staged_service;
+    Ok(())
 }
 
-fn persist_staged_state(
+async fn persist_staged_state(
     state: &ServerState,
-    auth: &mut crate::auth::AuthService,
-    service: &mut AppLedgerService,
     staged_auth: crate::auth::AuthService,
     staged_service: AppLedgerService,
-    original_service: AppLedgerService,
 ) -> Result<(), AdminApiError> {
-    staged_service
-        .save_to_path(&state.ledger_state_path)
-        .map_err(AdminApiError::from_service)?;
-    if let Err(error) = staged_auth.save_to_path(&state.auth_state_path) {
-        let _ = original_service.save_to_path(&state.ledger_state_path);
-        return Err(AdminApiError::from_auth(error));
-    }
+    state
+        .storage
+        .save_all(staged_service.snapshot(), staged_auth.snapshot())
+        .await
+        .map_err(AdminApiError::from_storage)?;
+    let mut auth = lock_auth(state)?;
+    let mut service = lock_service(state)?;
     *auth = staged_auth;
     *service = staged_service;
     Ok(())
@@ -883,6 +908,10 @@ impl AdminApiError {
             message: error.to_string(),
             retry_after_seconds,
         }
+    }
+
+    fn from_storage(error: anyhow::Error) -> Self {
+        Self::internal(format!("storage error: {error}"))
     }
 
     fn from_turnstile(error: TurnstileError) -> Self {
@@ -1062,7 +1091,7 @@ mod tests {
                 email: Some("employee@example.com".to_string()),
                 phone: None,
                 password: Some("employee-password".to_string()),
-                role: MembershipRole::Member,
+                role: MembershipRole::Employee,
             }),
         )
         .await
@@ -1079,7 +1108,7 @@ mod tests {
                 email: Some("forbidden@example.com".to_string()),
                 phone: None,
                 password: Some("employee-password".to_string()),
-                role: MembershipRole::Viewer,
+                role: MembershipRole::Employee,
             }),
         )
         .await
@@ -1096,7 +1125,7 @@ mod tests {
                 email: Some("employee@example.com".to_string()),
                 phone: None,
                 password: Some("another-password".to_string()),
-                role: MembershipRole::Viewer,
+                role: MembershipRole::Employee,
             }),
         )
         .await
@@ -1121,7 +1150,7 @@ mod tests {
                 email: Some("employee@example.com".to_string()),
                 phone: None,
                 password: Some("employee-password".to_string()),
-                role: MembershipRole::Accountant,
+                role: MembershipRole::Employee,
             }),
         )
         .await

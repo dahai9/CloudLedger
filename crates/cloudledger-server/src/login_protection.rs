@@ -4,12 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::auth::AuthError;
+use crate::{auth::AuthError, config::LoginSecurityConfig};
 
-const DEFAULT_MAX_FAILURES_PER_LOGIN: u32 = 5;
-const DEFAULT_MAX_FAILURES_PER_IP: u32 = 20;
-const DEFAULT_WINDOW_SECONDS: u64 = 15 * 60;
-const DEFAULT_LOCKOUT_SECONDS: u64 = 15 * 60;
 const MAX_TRACKED_KEYS: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -30,41 +26,18 @@ pub struct LoginProtectionConfig {
 
 impl Default for LoginProtectionConfig {
     fn default() -> Self {
-        Self {
-            max_failures_per_login: DEFAULT_MAX_FAILURES_PER_LOGIN,
-            max_failures_per_ip: DEFAULT_MAX_FAILURES_PER_IP,
-            window: Duration::from_secs(DEFAULT_WINDOW_SECONDS),
-            lockout: Duration::from_secs(DEFAULT_LOCKOUT_SECONDS),
-        }
+        Self::from_settings(&LoginSecurityConfig::default())
     }
 }
 
 impl LoginProtectionConfig {
-    pub fn from_env() -> anyhow::Result<Self> {
-        let config = Self {
-            max_failures_per_login: read_u32_env(
-                "CLOUDLEDGER_LOGIN_MAX_FAILURES",
-                DEFAULT_MAX_FAILURES_PER_LOGIN,
-            )?,
-            max_failures_per_ip: read_u32_env(
-                "CLOUDLEDGER_LOGIN_MAX_FAILURES_PER_IP",
-                DEFAULT_MAX_FAILURES_PER_IP,
-            )?,
-            window: Duration::from_secs(read_u64_env(
-                "CLOUDLEDGER_LOGIN_WINDOW_SECONDS",
-                DEFAULT_WINDOW_SECONDS,
-            )?),
-            lockout: Duration::from_secs(read_u64_env(
-                "CLOUDLEDGER_LOGIN_LOCKOUT_SECONDS",
-                DEFAULT_LOCKOUT_SECONDS,
-            )?),
-        };
-        if config.max_failures_per_ip < config.max_failures_per_login {
-            anyhow::bail!(
-                "CLOUDLEDGER_LOGIN_MAX_FAILURES_PER_IP must be greater than or equal to CLOUDLEDGER_LOGIN_MAX_FAILURES"
-            );
+    pub fn from_settings(settings: &LoginSecurityConfig) -> Self {
+        Self {
+            max_failures_per_login: settings.max_failures_per_login,
+            max_failures_per_ip: settings.max_failures_per_ip,
+            window: Duration::from_secs(settings.window_seconds),
+            lockout: Duration::from_secs(settings.lockout_seconds),
         }
-        Ok(config)
     }
 }
 
@@ -291,38 +264,6 @@ fn make_room<K: std::hash::Hash + Eq + Clone>(states: &mut HashMap<K, FailureSta
         .map(|(key, _)| key.clone())
     {
         states.remove(&oldest_key);
-    }
-}
-
-fn read_u32_env(name: &str, default: u32) -> anyhow::Result<u32> {
-    match std::env::var(name) {
-        Ok(value) => {
-            let parsed = value
-                .parse::<u32>()
-                .map_err(|_| anyhow::anyhow!("{name} must be a positive integer"))?;
-            if parsed == 0 {
-                anyhow::bail!("{name} must be greater than zero");
-            }
-            Ok(parsed)
-        }
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(error) => Err(anyhow::anyhow!("read {name}: {error}")),
-    }
-}
-
-fn read_u64_env(name: &str, default: u64) -> anyhow::Result<u64> {
-    match std::env::var(name) {
-        Ok(value) => {
-            let parsed = value
-                .parse::<u64>()
-                .map_err(|_| anyhow::anyhow!("{name} must be a positive integer"))?;
-            if parsed == 0 {
-                anyhow::bail!("{name} must be greater than zero");
-            }
-            Ok(parsed)
-        }
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(error) => Err(anyhow::anyhow!("read {name}: {error}")),
     }
 }
 

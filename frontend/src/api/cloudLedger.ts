@@ -30,6 +30,8 @@ export interface CloudLedgerApi {
     decision: "approve" | "reject",
     decisionNote?: string,
   ): Promise<Transaction>;
+  markTransactionPaid(transactionId: string): Promise<Transaction>;
+  confirmTransactionReceipt(transactionId: string): Promise<Transaction>;
   listApprovalQueue(ledgerId: string): Promise<ApprovalQueueItem[]>;
   listAuditTrail(ledgerId: string): Promise<AuditLogEntry[]>;
   isAuthRequired(error: unknown): boolean;
@@ -157,6 +159,26 @@ const serverApi: CloudLedgerApi = {
     });
     overviewCache = undefined;
     return mapTransaction(decided, overview);
+  },
+
+  async markTransactionPaid(transactionId) {
+    const overview = overviewCache ?? (await getOverview());
+    const transaction = await authenticatedJson<TransactionDto>("/app/payments/mark-paid", {
+      method: "POST",
+      body: { transactionId },
+    });
+    overviewCache = undefined;
+    return mapTransaction(transaction, overview);
+  },
+
+  async confirmTransactionReceipt(transactionId) {
+    const overview = overviewCache ?? (await getOverview());
+    const transaction = await authenticatedJson<TransactionDto>("/app/payments/confirm-receipt", {
+      method: "POST",
+      body: { transactionId },
+    });
+    overviewCache = undefined;
+    return mapTransaction(transaction, overview);
   },
 
   async listApprovalQueue(ledgerId) {
@@ -346,7 +368,7 @@ const mockLedgers: Ledger[] = [
     name: "增长事业部",
     kind: "organization",
     currency: "CNY",
-    role: "accountant",
+    role: "business_owner",
     organizationName: "CloudLedger Inc.",
     balanceCents: 8429500,
     pendingCount: 3,
@@ -406,7 +428,9 @@ let mockTransactions: Transaction[] = [
     accountName: "电子钱包",
     categoryName: "餐饮",
     approvalState: "approved",
+    paymentState: "not_applicable",
     actorName: "我",
+    createdByUserId: "demo-user",
     memo: "移动端快速记账",
     auditRequired: false,
   },
@@ -420,7 +444,9 @@ let mockTransactions: Transaction[] = [
     accountName: "电子钱包",
     categoryName: "交通",
     approvalState: "approved",
+    paymentState: "not_applicable",
     actorName: "我",
+    createdByUserId: "demo-user",
     auditRequired: false,
   },
   {
@@ -433,7 +459,9 @@ let mockTransactions: Transaction[] = [
     accountName: "公司基本户",
     categoryName: "云资源",
     approvalState: "pending",
+    paymentState: "not_applicable",
     actorName: "林会计",
+    createdByUserId: "demo-lin",
     memo: "待主管确认",
     auditRequired: true,
   },
@@ -447,7 +475,9 @@ let mockTransactions: Transaction[] = [
     accountName: "应收账款",
     categoryName: "合同回款",
     approvalState: "approved",
+    paymentState: "not_applicable",
     actorName: "陈经理",
+    createdByUserId: "demo-chen",
     auditRequired: true,
   },
 ];
@@ -572,7 +602,9 @@ const mockApi: CloudLedgerApi = {
       accountName: account?.name ?? "未选择账户",
       categoryName: category?.name ?? "未分类",
       approvalState: draft.submitForApproval ? "pending" : "draft",
+      paymentState: "not_applicable",
       actorName: "我",
+      createdByUserId: "demo-user",
       memo: draft.memo,
       auditRequired: draft.submitForApproval,
     };
@@ -626,6 +658,10 @@ const mockApi: CloudLedgerApi = {
     }
 
     transaction.approvalState = decision === "approve" ? "approved" : "rejected";
+    transaction.paymentState =
+      decision === "approve" && transaction.direction === "expense"
+        ? "pending_payment"
+        : "not_applicable";
     mockApprovalQueue = mockApprovalQueue.filter((item) => item.transactionId !== transactionId);
     mockAuditTrail = [
       {
@@ -643,6 +679,26 @@ const mockApi: CloudLedgerApi = {
       ...mockAuditTrail,
     ];
 
+    return transaction;
+  },
+
+  async markTransactionPaid(transactionId) {
+    const transaction = mockTransactions.find((item) => item.id === transactionId);
+    if (!transaction || transaction.paymentState !== "pending_payment") {
+      throw new Error("流水不是待打款状态");
+    }
+    transaction.paymentState = "paid_pending_receipt";
+    transaction.paidAt = nowIso();
+    return transaction;
+  },
+
+  async confirmTransactionReceipt(transactionId) {
+    const transaction = mockTransactions.find((item) => item.id === transactionId);
+    if (!transaction || transaction.paymentState !== "paid_pending_receipt") {
+      throw new Error("流水不是待确认收款状态");
+    }
+    transaction.paymentState = "received";
+    transaction.receivedAt = nowIso();
     return transaction;
   },
 
@@ -755,16 +811,13 @@ function normalizeRole(role: string): Ledger["role"] {
   if (
     role === "owner" ||
     role === "admin" ||
-    role === "accountant" ||
-    role === "approver" ||
-    role === "member" ||
-    role === "auditor" ||
-    role === "viewer"
+    role === "business_owner" ||
+    role === "employee"
   ) {
     return role;
   }
 
-  return "viewer";
+  return "employee";
 }
 
 function mapAccount(account: AccountDto): FinancialAccount {
@@ -806,7 +859,11 @@ function mapTransaction(transaction: TransactionDto, overview: LedgerOverview): 
     accountName: account?.name ?? "未知账户",
     categoryName: transaction.kind === "income" ? "收入" : "支出",
     approvalState: normalizeApprovalState(transaction.approvalState),
+    paymentState: transaction.paymentState,
     actorName: transaction.createdBy,
+    createdByUserId: transaction.createdByUserId,
+    paidAt: transaction.paidAt,
+    receivedAt: transaction.receivedAt,
     memo: transaction.description,
     auditRequired: transaction.approvalState === "submitted",
   };
@@ -814,8 +871,8 @@ function mapTransaction(transaction: TransactionDto, overview: LedgerOverview): 
 
 function mapApprovalQueue(ledgerId: string, overview: LedgerOverview): ApprovalQueueItem[] {
   const ledger = overview.ledgers.find((item) => item.id === ledgerId);
-  const role = normalizeRole(ledger?.role ?? "viewer");
-  const canApproveLedger = role === "owner" || role === "admin" || role === "approver";
+  const role = normalizeRole(ledger?.role ?? "employee");
+  const canApproveLedger = role === "business_owner";
 
   return overview.transactions
     .filter((item) => item.ledgerId === ledgerId && item.approvalState === "submitted")
@@ -878,6 +935,18 @@ function normalizeApprovalState(state: TransactionDto["approvalState"]): Transac
 }
 
 function normalizeAuditAction(action: string): AuditLogEntry["action"] {
+  if (action.includes("auto_approved")) {
+    return "transaction_auto_approved";
+  }
+
+  if (action.includes("received")) {
+    return "transaction_received";
+  }
+
+  if (action.includes("paid")) {
+    return "transaction_paid";
+  }
+
   if (action.includes("approved")) {
     return "transaction_approved";
   }

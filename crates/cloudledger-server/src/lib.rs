@@ -2,9 +2,11 @@ pub mod admin;
 pub mod app_api;
 pub mod auth;
 pub mod auth_routes;
+pub mod config;
 pub mod login_protection;
 pub mod platform_auth;
 pub mod state;
+pub mod storage;
 pub mod sync;
 pub mod turnstile;
 
@@ -59,6 +61,14 @@ pub fn router(state: ServerState) -> Router {
         .route("/app/overview", get(app_api::overview))
         .route("/app/transactions", post(app_api::create_transaction))
         .route("/app/approvals/decide", post(app_api::decide_approval))
+        .route(
+            "/app/payments/mark-paid",
+            post(app_api::mark_transaction_paid),
+        )
+        .route(
+            "/app/payments/confirm-receipt",
+            post(app_api::confirm_transaction_receipt),
+        )
         .with_state(state)
         .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(CorsLayer::permissive())

@@ -3,7 +3,8 @@ use std::{net::IpAddr, time::Duration};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-const DEFAULT_VERIFY_URL: &str = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+use crate::config::{TurnstileConfig, DEFAULT_TURNSTILE_VERIFY_URL};
+
 const EXPECTED_ACTION: &str = "admin-login";
 
 #[derive(Debug, Error)]
@@ -31,17 +32,17 @@ impl Default for TurnstileVerifier {
 }
 
 impl TurnstileVerifier {
-    pub fn from_env() -> anyhow::Result<Self> {
-        let site_key = read_optional_env("CLOUDLEDGER_TURNSTILE_SITE_KEY");
-        let secret_key = read_optional_env("CLOUDLEDGER_TURNSTILE_SECRET_KEY");
+    pub fn from_config(config: &TurnstileConfig) -> anyhow::Result<Self> {
+        let site_key = nonempty_value(&config.site_key);
+        let secret_key = nonempty_value(&config.secret_key);
         match (&site_key, &secret_key) {
             (Some(_), Some(_)) | (None, None) => {}
             _ => anyhow::bail!(
-                "CLOUDLEDGER_TURNSTILE_SITE_KEY and CLOUDLEDGER_TURNSTILE_SECRET_KEY must be configured together"
+                "security.turnstile.site_key and security.turnstile.secret_key must be configured together"
             ),
         }
-        let verify_url = read_optional_env("CLOUDLEDGER_TURNSTILE_VERIFY_URL")
-            .unwrap_or_else(|| DEFAULT_VERIFY_URL.to_string());
+        let verify_url = nonempty_value(&config.verify_url)
+            .ok_or_else(|| anyhow::anyhow!("security.turnstile.verify_url cannot be empty"))?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(8))
             .build()?;
@@ -57,7 +58,7 @@ impl TurnstileVerifier {
         Self {
             site_key: None,
             secret_key: None,
-            verify_url: DEFAULT_VERIFY_URL.to_string(),
+            verify_url: DEFAULT_TURNSTILE_VERIFY_URL.to_string(),
             client: reqwest::Client::new(),
         }
     }
@@ -120,11 +121,9 @@ struct TurnstileVerificationResponse {
     action: Option<String>,
 }
 
-fn read_optional_env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+fn nonempty_value(value: &str) -> Option<String> {
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 #[cfg(test)]

@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     auth::{
-        AuthError, AuthenticatedSession, LoginInput, RefreshInput, Session, UpdateProfileInput,
+        AuthError, AuthService, AuthenticatedSession, LoginInput, RefreshInput, Session,
+        UpdateProfileInput,
     },
     login_protection::LoginSurface,
     ServerState,
@@ -27,23 +28,21 @@ pub async fn login(
 ) -> Result<Json<Session>, ApiError> {
     let identifier = login_identifier(request.email.as_deref(), request.phone.as_deref());
     check_login_attempt(&state, peer_addr.ip(), LoginSurface::Business, &identifier)?;
+    let _write_guard = state.write_gate.lock().await;
 
-    let login_result = {
-        let mut auth = state
+    let (login_result, staged_auth) = {
+        let auth = state
             .auth_service
             .lock()
             .map_err(|_| ApiError::internal("auth service lock poisoned"))?;
-        let result = auth.login(LoginInput {
+        let mut staged_auth = auth.clone();
+        let result = staged_auth.login(LoginInput {
             email: request.email,
             phone: request.phone,
             password: request.password,
             installation_id: request.installation_id,
         });
-        if result.is_ok() {
-            auth.save_to_path(&state.auth_state_path)
-                .map_err(ApiError::from_auth)?;
-        }
-        result
+        (result, staged_auth)
     };
     let session = match login_result {
         Ok(session) => {
@@ -64,7 +63,15 @@ pub async fn login(
         }
     };
 
-    ensure_ledger_identity(&state, &session)?;
+    persist_auth_and_ledger_identity(
+        &state,
+        staged_auth,
+        &AuthenticatedSession {
+            user: session.user.clone(),
+            installation_id: session.installation_id.clone(),
+        },
+    )
+    .await?;
     Ok(Json(session))
 }
 
@@ -72,23 +79,30 @@ pub async fn refresh(
     State(state): State<ServerState>,
     Json(request): Json<RefreshRequest>,
 ) -> Result<Json<Session>, ApiError> {
-    let session = {
-        let mut auth = state
+    let _write_guard = state.write_gate.lock().await;
+    let (session, staged_auth) = {
+        let auth = state
             .auth_service
             .lock()
             .map_err(|_| ApiError::internal("auth service lock poisoned"))?;
-        let session = auth
+        let mut staged_auth = auth.clone();
+        let session = staged_auth
             .refresh(RefreshInput {
                 refresh_token: request.refresh_token,
                 installation_id: request.installation_id,
             })
             .map_err(ApiError::from_auth)?;
-        auth.save_to_path(&state.auth_state_path)
-            .map_err(ApiError::from_auth)?;
-        session
+        (session, staged_auth)
     };
-
-    ensure_ledger_identity(&state, &session)?;
+    persist_auth_and_ledger_identity(
+        &state,
+        staged_auth,
+        &AuthenticatedSession {
+            user: session.user.clone(),
+            installation_id: session.installation_id.clone(),
+        },
+    )
+    .await?;
     Ok(Json(session))
 }
 
@@ -109,12 +123,14 @@ pub async fn update_me(
     Json(request): Json<UpdateProfileRequest>,
 ) -> Result<Json<MeResponse>, ApiError> {
     let token = bearer_token(&headers)?;
-    let session = {
-        let mut auth = state
+    let _write_guard = state.write_gate.lock().await;
+    let (session, staged_auth) = {
+        let auth = state
             .auth_service
             .lock()
             .map_err(|_| ApiError::internal("auth service lock poisoned"))?;
-        let session = auth
+        let mut staged_auth = auth.clone();
+        let session = staged_auth
             .update_profile(
                 token,
                 UpdateProfileInput {
@@ -122,12 +138,9 @@ pub async fn update_me(
                 },
             )
             .map_err(ApiError::from_auth)?;
-        auth.save_to_path(&state.auth_state_path)
-            .map_err(ApiError::from_auth)?;
-        session
+        (session, staged_auth)
     };
-
-    ensure_ledger_identity_from_auth(&state, &session)?;
+    persist_auth_and_ledger_identity(&state, staged_auth, &session).await?;
     Ok(Json(MeResponse {
         user: session.user,
         installation_id: session.installation_id,
@@ -139,13 +152,25 @@ pub async fn logout(
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let token = bearer_token(&headers)?;
-    let mut auth = state
+    let _write_guard = state.write_gate.lock().await;
+    let staged_auth = {
+        let auth = state
+            .auth_service
+            .lock()
+            .map_err(|_| ApiError::internal("auth service lock poisoned"))?;
+        let mut staged_auth = auth.clone();
+        staged_auth.logout(token).map_err(ApiError::from_auth)?;
+        staged_auth
+    };
+    state
+        .storage
+        .save_auth(staged_auth.snapshot())
+        .await
+        .map_err(ApiError::from_storage)?;
+    *state
         .auth_service
         .lock()
-        .map_err(|_| ApiError::internal("auth service lock poisoned"))?;
-    auth.logout(token).map_err(ApiError::from_auth)?;
-    auth.save_to_path(&state.auth_state_path)
-        .map_err(ApiError::from_auth)?;
+        .map_err(|_| ApiError::internal("auth service lock poisoned"))? = staged_auth;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -162,25 +187,19 @@ pub(crate) fn authenticate(
         .map_err(ApiError::from_auth)
 }
 
-fn ensure_ledger_identity(state: &ServerState, session: &Session) -> Result<(), ApiError> {
-    ensure_ledger_identity_from_auth(
-        state,
-        &AuthenticatedSession {
-            user: session.user.clone(),
-            installation_id: session.installation_id.clone(),
-        },
-    )
-}
-
-fn ensure_ledger_identity_from_auth(
+async fn persist_auth_and_ledger_identity(
     state: &ServerState,
+    staged_auth: AuthService,
     session: &AuthenticatedSession,
 ) -> Result<(), ApiError> {
-    let mut service = state
-        .ledger_service
-        .lock()
-        .map_err(|_| ApiError::internal("ledger service lock poisoned"))?;
-    service
+    let mut staged_ledger = {
+        let service = state
+            .ledger_service
+            .lock()
+            .map_err(|_| ApiError::internal("ledger service lock poisoned"))?;
+        service.clone()
+    };
+    staged_ledger
         .ensure_user_identity(AppEnsureUserIdentityInput {
             user_id: session.user.id,
             display_name: session.user.display_name.clone(),
@@ -188,9 +207,22 @@ fn ensure_ledger_identity_from_auth(
             phone: session.user.phone.clone(),
         })
         .map_err(ApiError::from_service)?;
-    service
-        .save_to_path(&state.ledger_state_path)
-        .map_err(ApiError::from_service)
+    state
+        .storage
+        .save_all(staged_ledger.snapshot(), staged_auth.snapshot())
+        .await
+        .map_err(ApiError::from_storage)?;
+    let mut auth = state
+        .auth_service
+        .lock()
+        .map_err(|_| ApiError::internal("auth service lock poisoned"))?;
+    let mut ledger = state
+        .ledger_service
+        .lock()
+        .map_err(|_| ApiError::internal("ledger service lock poisoned"))?;
+    *auth = staged_auth;
+    *ledger = staged_ledger;
+    Ok(())
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
@@ -356,6 +388,10 @@ impl ApiError {
             message: error.to_string(),
             retry_after_seconds: None,
         }
+    }
+
+    pub(crate) fn from_storage(error: anyhow::Error) -> Self {
+        Self::internal(format!("storage error: {error}"))
     }
 }
 

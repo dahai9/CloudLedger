@@ -3,15 +3,13 @@ export type LedgerKind = "private" | "organization";
 export type MemberRole =
   | "owner"
   | "admin"
-  | "accountant"
-  | "approver"
-  | "member"
-  | "auditor"
-  | "viewer";
+  | "business_owner"
+  | "employee";
 
 export type TransactionDirection = "expense" | "income";
 
 export type ApprovalState = "draft" | "pending" | "approved" | "rejected" | "deleted";
+export type PaymentState = "not_applicable" | "pending_payment" | "paid_pending_receipt" | "received";
 
 export type CloudConnectionState = "checking" | "online" | "offline";
 
@@ -20,6 +18,9 @@ export type AuditAction =
   | "transaction_submitted"
   | "transaction_approved"
   | "transaction_rejected"
+  | "transaction_paid"
+  | "transaction_received"
+  | "transaction_auto_approved"
   | "transaction_deleted";
 
 export interface Ledger {
@@ -94,7 +95,11 @@ export interface Transaction {
   accountName: string;
   categoryName: string;
   approvalState: ApprovalState;
+  paymentState: PaymentState;
   actorName: string;
+  createdByUserId: string;
+  paidAt?: string;
+  receivedAt?: string;
   memo?: string;
   auditRequired: boolean;
 }

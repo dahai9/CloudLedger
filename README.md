@@ -37,13 +37,52 @@ Run the development cloud server on the LAN:
 nix develop path:. -c cargo run -p cloudledger-server
 ```
 
-The mobile API listens on `CLOUDLEDGER_BIND_ADDR`, defaulting to
-`0.0.0.0:8787` so the Android test phone can reach it on the LAN. The mobile
-frontend reads its runtime backend from `frontend/public/config.js`. Set
-`apiBaseUrl` there before an Android build, or edit `dist/config.js` when
-deploying the web build. An empty value makes the web development UI use the
-current page hostname on port `8787`. `VITE_CLOUDLEDGER_CLOUD_URL` remains a
-build-time fallback when the runtime value is empty.
+All backend deployment settings live in one TOML file. The default path is
+`.cloudledger-server/config.toml`; the server creates and validates it on first
+startup and restricts it to mode `0600` on Unix because it contains secrets.
+Use `cloudledger-server.example.toml` as the complete schema reference. A
+different file can be selected explicitly:
+
+```bash
+nix develop path:. -c cargo run -p cloudledger-server -- --config /etc/cloudledger/server.toml
+```
+
+The generated file contains these sections:
+
+- `[server]`: mobile API bind address, admin bind address, and data directory.
+- `[database]`: PostgreSQL URL, pool size, and connection timeout.
+- `[admin]`: randomized admin URL path and platform token.
+- `[security.login]`: identifier/IP failure limits, time window, and lockout.
+- `[security.turnstile]`: Cloudflare site key, secret key, and verification URL.
+
+PostgreSQL is required before the backend starts. Create the database and a
+dedicated login, copy `cloudledger-server.example.toml`, then set
+`database.url` to that database. CloudLedger creates and versions tables inside
+the existing database; it does not create the database or PostgreSQL login.
+The relational model is designed before implementation, then frozen as
+reviewable SQL migrations in `crates/cloudledger-server/migrations`. The
+backend applies pending migrations at startup through SQLx. See
+`docs/backend-data-model.md` for the ownership and migration rules.
+
+PostgreSQL is authoritative for server-shared organizations, ledgers,
+transactions, audit logs, users, installations, and sessions. SQLite remains
+the client-side local/offline cache boundary in `cloudledger-db`; the backend
+does not use SQLite as its primary database.
+
+When PostgreSQL has no CloudLedger application metadata, startup imports
+existing `ledger-state.json` and `auth-state.json` files from `server.data_dir`
+in one database transaction. The legacy files are read-only migration sources
+and are never consulted again after database state exists. Back up both files
+and PostgreSQL before an upgrade; do not delete the JSON sources until the
+import and a server restart have been verified.
+
+The mobile API defaults to `0.0.0.0:8787` so an Android test phone can reach it
+on the LAN. The mobile frontend reads its separate runtime backend URL from
+`frontend/public/config.js`. Set `apiBaseUrl` there before an Android build, or
+edit `dist/config.js` when deploying the web build. An empty value makes the
+web development UI use the current page hostname on port `8787`.
+`VITE_CLOUDLEDGER_CLOUD_URL` remains a build-time fallback when the runtime
+value is empty.
 
 For example, an Android build that reaches the development machine over LAN can
 use:
@@ -54,18 +93,18 @@ window.__CLOUDLEDGER_CONFIG__ = {
 };
 ```
 
-The admin backend is intentionally separated from the mobile API. It listens on
-`CLOUDLEDGER_ADMIN_BIND_ADDR`, defaulting to `127.0.0.1:8788`. For LAN admin
-testing bind it to a specific private address, for example `10.0.0.42:8788`;
-the server rejects `0.0.0.0` and public IPs for this admin port.
+The admin backend is intentionally separated from the mobile API. Its
+`server.admin_bind_addr` defaults to `127.0.0.1:8788`. For LAN admin testing,
+set it to a specific private address such as `10.0.0.42:8788`; the server
+rejects `0.0.0.0` and public IPs for this admin port.
 
 On first initialization the server generates a high-entropy path such as
-`manage-0123456789abcdef0123456789abcdef` and stores it in the server data
-directory's `admin-path` file with mode `0600` on Unix. The fixed `/admin`
-route intentionally returns `404`. `CLOUDLEDGER_ADMIN_PATH` can override the
-generated value with one 16-128 character path segment, but deployments should
-keep it unguessable. The platform token comes from `CLOUDLEDGER_ADMIN_TOKEN` or
-the data directory's `admin-token` file, which is also restricted to `0600`.
+`manage-0123456789abcdef0123456789abcdef` plus a platform token and writes both
+to the `[admin]` section of the config file. The fixed `/admin` route
+intentionally returns `404`. A configured `admin.path` must be one 16-128
+character path segment; deployments should keep it unguessable. Existing
+`admin-path` and `admin-token` files are imported once when upgrading to the
+unified config, so established credentials remain valid.
 
 The randomized admin page has separate platform and organization entry points.
 The raw platform token must first be exchanged for a revocable eight-hour
@@ -82,28 +121,43 @@ to the organization admin backend. Existing persisted `owner` or `admin`
 membership accounts are migrated to backend-only organization admins when the
 server starts.
 
+Business accounts use only two roles: `business_owner` (老板) and `employee`
+(员工). The product is optimized for a small team with one or two owners and a
+few employees; these sizes are operating targets rather than database hard
+caps. Every business account can record personal and permitted public-ledger
+transactions, while only a business owner can approve public applications or
+mark an approved expense as paid.
+
+Public expense reimbursement has a separate approval state and payment state:
+
+1. An employee submits a public expense: `submitted`.
+2. A different business owner approves it: `approved` + `pending_payment`.
+3. A business owner sends the money and marks it paid:
+   `paid_pending_receipt`. The public-account balance changes at this step.
+4. The original applicant confirms receipt: `received`.
+
+Approval does not reduce the public-account balance, and receipt confirmation
+does not post the expense a second time. A sole owner's public entry is
+auto-approved because no independent business approver exists. When two owners
+exist, one owner's entry must be approved by the other owner. Every transition
+is included in the shared public-ledger audit trail.
+
 Login brute-force protection is shared by the mobile and admin servers. By
 default, five failed attempts for one source IP and login identifier within 15
 minutes lock that login for 15 minutes; 20 failed attempts from one IP also lock
 that source even when identifiers are rotated. Rate-limited responses use HTTP
 `429` with `Retry-After`. New and reset passwords must contain 12–128
 characters. Existing password hashes remain valid until the password is reset.
-The defaults can be tuned with:
-
-- `CLOUDLEDGER_LOGIN_MAX_FAILURES`
-- `CLOUDLEDGER_LOGIN_MAX_FAILURES_PER_IP`
-- `CLOUDLEDGER_LOGIN_WINDOW_SECONDS`
-- `CLOUDLEDGER_LOGIN_LOCKOUT_SECONDS`
+Tune the defaults under `[security.login]` in the backend config.
 
 The limits use the direct TCP peer address. Deployments behind a reverse proxy
 must enforce equivalent limits at the proxy because forwarded client IP headers
 are intentionally not trusted by the application.
 
-Cloudflare Turnstile protects both organization and platform login forms. Set
-both variables from the Turnstile widget configured for the admin hostname:
-
-- `CLOUDLEDGER_TURNSTILE_SITE_KEY`
-- `CLOUDLEDGER_TURNSTILE_SECRET_KEY`
+Cloudflare Turnstile protects both organization and platform login forms. Put
+the widget credentials configured for the admin hostname in
+`security.turnstile.site_key` and `security.turnstile.secret_key`. Keep the
+secret key only in this backend config; never put it in frontend `config.js`.
 
 The server refuses a non-loopback admin bind unless both keys are configured.
 Turnstile may be omitted only for loopback-only local development. When a
@@ -133,7 +187,9 @@ management; account creation and organization membership are managed only
 through the admin backend.
 
 The server persists its development identity in `.cloudledger-server/server-id`
-by default; use `CLOUDLEDGER_SERVER_DATA_DIR` to move that state elsewhere.
+by default. Change `server.data_dir` in the backend config to move that state.
+Business and authentication records are persisted in the configured PostgreSQL
+database, not in this directory after migration.
 
 ## Android Smoke Test
 
@@ -156,20 +212,22 @@ organization membership management on Android.
 Use the server-side admin backend to manage organization/account relationships:
 
 ```bash
-CLOUDLEDGER_ADMIN_BIND_ADDR=127.0.0.1:8788 nix develop path:. -c cargo run -p cloudledger-server
+nix develop path:. -c cargo run -p cloudledger-server
 ```
 
-Read `.cloudledger-server/admin-path`, then open
-`http://127.0.0.1:8788/<admin-path>`. Use the platform-token tab with
-`.cloudledger-server/admin-token` to create organizations. Afterwards, each
+Read `admin.path` from `.cloudledger-server/config.toml`, then open
+`http://127.0.0.1:8788/<admin.path>`. Use the platform-token tab with
+`admin.token` from the same file to create organizations. Afterwards, each
 organization administrator uses the organization-account tab to create and
 manage that organization's employee accounts.
 
 For the public ledger approval smoke tests:
 
-1. Submit a public-ledger transaction from the logged-in phone account and
-   confirm it remains pending until another eligible account decides it.
-2. Create another member from the admin backend with an eligible role, log in
-   as that member on a separate installation id or use service tests, then
-   approve/reject and confirm transaction state, posted balance behavior, and
-   audit actor are correct.
+1. Submit a public expense as an employee and confirm it remains pending without
+   changing the public-account balance.
+2. Log in as a business owner on another installation, approve it, and confirm
+   the state is approved/pending-payment while the balance remains unchanged.
+3. Mark it paid as a business owner and confirm the public-account balance is
+   reduced exactly once.
+4. Return to the applicant account, confirm receipt, and verify the final state
+   and submission/approval/payment/receipt audit actors.

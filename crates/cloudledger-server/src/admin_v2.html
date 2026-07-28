@@ -52,11 +52,9 @@
       .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
       .pill, .count, .role { display: inline-flex; align-items: center; width: fit-content; min-height: 28px; border-radius: 999px; padding: 0 10px; font-size: 12px; font-weight: 800; white-space: nowrap; }
       .pill.platform { background: var(--blue-soft); color: var(--blue); }
-      .pill.organization, .role.approver { background: var(--green-soft); color: var(--green); }
+      .pill.organization, .role.business_owner { background: var(--green-soft); color: var(--green); }
       .role.owner, .role.admin { background: var(--blue-soft); color: var(--blue); }
-      .role.accountant { background: #e5f4ff; color: #1f608e; }
-      .role.member { background: #edf2ef; color: #34453d; }
-      .role.viewer { background: var(--amber-soft); color: var(--amber); }
+      .role.employee { background: #e5f4ff; color: #1f608e; }
       .count { background: #edf2ef; color: #34453d; }
       .alert { border: 1px solid #edb8b1; border-radius: 8px; background: #fff7f6; color: var(--red); padding: 11px 13px; font-size: 13px; font-weight: 700; }
 
@@ -125,16 +123,14 @@
       const app = document.querySelector("#adminApp");
       const adminBasePath = window.location.pathname.replace(/\/+$/, "");
       const adminApiPath = `${adminBasePath}/api`;
-      const employeeRoles = ["accountant", "approver", "member", "viewer"];
+      const employeeRoles = ["business_owner", "employee"];
       const minPasswordLength = 12;
       const maxPasswordLength = 128;
       const roleLabels = {
         owner: "组织管理员",
         admin: "组织管理员",
-        accountant: "记账",
-        approver: "审批",
-        member: "成员",
-        viewer: "只读",
+        business_owner: "老板",
+        employee: "员工",
       };
       const state = {
         token: sessionStorage.getItem("cloudledger.adminSession") || "",
@@ -215,7 +211,7 @@
         return `<div class="org-list">${state.organizations.map((item) => {
           const admin = item.members.find(isAdminMember);
           const employees = item.members.filter(isEmployee).length;
-          return `<div class="org-row"><div class="org-name"><strong>${escapeHtml(item.organization.name)}</strong><span class="muted mono">${escapeHtml(item.organization.id)}</span></div><div class="person"><strong>${escapeHtml(admin?.displayName || "未配置")}</strong><span class="muted">${escapeHtml(admin?.email || admin?.phone || "-")}</span></div><div class="meta"><span class="count">${employees} 名员工</span></div></div>`;
+          return `<div class="org-row"><div class="org-name"><strong>${escapeHtml(item.organization.name)}</strong><span class="muted mono">${escapeHtml(item.organization.id)}</span></div><div class="person"><strong>${escapeHtml(admin?.displayName || "未配置")}</strong><span class="muted">${escapeHtml(admin?.email || admin?.phone || "-")}</span></div><div class="meta"><span class="count">${employees} 个业务账号</span></div></div>`;
         }).join("")}</div>`;
       }
 
@@ -224,12 +220,12 @@
         if (!item) return `<div class="panel empty">当前管理员未绑定有效组织</div>`;
         const employees = filteredEmployees(item.members);
         return `<section class="metrics"><div class="metric"><span>Organization</span><strong>${escapeHtml(item.organization.name)}</strong></div><div class="metric"><span>Employees</span><strong>${item.members.filter(isEmployee).length}</strong></div><div class="metric"><span>Admin</span><strong>${escapeHtml(state.principal.user?.displayName || "-")}</strong></div></section>
-          <section class="panel"><div class="section-head"><div class="section-title"><h2>${escapeHtml(item.organization.name)}</h2><div class="meta"><span class="pill organization">组织管理员</span><span class="muted mono">${escapeHtml(item.organization.id)}</span></div></div><button class="primary" type="button" data-action="toggle-add">${state.addOpen ? "关闭" : "新增员工"}</button></div>${state.addOpen ? renderAddEmployee() : ""}<div class="toolbar"><input id="memberQuery" value="${escapeHtml(state.query)}" placeholder="搜索姓名、邮箱或手机号" aria-label="搜索员工" /><select id="roleFilter" aria-label="按角色筛选"><option value="all">全部角色</option>${employeeRoles.map(role => `<option value="${role}" ${state.roleFilter === role ? "selected" : ""}>${roleLabels[role]}</option>`).join("")}</select><button class="quiet" type="button" data-action="clear-filter">清除</button></div></section>
+          <section class="panel"><div class="section-head"><div class="section-title"><h2>${escapeHtml(item.organization.name)}</h2><div class="meta"><span class="pill organization">组织管理员</span><span class="muted mono">${escapeHtml(item.organization.id)}</span></div></div><button class="primary" type="button" data-action="toggle-add">${state.addOpen ? "关闭" : "新增业务账号"}</button></div>${state.addOpen ? renderAddEmployee() : ""}<div class="toolbar"><input id="memberQuery" value="${escapeHtml(state.query)}" placeholder="搜索姓名、邮箱或手机号" aria-label="搜索业务账号" /><select id="roleFilter" aria-label="按角色筛选"><option value="all">全部角色</option>${employeeRoles.map(role => `<option value="${role}" ${state.roleFilter === role ? "selected" : ""}>${roleLabels[role]}</option>`).join("")}</select><button class="quiet" type="button" data-action="clear-filter">清除</button></div></section>
           <section class="panel member-table">${renderMemberTable(item, employees)}</section>`;
       }
 
       function renderAddEmployee() {
-        return `<div class="add-panel"><form class="form" id="addEmployeeForm"><div class="form-grid"><label>员工姓名<input id="employeeName" autocomplete="name" required /></label><label>角色<select id="employeeRole">${roleOptions("member")}</select></label><label>邮箱<input id="employeeEmail" autocomplete="email" /></label><label>手机号<input id="employeePhone" autocomplete="tel" /></label><label>初始密码<input id="employeePassword" type="password" autocomplete="new-password" minlength="12" maxlength="128" required /></label><label>确认密码<input id="employeePasswordConfirm" type="password" autocomplete="new-password" minlength="12" maxlength="128" required /></label></div><div class="form-actions"><button class="primary" type="submit" ${state.loading ? "disabled" : ""}>添加员工</button></div></form></div>`;
+        return `<div class="add-panel"><form class="form" id="addEmployeeForm"><div class="form-grid"><label>姓名<input id="employeeName" autocomplete="name" required /></label><label>角色<select id="employeeRole">${roleOptions("employee")}</select></label><label>邮箱<input id="employeeEmail" autocomplete="email" /></label><label>手机号<input id="employeePhone" autocomplete="tel" /></label><label>初始密码<input id="employeePassword" type="password" autocomplete="new-password" minlength="12" maxlength="128" required /></label><label>确认密码<input id="employeePasswordConfirm" type="password" autocomplete="new-password" minlength="12" maxlength="128" required /></label></div><div class="form-actions"><button class="primary" type="submit" ${state.loading ? "disabled" : ""}>添加账号</button></div></form></div>`;
       }
 
       function renderMemberTable(item, employees) {

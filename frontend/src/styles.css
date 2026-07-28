@@ -534,6 +534,21 @@ button {
   gap: 10px;
 }
 
+@media (max-width: 520px) {
+  .top-bar {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .top-actions {
+    justify-content: space-between;
+  }
+
+  .cloud-chip {
+    max-width: calc(100% - 52px);
+  }
+}
+
 @media (max-width: 380px) {
   .field-grid {
     grid-template-columns: 1fr;
@@ -724,6 +739,13 @@ button {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 8px;
+}
+
+.transaction-actions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px;
+  padding-top: 2px;
 }
 
 .secondary-button,

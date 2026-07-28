@@ -10,6 +10,8 @@ pub enum Action {
     CreateTransaction,
     SubmitTransaction,
     ApproveTransaction,
+    MarkTransactionPaid,
+    ConfirmReceipt,
     EditApprovedTransaction,
     VoidTransaction,
     ExportLedger,
@@ -56,29 +58,27 @@ fn can_perform_organization(ctx: &AuthorizationContext<'_>, action: Action) -> b
     };
 
     match role {
-        MembershipRole::Owner => true,
-        MembershipRole::Admin => !matches!(action, Action::EditApprovedTransaction),
-        MembershipRole::Accountant => matches!(
-            action,
-            Action::ViewLedger
-                | Action::CreateTransaction
-                | Action::SubmitTransaction
-                | Action::VoidTransaction
-                | Action::ExportLedger
-                | Action::ManageAccounts
-                | Action::ViewAuditLog
-        ),
-        MembershipRole::Approver => matches!(
+        MembershipRole::Owner | MembershipRole::Admin => false,
+        MembershipRole::BusinessOwner | MembershipRole::Approver => matches!(
             action,
             Action::ViewLedger
                 | Action::CreateTransaction
                 | Action::SubmitTransaction
                 | Action::ApproveTransaction
+                | Action::MarkTransactionPaid
+                | Action::ConfirmReceipt
+                | Action::VoidTransaction
+                | Action::ExportLedger
+                | Action::ManageAccounts
                 | Action::ViewAuditLog
         ),
-        MembershipRole::Member => matches!(
+        MembershipRole::Employee | MembershipRole::Accountant | MembershipRole::Member => matches!(
             action,
-            Action::ViewLedger | Action::CreateTransaction | Action::SubmitTransaction
+            Action::ViewLedger
+                | Action::CreateTransaction
+                | Action::SubmitTransaction
+                | Action::ConfirmReceipt
+                | Action::ViewAuditLog
         ),
         MembershipRole::Viewer => matches!(action, Action::ViewLedger | Action::ViewAuditLog),
     }
@@ -105,7 +105,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_can_manage_public_ledger() {
+    fn business_owner_can_manage_public_ledger() {
         let owner = Uuid::new_v4();
         let org = Uuid::new_v4();
         let ledger = Ledger::organization_public(org, "Company books");
@@ -113,11 +113,12 @@ mod tests {
         let ctx = AuthorizationContext {
             actor_user_id: owner,
             ledger: &ledger,
-            membership_role: Some(MembershipRole::Owner),
+            membership_role: Some(MembershipRole::BusinessOwner),
         };
 
         assert!(can_perform(&ctx, Action::ApproveTransaction));
-        assert!(can_perform(&ctx, Action::ManageMembers));
+        assert!(can_perform(&ctx, Action::MarkTransactionPaid));
+        assert!(!can_perform(&ctx, Action::ManageMembers));
     }
 
     #[test]

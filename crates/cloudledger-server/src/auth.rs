@@ -155,22 +155,22 @@ pub struct UpdateProfileInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct StoredUser {
-    id: Uuid,
-    display_name: String,
-    email: Option<String>,
-    phone: Option<String>,
-    password_hash: String,
+pub(crate) struct StoredUser {
+    pub(crate) id: Uuid,
+    pub(crate) display_name: String,
+    pub(crate) email: Option<String>,
+    pub(crate) phone: Option<String>,
+    pub(crate) password_hash: String,
     #[serde(default)]
-    account_kind: AccountKind,
+    pub(crate) account_kind: AccountKind,
     #[serde(default)]
-    organization_id: Option<Uuid>,
-    created_at: OffsetDateTime,
+    pub(crate) organization_id: Option<Uuid>,
+    pub(crate) created_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum SessionKind {
+pub(crate) enum SessionKind {
     #[default]
     App,
     Admin,
@@ -178,15 +178,15 @@ enum SessionKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct StoredSession {
-    user_id: Uuid,
-    installation_id: String,
-    access_token: String,
-    refresh_token: String,
+pub(crate) struct StoredSession {
+    pub(crate) user_id: Uuid,
+    pub(crate) installation_id: String,
+    pub(crate) access_token: String,
+    pub(crate) refresh_token: String,
     #[serde(default)]
-    kind: SessionKind,
-    created_at: OffsetDateTime,
-    refreshed_at: OffsetDateTime,
+    pub(crate) kind: SessionKind,
+    pub(crate) created_at: OffsetDateTime,
+    pub(crate) refreshed_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -206,7 +206,59 @@ pub struct AuthService {
     access_tokens_by_refresh_token: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AuthSnapshot {
+    pub(crate) users: Vec<StoredUser>,
+    pub(crate) installations: Vec<(String, Uuid)>,
+    pub(crate) sessions: Vec<StoredSession>,
+}
+
 impl AuthService {
+    pub(crate) fn snapshot(&self) -> AuthSnapshot {
+        AuthSnapshot {
+            users: self.users_by_id.values().cloned().collect(),
+            installations: self
+                .installations_by_id
+                .iter()
+                .map(|(installation_id, user_id)| (installation_id.clone(), *user_id))
+                .collect(),
+            sessions: self.sessions_by_access_token.values().cloned().collect(),
+        }
+    }
+
+    pub(crate) fn from_snapshot(snapshot: AuthSnapshot) -> Self {
+        let users_by_id: BTreeMap<_, _> = snapshot
+            .users
+            .into_iter()
+            .map(|user| (user.id, user))
+            .collect();
+        let sessions_by_access_token: BTreeMap<_, _> = snapshot
+            .sessions
+            .into_iter()
+            .map(|session| (session.access_token.clone(), session))
+            .collect();
+        let mut service = Self {
+            user_ids_by_email: users_by_id
+                .values()
+                .filter_map(|user| user.email.clone().map(|email| (email, user.id)))
+                .collect(),
+            user_ids_by_phone: users_by_id
+                .values()
+                .filter_map(|user| user.phone.clone().map(|phone| (phone, user.id)))
+                .collect(),
+            installations_by_id: snapshot.installations.into_iter().collect(),
+            access_tokens_by_refresh_token: sessions_by_access_token
+                .values()
+                .filter(|session| !session.refresh_token.is_empty())
+                .map(|session| (session.refresh_token.clone(), session.access_token.clone()))
+                .collect(),
+            users_by_id,
+            sessions_by_access_token,
+        };
+        service.prune_expired_sessions();
+        service
+    }
+
     pub fn load_or_default(path: impl AsRef<Path>) -> Result<Self, AuthError> {
         let path = path.as_ref();
         if !path.exists() {
