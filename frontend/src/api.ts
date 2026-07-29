@@ -71,6 +71,65 @@ export interface LedgerOverview {
   pendingReceiptCount: number;
 }
 
+export interface FinancialAnalysisDto {
+  ledgerId: string;
+  currency: string;
+  months: number;
+  periodStart: string;
+  periodEnd: string;
+  currentBalanceMinor: number;
+  incomeMinor: number;
+  expenseMinor: number;
+  netCashFlowMinor: number;
+  previousIncomeMinor: number;
+  previousExpenseMinor: number;
+  previousNetCashFlowMinor: number;
+  transactionCount: number;
+  pendingApproval: FinancialExposureDto;
+  pendingPayment: FinancialExposureDto;
+  paidPendingReceipt: FinancialExposureDto;
+  trend: CashFlowTrendPointDto[];
+  accounts: AnalysisAccountDto[];
+  memberExpenses: MemberExpenseDto[];
+  largestExpenses: AnalysisExpenseDto[];
+  generatedAt: string;
+}
+
+export interface FinancialExposureDto {
+  count: number;
+  amountMinor: number;
+}
+
+export interface CashFlowTrendPointDto {
+  key: string;
+  label: string;
+  incomeMinor: number;
+  expenseMinor: number;
+  netCashFlowMinor: number;
+}
+
+export interface AnalysisAccountDto {
+  id: string;
+  name: string;
+  kind: string;
+  balanceMinor: number;
+}
+
+export interface MemberExpenseDto {
+  userId: string;
+  displayName: string;
+  expenseMinor: number;
+  transactionCount: number;
+}
+
+export interface AnalysisExpenseDto {
+  transactionId: string;
+  description: string;
+  submittedBy: string;
+  amountMinor: number;
+  paidAt: string;
+}
+
 export interface CreateTransactionInput {
   ledgerId: string;
   accountId: string;
@@ -92,6 +151,13 @@ export interface TransactionActionInput {
 
 export async function loadOverview(): Promise<LedgerOverview> {
   return invoke<LedgerOverview>("get_overview");
+}
+
+export async function loadFinancialAnalysis(
+  ledgerId: string,
+  months: number,
+): Promise<FinancialAnalysisDto> {
+  return invoke<FinancialAnalysisDto>("get_financial_analysis", { ledgerId, months });
 }
 
 export async function createTransaction(

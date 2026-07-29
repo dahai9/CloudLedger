@@ -2,9 +2,11 @@ use std::{path::PathBuf, sync::Mutex};
 
 use cloudledger_service::{
     AppConfirmTransactionReceiptInput, AppCreateTransactionInput, AppDecideApprovalInput,
-    AppLedgerService, AppMarkTransactionPaidInput, AppServiceError, LedgerOverview, TransactionDto,
+    AppLedgerService, AppMarkTransactionPaidInput, AppServiceError, FinancialAnalysisDto,
+    LedgerOverview, TransactionDto,
 };
 use tauri::{Manager, State};
+use uuid::Uuid;
 
 struct AppState {
     ledger_service: Mutex<AppLedgerService>,
@@ -23,6 +25,21 @@ fn get_overview(state: State<'_, AppState>) -> Result<LedgerOverview, String> {
         .lock()
         .map_err(|_| "ledger service lock poisoned".to_string())?;
     Ok(service.overview(service.current_user_id()))
+}
+
+#[tauri::command]
+fn get_financial_analysis(
+    state: State<'_, AppState>,
+    ledger_id: Uuid,
+    months: u8,
+) -> Result<FinancialAnalysisDto, String> {
+    let service = state
+        .ledger_service
+        .lock()
+        .map_err(|_| "ledger service lock poisoned".to_string())?;
+    service
+        .financial_analysis(service.current_user_id(), ledger_id, months)
+        .map_err(service_error)
 }
 
 #[tauri::command]
@@ -112,6 +129,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             health,
             get_overview,
+            get_financial_analysis,
             create_transaction,
             decide_approval,
             mark_transaction_paid,

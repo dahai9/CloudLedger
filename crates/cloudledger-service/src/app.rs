@@ -12,7 +12,7 @@ use cloudledger_core::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{format_description::well_known::Rfc3339, Date, Month, OffsetDateTime, Time};
 use uuid::Uuid;
 
 const APP_STATE_SCHEMA_VERSION: u32 = 2;
@@ -59,6 +59,8 @@ pub enum AppServiceError {
     InvalidUserDisplayName,
     #[error("invalid amount: {0}")]
     InvalidAmount(String),
+    #[error("financial analysis range must be 3, 6, or 12 months")]
+    InvalidAnalysisRange,
     #[error("storage error: {0}")]
     Storage(String),
 }
@@ -250,6 +252,77 @@ pub struct AuditLogDto {
     pub resource_id: String,
     pub summary: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FinancialAnalysisDto {
+    pub ledger_id: String,
+    pub currency: String,
+    pub months: u8,
+    pub period_start: String,
+    pub period_end: String,
+    pub current_balance_minor: i64,
+    pub income_minor: i64,
+    pub expense_minor: i64,
+    pub net_cash_flow_minor: i64,
+    pub previous_income_minor: i64,
+    pub previous_expense_minor: i64,
+    pub previous_net_cash_flow_minor: i64,
+    pub transaction_count: usize,
+    pub pending_approval: FinancialExposureDto,
+    pub pending_payment: FinancialExposureDto,
+    pub paid_pending_receipt: FinancialExposureDto,
+    pub trend: Vec<CashFlowTrendPointDto>,
+    pub accounts: Vec<AnalysisAccountDto>,
+    pub member_expenses: Vec<MemberExpenseDto>,
+    pub largest_expenses: Vec<AnalysisExpenseDto>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FinancialExposureDto {
+    pub count: usize,
+    pub amount_minor: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CashFlowTrendPointDto {
+    pub key: String,
+    pub label: String,
+    pub income_minor: i64,
+    pub expense_minor: i64,
+    pub net_cash_flow_minor: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisAccountDto {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub balance_minor: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberExpenseDto {
+    pub user_id: String,
+    pub display_name: String,
+    pub expense_minor: i64,
+    pub transaction_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisExpenseDto {
+    pub transaction_id: String,
+    pub description: String,
+    pub submitted_by: String,
+    pub amount_minor: i64,
+    pub paid_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -682,6 +755,213 @@ impl AppLedgerService {
             pending_payment_count,
             pending_receipt_count,
         }
+    }
+
+    pub fn financial_analysis(
+        &self,
+        actor_user_id: Uuid,
+        ledger_id: Uuid,
+        months: u8,
+    ) -> Result<FinancialAnalysisDto, AppServiceError> {
+        if !matches!(months, 3 | 6 | 12) {
+            return Err(AppServiceError::InvalidAnalysisRange);
+        }
+
+        let ledger = self
+            .ledgers
+            .get(&ledger_id)
+            .ok_or(AppServiceError::LedgerNotFound)?;
+        if !self.authorized(actor_user_id, ledger, Action::ViewFinancialAnalytics) {
+            return Err(AppServiceError::Unauthorized);
+        }
+
+        let now = OffsetDateTime::now_utc();
+        let current_month = month_start(now);
+        let period_start = shift_month_start(current_month, -(i32::from(months) - 1));
+        let period_duration = now - period_start;
+        let previous_period_start = period_start - period_duration;
+
+        let mut accounts = self
+            .accounts
+            .values()
+            .filter(|account| account.ledger_id == ledger_id && account.deleted_at.is_none())
+            .map(|account| {
+                let account = self.account_dto(account);
+                AnalysisAccountDto {
+                    id: account.id,
+                    name: account.name,
+                    kind: account.kind,
+                    balance_minor: account.balance_minor,
+                }
+            })
+            .collect::<Vec<_>>();
+        accounts.sort_by(|left, right| {
+            right
+                .balance_minor
+                .cmp(&left.balance_minor)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+
+        let currency = self
+            .accounts
+            .values()
+            .find(|account| account.ledger_id == ledger_id && account.deleted_at.is_none())
+            .map(|account| account.opening_balance.currency.clone())
+            .unwrap_or_else(|| "CNY".to_string());
+        let current_balance_minor = accounts.iter().map(|account| account.balance_minor).sum();
+
+        let mut trend = (0..months)
+            .map(|offset| {
+                let start = shift_month_start(period_start, i32::from(offset));
+                CashFlowTrendPointDto {
+                    key: format!("{:04}-{:02}", start.year(), start.month() as u8),
+                    label: format!("{}月", start.month() as u8),
+                    income_minor: 0,
+                    expense_minor: 0,
+                    net_cash_flow_minor: 0,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut income_minor = 0;
+        let mut expense_minor = 0;
+        let mut previous_income_minor = 0;
+        let mut previous_expense_minor = 0;
+        let mut transaction_count = 0;
+        let mut pending_approval = FinancialExposureDto {
+            count: 0,
+            amount_minor: 0,
+        };
+        let mut pending_payment = FinancialExposureDto {
+            count: 0,
+            amount_minor: 0,
+        };
+        let mut paid_pending_receipt = FinancialExposureDto {
+            count: 0,
+            amount_minor: 0,
+        };
+        let mut member_expenses = BTreeMap::<Uuid, (i64, usize)>::new();
+        let mut largest_expenses = Vec::new();
+
+        for transaction in self.transactions.values().filter(|transaction| {
+            transaction.ledger_id == ledger_id && transaction.deleted_at.is_none()
+        }) {
+            if transaction.kind == TransactionKind::Expense {
+                match (transaction.approval_state, transaction.payment_state) {
+                    (ApprovalState::Submitted, _) => {
+                        add_exposure(&mut pending_approval, transaction)
+                    }
+                    (ApprovalState::Approved, PaymentState::PendingPayment) => {
+                        add_exposure(&mut pending_payment, transaction);
+                    }
+                    (ApprovalState::Approved, PaymentState::PaidPendingReceipt) => {
+                        add_exposure(&mut paid_pending_receipt, transaction);
+                    }
+                    _ => {}
+                }
+            }
+
+            let Some(effective_at) = transaction_cash_effective_at(transaction) else {
+                continue;
+            };
+            let (transaction_income, transaction_expense) = match transaction.kind {
+                TransactionKind::Income => (transaction.amount.amount_minor, 0),
+                TransactionKind::Expense => (0, transaction.amount.amount_minor),
+                TransactionKind::Transfer => (0, 0),
+            };
+
+            if effective_at >= previous_period_start && effective_at < period_start {
+                previous_income_minor += transaction_income;
+                previous_expense_minor += transaction_expense;
+            }
+            if effective_at < period_start || effective_at > now {
+                continue;
+            }
+
+            income_minor += transaction_income;
+            expense_minor += transaction_expense;
+            transaction_count += 1;
+            let trend_index = month_distance(period_start, month_start(effective_at));
+            if let Some(point) = usize::try_from(trend_index)
+                .ok()
+                .and_then(|index| trend.get_mut(index))
+            {
+                point.income_minor += transaction_income;
+                point.expense_minor += transaction_expense;
+            }
+
+            if transaction_expense > 0 {
+                let entry = member_expenses.entry(transaction.created_by).or_default();
+                entry.0 += transaction_expense;
+                entry.1 += 1;
+                largest_expenses.push(AnalysisExpenseDto {
+                    transaction_id: transaction.id.to_string(),
+                    description: transaction.description.clone(),
+                    submitted_by: self
+                        .users
+                        .get(&transaction.created_by)
+                        .map(|user| user.display_name.clone())
+                        .unwrap_or_else(|| transaction.created_by.to_string()),
+                    amount_minor: transaction_expense,
+                    paid_at: format_time(effective_at),
+                });
+            }
+        }
+
+        for point in &mut trend {
+            point.net_cash_flow_minor = point.income_minor - point.expense_minor;
+        }
+        let mut member_expenses = member_expenses
+            .into_iter()
+            .map(
+                |(user_id, (expense_minor, transaction_count))| MemberExpenseDto {
+                    user_id: user_id.to_string(),
+                    display_name: self
+                        .users
+                        .get(&user_id)
+                        .map(|user| user.display_name.clone())
+                        .unwrap_or_else(|| user_id.to_string()),
+                    expense_minor,
+                    transaction_count,
+                },
+            )
+            .collect::<Vec<_>>();
+        member_expenses.sort_by(|left, right| {
+            right
+                .expense_minor
+                .cmp(&left.expense_minor)
+                .then_with(|| left.display_name.cmp(&right.display_name))
+        });
+        largest_expenses.sort_by(|left, right| {
+            right
+                .amount_minor
+                .cmp(&left.amount_minor)
+                .then_with(|| right.paid_at.cmp(&left.paid_at))
+        });
+        largest_expenses.truncate(5);
+
+        Ok(FinancialAnalysisDto {
+            ledger_id: ledger_id.to_string(),
+            currency,
+            months,
+            period_start: format_time(period_start),
+            period_end: format_time(now),
+            current_balance_minor,
+            income_minor,
+            expense_minor,
+            net_cash_flow_minor: income_minor - expense_minor,
+            previous_income_minor,
+            previous_expense_minor,
+            previous_net_cash_flow_minor: previous_income_minor - previous_expense_minor,
+            transaction_count,
+            pending_approval,
+            pending_payment,
+            paid_pending_receipt,
+            trend,
+            accounts,
+            member_expenses,
+            largest_expenses,
+            generated_at: format_time(now),
+        })
     }
 
     pub fn organizations(&self) -> Vec<OrganizationDto> {
@@ -1585,6 +1865,52 @@ fn transaction_affects_balance(transaction: &Transaction) -> bool {
         }
 }
 
+fn transaction_cash_effective_at(transaction: &Transaction) -> Option<OffsetDateTime> {
+    if transaction.deleted_at.is_some() || transaction.approval_state != ApprovalState::Approved {
+        return None;
+    }
+
+    match transaction.kind {
+        TransactionKind::Income => Some(transaction.approved_at.unwrap_or(transaction.occurred_at)),
+        TransactionKind::Expense if transaction.payment_state != PaymentState::PendingPayment => {
+            Some(
+                transaction
+                    .paid_at
+                    .or(transaction.received_at)
+                    .unwrap_or(transaction.occurred_at),
+            )
+        }
+        TransactionKind::Expense | TransactionKind::Transfer => None,
+    }
+}
+
+fn add_exposure(exposure: &mut FinancialExposureDto, transaction: &Transaction) {
+    exposure.count += 1;
+    exposure.amount_minor += transaction.amount.amount_minor;
+}
+
+fn month_start(value: OffsetDateTime) -> OffsetDateTime {
+    Date::from_calendar_date(value.year(), value.month(), 1)
+        .expect("an existing timestamp always has a valid month start")
+        .with_time(Time::MIDNIGHT)
+        .assume_utc()
+}
+
+fn shift_month_start(value: OffsetDateTime, offset: i32) -> OffsetDateTime {
+    let absolute_month = value.year() * 12 + i32::from(value.month() as u8) - 1 + offset;
+    let year = absolute_month.div_euclid(12);
+    let month_number = absolute_month.rem_euclid(12) + 1;
+    let month = Month::try_from(month_number as u8).expect("normalized month is valid");
+    Date::from_calendar_date(year, month, 1)
+        .expect("normalized month start is valid")
+        .with_time(Time::MIDNIGHT)
+        .assume_utc()
+}
+
+fn month_distance(start: OffsetDateTime, end: OffsetDateTime) -> i32 {
+    (end.year() - start.year()) * 12 + i32::from(end.month() as u8) - i32::from(start.month() as u8)
+}
+
 fn approval_state_name(state: ApprovalState) -> &'static str {
     match state {
         ApprovalState::Draft => "draft",
@@ -1722,6 +2048,92 @@ mod tests {
         assert_eq!(overview.ledgers[0].name, "Alice 私账");
         assert_eq!(overview.pending_approval_count, 1);
         assert_eq!(overview.audit_logs.len(), 1);
+    }
+
+    #[test]
+    fn financial_analysis_is_owner_only_and_uses_payment_as_expense_date() {
+        let mut service = AppLedgerService::seeded();
+        let owner_id = service.current_user_id();
+        let employee_id = service
+            .users()
+            .into_iter()
+            .find(|user| user.display_name == "Bob")
+            .and_then(|user| Uuid::parse_str(&user.id).ok())
+            .expect("seeded employee");
+        let overview = service.overview(owner_id);
+        let ledger_id = overview
+            .ledgers
+            .iter()
+            .find(|ledger| ledger.kind == "organization_public")
+            .and_then(|ledger| Uuid::parse_str(&ledger.id).ok())
+            .expect("seeded public ledger");
+        let transaction_id = overview
+            .transactions
+            .iter()
+            .find(|transaction| transaction.approval_state == "submitted")
+            .and_then(|transaction| Uuid::parse_str(&transaction.id).ok())
+            .expect("seeded pending expense");
+
+        let before_payment = service
+            .financial_analysis(owner_id, ledger_id, 3)
+            .expect("owner analysis");
+        assert_eq!(before_payment.current_balance_minor, 5_000_000);
+        assert_eq!(before_payment.expense_minor, 0);
+        assert_eq!(before_payment.pending_approval.count, 1);
+        assert_eq!(before_payment.pending_approval.amount_minor, 86_000);
+        assert!(matches!(
+            service.financial_analysis(employee_id, ledger_id, 3),
+            Err(AppServiceError::Unauthorized)
+        ));
+        assert!(matches!(
+            service.financial_analysis(owner_id, ledger_id, 2),
+            Err(AppServiceError::InvalidAnalysisRange)
+        ));
+
+        service
+            .decide_approval(AppDecideApprovalInput {
+                actor_user_id: owner_id,
+                transaction_id,
+                decision: ApprovalDecision::Approve,
+                decision_note: None,
+            })
+            .expect("approve expense");
+        let after_approval = service
+            .financial_analysis(owner_id, ledger_id, 3)
+            .expect("analysis after approval");
+        assert_eq!(after_approval.expense_minor, 0);
+        assert_eq!(after_approval.pending_payment.amount_minor, 86_000);
+
+        service
+            .mark_transaction_paid(AppMarkTransactionPaidInput {
+                actor_user_id: owner_id,
+                transaction_id,
+            })
+            .expect("mark expense paid");
+        let after_payment = service
+            .financial_analysis(owner_id, ledger_id, 3)
+            .expect("analysis after payment");
+        assert_eq!(after_payment.current_balance_minor, 4_914_000);
+        assert_eq!(after_payment.income_minor, 0);
+        assert_eq!(after_payment.expense_minor, 86_000);
+        assert_eq!(after_payment.net_cash_flow_minor, -86_000);
+        assert_eq!(after_payment.transaction_count, 1);
+        assert_eq!(after_payment.pending_payment.count, 0);
+        assert_eq!(after_payment.paid_pending_receipt.amount_minor, 86_000);
+        assert_eq!(after_payment.member_expenses[0].display_name, "Bob");
+        assert_eq!(after_payment.member_expenses[0].expense_minor, 86_000);
+        assert_eq!(
+            after_payment.largest_expenses[0].description,
+            "办公用品采购"
+        );
+        assert_eq!(
+            after_payment
+                .trend
+                .iter()
+                .map(|point| point.expense_minor)
+                .sum::<i64>(),
+            86_000
+        );
     }
 
     #[test]

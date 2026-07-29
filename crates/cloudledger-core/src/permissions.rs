@@ -18,6 +18,7 @@ pub enum Action {
     ManageAccounts,
     ManageMembers,
     ViewAuditLog,
+    ViewFinancialAnalytics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +72,7 @@ fn can_perform_organization(ctx: &AuthorizationContext<'_>, action: Action) -> b
                 | Action::ExportLedger
                 | Action::ManageAccounts
                 | Action::ViewAuditLog
+                | Action::ViewFinancialAnalytics
         ),
         MembershipRole::Employee | MembershipRole::Accountant | MembershipRole::Member => matches!(
             action,
@@ -118,6 +120,7 @@ mod tests {
 
         assert!(can_perform(&ctx, Action::ApproveTransaction));
         assert!(can_perform(&ctx, Action::MarkTransactionPaid));
+        assert!(can_perform(&ctx, Action::ViewFinancialAnalytics));
         assert!(!can_perform(&ctx, Action::ManageMembers));
     }
 
@@ -136,5 +139,6 @@ mod tests {
         assert!(can_perform(&ctx, Action::ViewLedger));
         assert!(!can_perform(&ctx, Action::CreateTransaction));
         assert!(!can_perform(&ctx, Action::ApproveTransaction));
+        assert!(!can_perform(&ctx, Action::ViewFinancialAnalytics));
     }
 }

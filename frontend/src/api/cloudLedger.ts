@@ -1,11 +1,20 @@
-import type { AccountDto, AuditLogDto, LedgerDto, LedgerOverview, TransactionDto } from "../api";
+import type {
+  AccountDto,
+  AuditLogDto,
+  FinancialAnalysisDto,
+  LedgerDto,
+  LedgerOverview,
+  TransactionDto,
+} from "../api";
 import { cloudBaseUrl } from "../config";
 import type {
   ApprovalQueueItem,
+  AnalysisMonths,
   AuthSession,
   AuditLogEntry,
   Category,
   FinancialAccount,
+  FinancialAnalysis,
   Ledger,
   LedgerDashboard,
   LoginDraft,
@@ -24,6 +33,7 @@ export interface CloudLedgerApi {
   checkCloudStatus(): Promise<UserSession["cloudStatus"]>;
   listLedgers(): Promise<Ledger[]>;
   getLedgerDashboard(ledgerId: string): Promise<LedgerDashboard>;
+  getFinancialAnalysis(ledgerId: string, months: AnalysisMonths): Promise<FinancialAnalysis>;
   createTransaction(draft: NewTransactionDraft): Promise<Transaction>;
   decideApproval(
     transactionId: string,
@@ -128,6 +138,13 @@ const serverApi: CloudLedgerApi = {
   async getLedgerDashboard(ledgerId) {
     const overview = await getOverview();
     return mapDashboard(ledgerId, overview);
+  },
+
+  async getFinancialAnalysis(ledgerId, months) {
+    const analysis = await authenticatedJson<FinancialAnalysisDto>(
+      `/app/analytics?ledgerId=${encodeURIComponent(ledgerId)}&months=${months}`,
+    );
+    return mapFinancialAnalysis(analysis);
   },
 
   async createTransaction(draft) {
@@ -589,6 +606,10 @@ const mockApi: CloudLedgerApi = {
     };
   },
 
+  async getFinancialAnalysis(ledgerId, months) {
+    return buildMockFinancialAnalysis(ledgerId, months);
+  },
+
   async createTransaction(draft) {
     const account = mockAccounts.find((item) => item.id === draft.accountId);
     const category = mockCategories.find((item) => item.id === draft.categoryId);
@@ -717,6 +738,196 @@ const mockApi: CloudLedgerApi = {
 
 export const cloudLedgerApi: CloudLedgerApi =
   import.meta.env.VITE_CLOUDLEDGER_USE_MOCK === "1" ? mockApi : serverApi;
+
+function mapFinancialAnalysis(analysis: FinancialAnalysisDto): FinancialAnalysis {
+  const months: AnalysisMonths =
+    analysis.months === 3 || analysis.months === 12 ? analysis.months : 6;
+  return {
+    ledgerId: analysis.ledgerId,
+    currency: analysis.currency,
+    months,
+    periodStart: analysis.periodStart,
+    periodEnd: analysis.periodEnd,
+    currentBalanceCents: analysis.currentBalanceMinor,
+    incomeCents: analysis.incomeMinor,
+    expenseCents: analysis.expenseMinor,
+    netCashFlowCents: analysis.netCashFlowMinor,
+    previousIncomeCents: analysis.previousIncomeMinor,
+    previousExpenseCents: analysis.previousExpenseMinor,
+    previousNetCashFlowCents: analysis.previousNetCashFlowMinor,
+    transactionCount: analysis.transactionCount,
+    pendingApproval: {
+      count: analysis.pendingApproval.count,
+      amountCents: analysis.pendingApproval.amountMinor,
+    },
+    pendingPayment: {
+      count: analysis.pendingPayment.count,
+      amountCents: analysis.pendingPayment.amountMinor,
+    },
+    paidPendingReceipt: {
+      count: analysis.paidPendingReceipt.count,
+      amountCents: analysis.paidPendingReceipt.amountMinor,
+    },
+    trend: analysis.trend.map((point) => ({
+      key: point.key,
+      label: point.label,
+      incomeCents: point.incomeMinor,
+      expenseCents: point.expenseMinor,
+      netCashFlowCents: point.netCashFlowMinor,
+    })),
+    accounts: analysis.accounts.map((account) => ({
+      id: account.id,
+      name: account.name,
+      kind: account.kind,
+      balanceCents: account.balanceMinor,
+    })),
+    memberExpenses: analysis.memberExpenses.map((member) => ({
+      userId: member.userId,
+      displayName: member.displayName,
+      expenseCents: member.expenseMinor,
+      transactionCount: member.transactionCount,
+    })),
+    largestExpenses: analysis.largestExpenses.map((expense) => ({
+      transactionId: expense.transactionId,
+      description: expense.description,
+      submittedBy: expense.submittedBy,
+      amountCents: expense.amountMinor,
+      paidAt: expense.paidAt,
+    })),
+    generatedAt: analysis.generatedAt,
+  };
+}
+
+function buildMockFinancialAnalysis(
+  ledgerId: string,
+  months: AnalysisMonths,
+): FinancialAnalysis {
+  const ledger = mockLedgers.find((item) => item.id === ledgerId);
+  if (!ledger || ledger.kind !== "organization" || ledger.role !== "business_owner") {
+    throw new Error("actor is not authorized for this action");
+  }
+
+  const now = new Date();
+  const periodStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - months + 1, 1));
+  const periodDuration = now.getTime() - periodStart.getTime();
+  const previousStart = new Date(periodStart.getTime() - periodDuration);
+  const cashFlows = mockTransactions
+    .filter((transaction) => transaction.ledgerId === ledgerId)
+    .flatMap((transaction) => {
+      if (transaction.approvalState !== "approved") return [];
+      if (transaction.direction === "expense" && transaction.paymentState === "pending_payment") {
+        return [];
+      }
+      return [
+        {
+          transaction,
+          effectiveAt: new Date(
+            transaction.direction === "expense"
+              ? transaction.paidAt || transaction.receivedAt || transaction.occurredAt
+              : transaction.occurredAt,
+          ),
+        },
+      ];
+    });
+  const periodFlows = cashFlows.filter(
+    (flow) => flow.effectiveAt >= periodStart && flow.effectiveAt <= now,
+  );
+  const previousFlows = cashFlows.filter(
+    (flow) => flow.effectiveAt >= previousStart && flow.effectiveAt < periodStart,
+  );
+  const totals = (flows: typeof cashFlows) => {
+    const incomeCents = flows
+      .filter((flow) => flow.transaction.direction === "income")
+      .reduce((sum, flow) => sum + flow.transaction.amountCents, 0);
+    const expenseCents = flows
+      .filter((flow) => flow.transaction.direction === "expense")
+      .reduce((sum, flow) => sum + flow.transaction.amountCents, 0);
+    return { incomeCents, expenseCents, netCashFlowCents: incomeCents - expenseCents };
+  };
+  const currentTotals = totals(periodFlows);
+  const previousTotals = totals(previousFlows);
+  const trend = Array.from({ length: months }, (_, index) => {
+    const start = new Date(
+      Date.UTC(periodStart.getUTCFullYear(), periodStart.getUTCMonth() + index, 1),
+    );
+    const end = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 1));
+    const pointTotals = totals(
+      periodFlows.filter((flow) => flow.effectiveAt >= start && flow.effectiveAt < end),
+    );
+    return {
+      key: `${start.getUTCFullYear()}-${String(start.getUTCMonth() + 1).padStart(2, "0")}`,
+      label: `${start.getUTCMonth() + 1}月`,
+      ...pointTotals,
+    };
+  });
+  const exposure = (state: Transaction["paymentState"] | "pending_approval") => {
+    const transactions = mockTransactions.filter((transaction) => {
+      if (transaction.ledgerId !== ledgerId || transaction.direction !== "expense") return false;
+      return state === "pending_approval"
+        ? transaction.approvalState === "pending"
+        : transaction.approvalState === "approved" && transaction.paymentState === state;
+    });
+    return {
+      count: transactions.length,
+      amountCents: transactions.reduce((sum, transaction) => sum + transaction.amountCents, 0),
+    };
+  };
+  const memberMap = new Map<string, { displayName: string; expenseCents: number; transactionCount: number }>();
+  for (const flow of periodFlows.filter((item) => item.transaction.direction === "expense")) {
+    const transaction = flow.transaction;
+    const current = memberMap.get(transaction.createdByUserId) ?? {
+      displayName: transaction.actorName,
+      expenseCents: 0,
+      transactionCount: 0,
+    };
+    current.expenseCents += transaction.amountCents;
+    current.transactionCount += 1;
+    memberMap.set(transaction.createdByUserId, current);
+  }
+
+  return {
+    ledgerId,
+    currency: ledger.currency,
+    months,
+    periodStart: periodStart.toISOString(),
+    periodEnd: now.toISOString(),
+    currentBalanceCents: mockAccounts
+      .filter((account) => account.ledgerId === ledgerId)
+      .reduce((sum, account) => sum + account.balanceCents, 0),
+    ...currentTotals,
+    previousIncomeCents: previousTotals.incomeCents,
+    previousExpenseCents: previousTotals.expenseCents,
+    previousNetCashFlowCents: previousTotals.netCashFlowCents,
+    transactionCount: periodFlows.length,
+    pendingApproval: exposure("pending_approval"),
+    pendingPayment: exposure("pending_payment"),
+    paidPendingReceipt: exposure("paid_pending_receipt"),
+    trend,
+    accounts: mockAccounts
+      .filter((account) => account.ledgerId === ledgerId)
+      .map((account) => ({
+        id: account.id,
+        name: account.name,
+        kind: account.kind,
+        balanceCents: account.balanceCents,
+      })),
+    memberExpenses: Array.from(memberMap, ([userId, value]) => ({ userId, ...value })).sort(
+      (left, right) => right.expenseCents - left.expenseCents,
+    ),
+    largestExpenses: periodFlows
+      .filter((flow) => flow.transaction.direction === "expense")
+      .sort((left, right) => right.transaction.amountCents - left.transaction.amountCents)
+      .slice(0, 5)
+      .map((flow) => ({
+        transactionId: flow.transaction.id,
+        description: flow.transaction.title,
+        submittedBy: flow.transaction.actorName,
+        amountCents: flow.transaction.amountCents,
+        paidAt: flow.effectiveAt.toISOString(),
+      })),
+    generatedAt: now.toISOString(),
+  };
+}
 
 function mapDashboard(ledgerId: string, overview: LedgerOverview): LedgerDashboard {
   const ledgerDto = overview.ledgers.find((item) => item.id === ledgerId) ?? overview.ledgers[0];

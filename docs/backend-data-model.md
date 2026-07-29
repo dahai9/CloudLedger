@@ -67,6 +67,32 @@ high-volume work can replace full snapshot materialization with entity-level
 repositories without changing the relational model or moving authority back to
 SQLite.
 
+## Financial Analysis Model
+
+Financial analysis is derived from authoritative ledger rows, so it does not
+add aggregate tables or a schema migration. The service currently materializes
+the small-team snapshot and computes owner-only public-ledger summaries for 3,
+6, or 12 calendar months.
+
+- Approved income is recognized at `approved_at`, falling back to
+  `occurred_at` for legacy records.
+- Public expense cash flow is recognized at `paid_at`. Legacy settled records
+  fall back to `received_at` and then `occurred_at`.
+- Submitted expenses and approved-but-unpaid expenses are current workflow
+  exposure, not historical cash outflow.
+- `paid_pending_receipt` expenses have already reduced the account balance and
+  are included in cash outflow while remaining visible as unsettled receipts.
+- Current account balances include opening balances and every transaction that
+  affects the ledger balance; the selected range does not limit this snapshot.
+- Only a `business_owner` on the organization public ledger has
+  `ViewFinancialAnalytics`; employee and backend-admin requests are rejected by
+  the service authorization layer.
+
+This in-memory aggregation is appropriate for the target organization size.
+If transaction volume grows materially, the same response model can be backed
+by indexed PostgreSQL aggregate queries without changing its accounting
+semantics.
+
 ## Invariants
 
 - Organization membership is unique by organization and user.

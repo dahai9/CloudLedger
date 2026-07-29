@@ -142,6 +142,13 @@ auto-approved because no independent business approver exists. When two owners
 exist, one owner's entry must be approved by the other owner. Every transition
 is included in the shared public-ledger audit trail.
 
+Business owners also have a public-ledger financial analysis view with 3, 6,
+and 12 month ranges. It reports current account balances, actual income and
+paid expenses, net cash flow, monthly trends, open approval/payment exposure,
+member spending, and the largest paid expenses. Employees cannot access this
+view or its API. Expense cash flow uses `paid_at`; approval alone is shown as a
+future payment commitment and never counted as money already spent.
+
 Login brute-force protection is shared by the mobile and admin servers. By
 default, five failed attempts for one source IP and login identifier within 15
 minutes lock that login for 15 minutes; 20 failed attempts from one IP also lock
@@ -178,8 +185,11 @@ The mobile API owns app login and ledger operations:
 - `GET /auth/me`
 - `POST /auth/logout`
 - `GET /app/overview`
+- `GET /app/analytics?ledgerId=<uuid>&months=6`
 - `POST /app/transactions`
 - `POST /app/approvals/decide`
+- `POST /app/payments/mark-paid`
+- `POST /app/payments/confirm-receipt`
 
 Login binds the server session to the app installation id. The Android UI does
 not expose registration, account switching, or organization membership

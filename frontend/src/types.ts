@@ -10,6 +10,7 @@ export type TransactionDirection = "expense" | "income";
 
 export type ApprovalState = "draft" | "pending" | "approved" | "rejected" | "deleted";
 export type PaymentState = "not_applicable" | "pending_payment" | "paid_pending_receipt" | "received";
+export type AnalysisMonths = 3 | 6 | 12;
 
 export type CloudConnectionState = "checking" | "online" | "offline";
 
@@ -146,4 +147,63 @@ export interface LedgerDashboard {
   recentTransactions: Transaction[];
   approvalQueue: ApprovalQueueItem[];
   auditTrail: AuditLogEntry[];
+}
+
+export interface FinancialAnalysis {
+  ledgerId: string;
+  currency: string;
+  months: AnalysisMonths;
+  periodStart: string;
+  periodEnd: string;
+  currentBalanceCents: number;
+  incomeCents: number;
+  expenseCents: number;
+  netCashFlowCents: number;
+  previousIncomeCents: number;
+  previousExpenseCents: number;
+  previousNetCashFlowCents: number;
+  transactionCount: number;
+  pendingApproval: FinancialExposure;
+  pendingPayment: FinancialExposure;
+  paidPendingReceipt: FinancialExposure;
+  trend: CashFlowTrendPoint[];
+  accounts: AnalysisAccount[];
+  memberExpenses: MemberExpense[];
+  largestExpenses: AnalysisExpense[];
+  generatedAt: string;
+}
+
+export interface FinancialExposure {
+  count: number;
+  amountCents: number;
+}
+
+export interface CashFlowTrendPoint {
+  key: string;
+  label: string;
+  incomeCents: number;
+  expenseCents: number;
+  netCashFlowCents: number;
+}
+
+export interface AnalysisAccount {
+  id: string;
+  name: string;
+  kind: string;
+  balanceCents: number;
+}
+
+export interface MemberExpense {
+  userId: string;
+  displayName: string;
+  expenseCents: number;
+  transactionCount: number;
+}
+
+export interface AnalysisExpense {
+  transactionId: string;
+  description: string;
+  submittedBy: string;
+  amountCents: number;
+  paidAt: string;
 }

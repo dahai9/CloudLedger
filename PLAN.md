@@ -67,7 +67,7 @@ development and smoke testing.
 
 3. Mobile App MVP
    - Wire the frontend to the mobile server API for login, overview, quick
-     entry, approval decisions, and audit views.
+     entry, approval decisions, owner-only financial analysis, and audit views.
    - Keep the UI optimized for Android: single-column layout, quick entry,
      bottom navigation, touch-friendly controls, and clear offline/error states.
    - Build and verify desktop dev mode first, then Android debug APK.
@@ -126,8 +126,11 @@ development and smoke testing.
   - `GET /auth/me`
   - `POST /auth/logout`
   - `GET /app/overview`
+  - `GET /app/analytics?ledgerId=<uuid>&months=6`
   - `POST /app/transactions`
   - `POST /app/approvals/decide`
+  - `POST /app/payments/mark-paid`
+  - `POST /app/payments/confirm-receipt`
   - `GET /{admin_path}`
   - `GET /{admin_path}/api/security`
   - `POST /{admin_path}/api/login`
@@ -225,6 +228,12 @@ nix develop path:. -c npm run tauri:android:build -- --debug --target aarch64
   requires the other owner; self-approval remains forbidden. Rejection requires
   a reason, and submission, approval, payment, and receipt all write audit
   events.
+- Business owners have an organization-public-ledger analysis view for 3, 6,
+  or 12 months. The backend returns account balances, actual cash flow, prior
+  period comparison, monthly trend, workflow exposure, member spending, and
+  largest expenses. Employees and backend admins are denied by service-layer
+  authorization. Paid time is the expense cash-flow date; approval alone never
+  counts as money spent.
 - Public-ledger approval validation uses admin-created members in real server
   flows; seeded Acme/Alice/Bob data remains only as an explicit service-layer
   test fixture.

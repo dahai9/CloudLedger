@@ -1,10 +1,28 @@
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{
+    extract::{Query, State},
+    http::HeaderMap,
+    Json,
+};
 use cloudledger_service::{
     AppConfirmTransactionReceiptInput, AppCreateTransactionInput, AppDecideApprovalInput,
-    AppMarkTransactionPaidInput, LedgerOverview, TransactionDto,
+    AppMarkTransactionPaidInput, FinancialAnalysisDto, LedgerOverview, TransactionDto,
 };
+use serde::Deserialize;
+use uuid::Uuid;
 
 use crate::{auth_routes, auth_routes::ApiError, ServerState};
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FinancialAnalysisQuery {
+    pub ledger_id: Uuid,
+    #[serde(default = "default_analysis_months")]
+    pub months: u8,
+}
+
+fn default_analysis_months() -> u8 {
+    6
+}
 
 pub async fn overview(
     State(state): State<ServerState>,
@@ -16,6 +34,23 @@ pub async fn overview(
         .lock()
         .map_err(|_| ApiError::internal("ledger service lock poisoned"))?;
     Ok(Json(service.overview(session.user.id)))
+}
+
+pub async fn financial_analysis(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<FinancialAnalysisQuery>,
+) -> Result<Json<FinancialAnalysisDto>, ApiError> {
+    let session = auth_routes::authenticate(&state, &headers)?;
+    let service = state
+        .ledger_service
+        .lock()
+        .map_err(|_| ApiError::internal("ledger service lock poisoned"))?;
+    Ok(Json(
+        service
+            .financial_analysis(session.user.id, query.ledger_id, query.months)
+            .map_err(ApiError::from_service)?,
+    ))
 }
 
 pub async fn create_transaction(
