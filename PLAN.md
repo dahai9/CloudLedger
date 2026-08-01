@@ -115,6 +115,8 @@ development and smoke testing.
 - Tauri commands:
   - `health`
   - `get_overview`
+  - `get_transactions_for_month`
+  - `create_category`
   - `create_transaction`
   - `decide_approval`
 - Server routes currently planned:
@@ -127,6 +129,8 @@ development and smoke testing.
   - `POST /auth/logout`
   - `GET /app/overview`
   - `GET /app/analytics?ledgerId=<uuid>&months=6`
+  - `GET /app/transactions?ledgerId=<uuid>&month=YYYY-MM`
+  - `POST /app/categories`
   - `POST /app/transactions`
   - `POST /app/approvals/decide`
   - `POST /app/payments/mark-paid`
@@ -234,6 +238,10 @@ nix develop path:. -c npm run tauri:android:build -- --debug --target aarch64
   largest expenses. Employees and backend admins are denied by service-layer
   authorization. Paid time is the expense cash-flow date; approval alone never
   counts as money spent.
+- Transaction history is fetched one calendar month at a time, while the
+  overview retains current-month rows and all unfinished approval/payment
+  workflows. Quick entry exposes 微信、支付宝、银行账户、现金 as standard accounts,
+  and authorized members can add ledger-scoped income or expense categories.
 - Public-ledger approval validation uses admin-created members in real server
   flows; seeded Acme/Alice/Bob data remains only as an explicit service-layer
   test fixture.

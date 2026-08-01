@@ -1,9 +1,9 @@
 use std::{path::PathBuf, sync::Mutex};
 
 use cloudledger_service::{
-    AppConfirmTransactionReceiptInput, AppCreateTransactionInput, AppDecideApprovalInput,
-    AppLedgerService, AppMarkTransactionPaidInput, AppServiceError, FinancialAnalysisDto,
-    LedgerOverview, TransactionDto,
+    AppConfirmTransactionReceiptInput, AppCreateCategoryInput, AppCreateTransactionInput,
+    AppDecideApprovalInput, AppLedgerService, AppMarkTransactionPaidInput, AppServiceError,
+    CategoryDto, FinancialAnalysisDto, LedgerOverview, TransactionDto, TransactionMonthDto,
 };
 use tauri::{Manager, State};
 use uuid::Uuid;
@@ -40,6 +40,38 @@ fn get_financial_analysis(
     service
         .financial_analysis(service.current_user_id(), ledger_id, months)
         .map_err(service_error)
+}
+
+#[tauri::command]
+fn get_transactions_for_month(
+    state: State<'_, AppState>,
+    ledger_id: Uuid,
+    month: Option<String>,
+) -> Result<TransactionMonthDto, String> {
+    let service = state
+        .ledger_service
+        .lock()
+        .map_err(|_| "ledger service lock poisoned".to_string())?;
+    service
+        .transactions_for_month(service.current_user_id(), ledger_id, month.as_deref())
+        .map_err(service_error)
+}
+
+#[tauri::command]
+fn create_category(
+    state: State<'_, AppState>,
+    mut input: AppCreateCategoryInput,
+) -> Result<CategoryDto, String> {
+    let mut service = state
+        .ledger_service
+        .lock()
+        .map_err(|_| "ledger service lock poisoned".to_string())?;
+    input.actor_user_id = service.current_user_id();
+    let category = service.create_category(input).map_err(service_error)?;
+    service
+        .save_to_path(&state.storage_path)
+        .map_err(service_error)?;
+    Ok(category)
 }
 
 #[tauri::command]
@@ -130,6 +162,8 @@ pub fn run() {
             health,
             get_overview,
             get_financial_analysis,
+            get_transactions_for_month,
+            create_category,
             create_transaction,
             decide_approval,
             mark_transaction_paid,

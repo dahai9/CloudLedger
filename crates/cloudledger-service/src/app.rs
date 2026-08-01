@@ -1,21 +1,32 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
 };
 
 use cloudledger_core::{
-    can_perform, Action, ApprovalState, AuditLog, AuthorizationContext, FinancialAccount,
-    FinancialAccountKind, Ledger, LedgerKind, Membership, MembershipRole, Money, Organization,
-    PaymentState, Transaction, TransactionKind, User,
+    can_perform, Action, ApprovalState, AuditLog, AuthorizationContext, Category, CategoryKind,
+    FinancialAccount, FinancialAccountKind, Ledger, LedgerKind, Membership, MembershipRole, Money,
+    Organization, PaymentState, Transaction, TransactionKind, User,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, Date, Month, OffsetDateTime, Time};
 use uuid::Uuid;
 
-const APP_STATE_SCHEMA_VERSION: u32 = 2;
+const APP_STATE_SCHEMA_VERSION: u32 = 3;
+const DEFAULT_CATEGORIES: &[(&str, CategoryKind)] = &[
+    ("餐饮", CategoryKind::Expense),
+    ("交通", CategoryKind::Expense),
+    ("办公", CategoryKind::Expense),
+    ("采购", CategoryKind::Expense),
+    ("差旅", CategoryKind::Expense),
+    ("其他支出", CategoryKind::Expense),
+    ("工资", CategoryKind::Income),
+    ("业务收入", CategoryKind::Income),
+    ("其他收入", CategoryKind::Income),
+];
 
 #[derive(Debug, Error)]
 pub enum AppServiceError {
@@ -25,6 +36,14 @@ pub enum AppServiceError {
     UserNotFound,
     #[error("account was not found")]
     AccountNotFound,
+    #[error("category was not found")]
+    CategoryNotFound,
+    #[error("category name is required and must not exceed 24 characters")]
+    InvalidCategoryName,
+    #[error("category already exists")]
+    DuplicateCategory,
+    #[error("category direction does not match transaction direction")]
+    CategoryDirectionMismatch,
     #[error("organization was not found")]
     OrganizationNotFound,
     #[error("membership was not found")]
@@ -61,6 +80,8 @@ pub enum AppServiceError {
     InvalidAmount(String),
     #[error("financial analysis range must be 3, 6, or 12 months")]
     InvalidAnalysisRange,
+    #[error("transaction month must use YYYY-MM format")]
+    InvalidTransactionMonth,
     #[error("storage error: {0}")]
     Storage(String),
 }
@@ -72,10 +93,22 @@ pub struct AppCreateTransactionInput {
     pub actor_user_id: Uuid,
     pub ledger_id: Uuid,
     pub account_id: Uuid,
+    #[serde(default)]
+    pub category_id: Option<Uuid>,
     pub kind: TransactionKind,
     pub amount_minor: i64,
     pub currency: String,
     pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppCreateCategoryInput {
+    #[serde(default)]
+    pub actor_user_id: Uuid,
+    pub ledger_id: Uuid,
+    pub name: String,
+    pub kind: CategoryKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +150,7 @@ pub struct LedgerOverview {
     pub current_user: UserDto,
     pub ledgers: Vec<LedgerDto>,
     pub accounts: Vec<AccountDto>,
+    pub categories: Vec<CategoryDto>,
     pub transactions: Vec<TransactionDto>,
     pub audit_logs: Vec<AuditLogDto>,
     pub monthly_income_minor: i64,
@@ -124,6 +158,15 @@ pub struct LedgerOverview {
     pub pending_approval_count: usize,
     pub pending_payment_count: usize,
     pub pending_receipt_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionMonthDto {
+    pub ledger_id: String,
+    pub month: String,
+    pub available_months: Vec<String>,
+    pub transactions: Vec<TransactionDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,10 +265,20 @@ pub struct AccountDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CategoryDto {
+    pub id: String,
+    pub ledger_id: String,
+    pub name: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TransactionDto {
     pub id: String,
     pub ledger_id: String,
     pub account_id: String,
+    pub category_id: Option<String>,
     pub kind: String,
     pub amount_minor: i64,
     pub currency: String,
@@ -335,6 +388,8 @@ pub struct AppLedgerService {
     memberships: Vec<Membership>,
     ledgers: BTreeMap<Uuid, Ledger>,
     accounts: BTreeMap<Uuid, FinancialAccount>,
+    #[serde(default)]
+    categories: BTreeMap<Uuid, Category>,
     transactions: BTreeMap<Uuid, Transaction>,
     audit_logs: Vec<AuditLog>,
 }
@@ -348,6 +403,7 @@ pub struct AppLedgerSnapshot {
     pub memberships: Vec<Membership>,
     pub ledgers: Vec<Ledger>,
     pub accounts: Vec<FinancialAccount>,
+    pub categories: Vec<Category>,
     pub transactions: Vec<Transaction>,
     pub audit_logs: Vec<AuditLog>,
 }
@@ -362,6 +418,7 @@ impl AppLedgerService {
             memberships: self.memberships.clone(),
             ledgers: self.ledgers.values().cloned().collect(),
             accounts: self.accounts.values().cloned().collect(),
+            categories: self.categories.values().cloned().collect(),
             transactions: self.transactions.values().cloned().collect(),
             audit_logs: self.audit_logs.clone(),
         }
@@ -391,6 +448,11 @@ impl AppLedgerService {
                 .accounts
                 .into_iter()
                 .map(|account| (account.id, account))
+                .collect(),
+            categories: snapshot
+                .categories
+                .into_iter()
+                .map(|category| (category.id, category))
                 .collect(),
             transactions: snapshot
                 .transactions
@@ -477,6 +539,9 @@ impl AppLedgerService {
                     }
                 }
             }
+        }
+        if self.schema_version < 3 {
+            self.ensure_standard_setup();
         }
         self.schema_version = APP_STATE_SCHEMA_VERSION;
     }
@@ -602,7 +667,7 @@ impl AppLedgerService {
             "提交公账支出：办公用品采购",
         );
 
-        Self {
+        let mut service = Self {
             schema_version: APP_STATE_SCHEMA_VERSION,
             current_user_id: alice_id,
             users: BTreeMap::from([(alice_id, alice), (bob_id, bob)]),
@@ -621,13 +686,16 @@ impl AppLedgerService {
                 (bob_wallet.id, bob_wallet),
                 (company_bank.id, company_bank),
             ]),
+            categories: BTreeMap::new(),
             transactions: BTreeMap::from([
                 (salary.id, salary),
                 (bob_meal.id, bob_meal),
                 (office.id, office),
             ]),
             audit_logs: vec![audit],
-        }
+        };
+        service.ensure_standard_setup();
+        service
     }
 
     pub fn uninitialized() -> Self {
@@ -639,6 +707,7 @@ impl AppLedgerService {
             memberships: Vec::new(),
             ledgers: BTreeMap::new(),
             accounts: BTreeMap::new(),
+            categories: BTreeMap::new(),
             transactions: BTreeMap::new(),
             audit_logs: Vec::new(),
         }
@@ -693,10 +762,26 @@ impl AppLedgerService {
             .map(|account| self.account_dto(account))
             .collect();
 
+        let categories = self
+            .categories
+            .values()
+            .filter(|category| visible_ledger_ids.contains(&category.ledger_id))
+            .map(category_dto)
+            .collect();
+
+        let current_month = month_key(OffsetDateTime::now_utc());
         let transactions: Vec<_> = self
             .transactions
             .values()
             .filter(|transaction| visible_ledger_ids.contains(&transaction.ledger_id))
+            .filter(|transaction| {
+                month_key(transaction.occurred_at) == current_month
+                    || transaction.approval_state == ApprovalState::Submitted
+                    || matches!(
+                        transaction.payment_state,
+                        PaymentState::PendingPayment | PaymentState::PaidPendingReceipt
+                    )
+            })
             .map(|transaction| self.transaction_dto(transaction))
             .collect();
 
@@ -737,6 +822,7 @@ impl AppLedgerService {
                 }),
             ledgers,
             accounts,
+            categories,
             transactions,
             audit_logs: self
                 .audit_logs
@@ -755,6 +841,100 @@ impl AppLedgerService {
             pending_payment_count,
             pending_receipt_count,
         }
+    }
+
+    pub fn transactions_for_month(
+        &self,
+        actor_user_id: Uuid,
+        ledger_id: Uuid,
+        requested_month: Option<&str>,
+    ) -> Result<TransactionMonthDto, AppServiceError> {
+        let ledger = self
+            .ledgers
+            .get(&ledger_id)
+            .ok_or(AppServiceError::LedgerNotFound)?;
+        if !self.authorized(actor_user_id, ledger, Action::ViewLedger) {
+            return Err(AppServiceError::Unauthorized);
+        }
+
+        let current_month = month_key(OffsetDateTime::now_utc());
+        let selected_month = requested_month
+            .unwrap_or(current_month.as_str())
+            .to_string();
+        if parse_month_key(&selected_month).is_none() {
+            return Err(AppServiceError::InvalidTransactionMonth);
+        }
+
+        let mut available_months = self
+            .transactions
+            .values()
+            .filter(|transaction| {
+                transaction.ledger_id == ledger_id && transaction.deleted_at.is_none()
+            })
+            .map(|transaction| month_key(transaction.occurred_at))
+            .collect::<BTreeSet<_>>();
+        available_months.insert(current_month);
+        available_months.insert(selected_month.clone());
+        let available_months = available_months.into_iter().rev().collect::<Vec<_>>();
+
+        let mut transactions = self
+            .transactions
+            .values()
+            .filter(|transaction| {
+                transaction.ledger_id == ledger_id
+                    && transaction.deleted_at.is_none()
+                    && month_key(transaction.occurred_at) == selected_month
+            })
+            .map(|transaction| self.transaction_dto(transaction))
+            .collect::<Vec<_>>();
+        transactions.sort_by(|left, right| {
+            right
+                .occurred_at
+                .cmp(&left.occurred_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+
+        Ok(TransactionMonthDto {
+            ledger_id: ledger_id.to_string(),
+            month: selected_month,
+            available_months,
+            transactions,
+        })
+    }
+
+    pub fn create_category(
+        &mut self,
+        input: AppCreateCategoryInput,
+    ) -> Result<CategoryDto, AppServiceError> {
+        let ledger = self
+            .ledgers
+            .get(&input.ledger_id)
+            .ok_or(AppServiceError::LedgerNotFound)?;
+        if !self.authorized(input.actor_user_id, ledger, Action::CreateTransaction) {
+            return Err(AppServiceError::Unauthorized);
+        }
+
+        let name = input.name.trim();
+        if name.is_empty() || name.chars().count() > 24 {
+            return Err(AppServiceError::InvalidCategoryName);
+        }
+        if self.categories.values().any(|category| {
+            category.ledger_id == input.ledger_id
+                && category.kind == input.kind
+                && category.name.to_lowercase() == name.to_lowercase()
+        }) {
+            return Err(AppServiceError::DuplicateCategory);
+        }
+
+        let category = Category {
+            id: Uuid::new_v4(),
+            ledger_id: input.ledger_id,
+            name: name.to_string(),
+            kind: input.kind,
+        };
+        let dto = category_dto(&category);
+        self.categories.insert(category.id, category);
+        Ok(dto)
     }
 
     pub fn financial_analysis(
@@ -1033,12 +1213,7 @@ impl AppLedgerService {
         let organization = Organization::new(organization_name, admin.id);
         let public_ledger =
             Ledger::organization_public(organization.id, format!("{} 公账", organization.name));
-        let company_bank = FinancialAccount::new(
-            public_ledger.id,
-            "公司银行账户",
-            FinancialAccountKind::Bank,
-            Money::new(0, "CNY").expect("zero CNY is valid"),
-        );
+        let public_ledger_id = public_ledger.id;
         let membership = Membership::new(organization.id, admin.id, MembershipRole::Owner);
         let membership_dto = MembershipDto {
             id: membership.id.to_string(),
@@ -1056,8 +1231,9 @@ impl AppLedgerService {
         self.users.insert(admin.id, admin);
         self.organizations.insert(organization.id, organization);
         self.memberships.push(membership);
-        self.accounts.insert(company_bank.id, company_bank);
         self.ledgers.insert(public_ledger.id, public_ledger);
+        self.ensure_standard_accounts_for_ledger(public_ledger_id);
+        self.ensure_default_categories_for_ledger(public_ledger_id);
         Ok(membership_dto)
     }
 
@@ -1296,12 +1472,45 @@ impl AppLedgerService {
             return Err(AppServiceError::CurrencyMismatch);
         }
 
+        let category_kind = match input.kind {
+            TransactionKind::Income => CategoryKind::Income,
+            TransactionKind::Expense => CategoryKind::Expense,
+            TransactionKind::Transfer => return Err(AppServiceError::UnsupportedTransactionKind),
+        };
+        let category_id = if let Some(category_id) = input.category_id {
+            let category = self
+                .categories
+                .get(&category_id)
+                .ok_or(AppServiceError::CategoryNotFound)?;
+            if category.ledger_id != input.ledger_id {
+                return Err(AppServiceError::CategoryNotFound);
+            }
+            if category.kind != category_kind {
+                return Err(AppServiceError::CategoryDirectionMismatch);
+            }
+            category.id
+        } else {
+            let fallback_name = match category_kind {
+                CategoryKind::Income => "其他收入",
+                CategoryKind::Expense => "其他支出",
+            };
+            self.categories
+                .values()
+                .find(|category| {
+                    category.ledger_id == input.ledger_id
+                        && category.kind == category_kind
+                        && category.name == fallback_name
+                })
+                .map(|category| category.id)
+                .ok_or(AppServiceError::CategoryNotFound)?
+        };
+
         let amount = Money::new(input.amount_minor, input.currency)
             .map_err(|err| AppServiceError::InvalidAmount(err.to_string()))?;
         let mut transaction = Transaction::draft(
             input.ledger_id,
             input.account_id,
-            None,
+            Some(category_id),
             input.kind,
             amount,
             input.description,
@@ -1665,6 +1874,7 @@ impl AppLedgerService {
             id: transaction.id.to_string(),
             ledger_id: transaction.ledger_id.to_string(),
             account_id: transaction.account_id.to_string(),
+            category_id: transaction.category_id.map(|id| id.to_string()),
             kind: match transaction.kind {
                 TransactionKind::Income => "income",
                 TransactionKind::Expense => "expense",
@@ -1758,15 +1968,109 @@ impl AppLedgerService {
         }
 
         let ledger = Ledger::personal(user_id, format!("{display_name} 私账"));
-        let account = FinancialAccount::new(
-            ledger.id,
-            "个人现金",
-            FinancialAccountKind::Cash,
-            Money::new(0, "CNY").expect("zero CNY is valid"),
-        );
-        self.accounts.insert(account.id, account);
+        let ledger_id = ledger.id;
         self.ledgers.insert(ledger.id, ledger);
+        self.ensure_standard_accounts_for_ledger(ledger_id);
+        self.ensure_default_categories_for_ledger(ledger_id);
         Ok(())
+    }
+
+    fn ensure_standard_setup(&mut self) {
+        for account in self.accounts.values_mut() {
+            if account.kind == FinancialAccountKind::Wallet {
+                account.kind = FinancialAccountKind::Wechat;
+            }
+        }
+        let ledger_ids = self
+            .ledgers
+            .values()
+            .filter(|ledger| ledger.deleted_at.is_none())
+            .map(|ledger| ledger.id)
+            .collect::<Vec<_>>();
+        for ledger_id in ledger_ids {
+            self.ensure_standard_accounts_for_ledger(ledger_id);
+            self.ensure_default_categories_for_ledger(ledger_id);
+        }
+        self.assign_default_categories();
+    }
+
+    fn ensure_standard_accounts_for_ledger(&mut self, ledger_id: Uuid) {
+        let currency = self
+            .accounts
+            .values()
+            .find(|account| account.ledger_id == ledger_id && account.deleted_at.is_none())
+            .map(|account| account.opening_balance.currency.clone())
+            .unwrap_or_else(|| "CNY".to_string());
+        let standards = [
+            ("微信", FinancialAccountKind::Wechat),
+            ("支付宝", FinancialAccountKind::Alipay),
+            ("银行账户", FinancialAccountKind::Bank),
+            ("现金", FinancialAccountKind::Cash),
+        ];
+
+        for (name, kind) in standards {
+            if let Some(account) = self.accounts.values_mut().find(|account| {
+                account.ledger_id == ledger_id
+                    && account.kind == kind
+                    && account.deleted_at.is_none()
+            }) {
+                account.name = name.to_string();
+                continue;
+            }
+            let account = FinancialAccount::new(
+                ledger_id,
+                name,
+                kind,
+                Money::new(0, currency.clone()).expect("existing ledger currency is valid"),
+            );
+            self.accounts.insert(account.id, account);
+        }
+    }
+
+    fn ensure_default_categories_for_ledger(&mut self, ledger_id: Uuid) {
+        for (name, kind) in DEFAULT_CATEGORIES {
+            let exists = self.categories.values().any(|category| {
+                category.ledger_id == ledger_id && category.kind == *kind && category.name == *name
+            });
+            if !exists {
+                let category = Category {
+                    id: Uuid::new_v4(),
+                    ledger_id,
+                    name: (*name).to_string(),
+                    kind: *kind,
+                };
+                self.categories.insert(category.id, category);
+            }
+        }
+    }
+
+    fn assign_default_categories(&mut self) {
+        let expense_defaults = self
+            .categories
+            .values()
+            .filter(|category| {
+                category.kind == CategoryKind::Expense && category.name == "其他支出"
+            })
+            .map(|category| (category.ledger_id, category.id))
+            .collect::<BTreeMap<_, _>>();
+        let income_defaults = self
+            .categories
+            .values()
+            .filter(|category| category.kind == CategoryKind::Income && category.name == "其他收入")
+            .map(|category| (category.ledger_id, category.id))
+            .collect::<BTreeMap<_, _>>();
+
+        for transaction in self
+            .transactions
+            .values_mut()
+            .filter(|transaction| transaction.category_id.is_none())
+        {
+            transaction.category_id = match transaction.kind {
+                TransactionKind::Income => income_defaults.get(&transaction.ledger_id).copied(),
+                TransactionKind::Expense => expense_defaults.get(&transaction.ledger_id).copied(),
+                TransactionKind::Transfer => None,
+            };
+        }
     }
 
     fn rename_personal_ledger_for_user(&mut self, user_id: Uuid, display_name: &str) {
@@ -1779,7 +2083,7 @@ impl AppLedgerService {
 }
 
 fn default_schema_version() -> u32 {
-    APP_STATE_SCHEMA_VERSION
+    1
 }
 
 fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
@@ -1856,6 +2160,19 @@ fn payment_state_name(state: PaymentState) -> &'static str {
     }
 }
 
+fn category_dto(category: &Category) -> CategoryDto {
+    CategoryDto {
+        id: category.id.to_string(),
+        ledger_id: category.ledger_id.to_string(),
+        name: category.name.clone(),
+        kind: match category.kind {
+            CategoryKind::Income => "income",
+            CategoryKind::Expense => "expense",
+        }
+        .to_string(),
+    }
+}
+
 fn transaction_affects_balance(transaction: &Transaction) -> bool {
     transaction.approval_state == ApprovalState::Approved
         && match transaction.kind {
@@ -1894,6 +2211,22 @@ fn month_start(value: OffsetDateTime) -> OffsetDateTime {
         .expect("an existing timestamp always has a valid month start")
         .with_time(Time::MIDNIGHT)
         .assume_utc()
+}
+
+fn month_key(value: OffsetDateTime) -> String {
+    format!("{:04}-{:02}", value.year(), value.month() as u8)
+}
+
+fn parse_month_key(value: &str) -> Option<(i32, Month)> {
+    let (year, month) = value.split_once('-')?;
+    if year.len() != 4 || month.len() != 2 {
+        return None;
+    }
+    let year = year.parse::<i32>().ok()?;
+    let month_number = month.parse::<u8>().ok()?;
+    let month = Month::try_from(month_number).ok()?;
+    Date::from_calendar_date(year, month, 1).ok()?;
+    Some((year, month))
 }
 
 fn shift_month_start(value: OffsetDateTime, offset: i32) -> OffsetDateTime {
@@ -1946,6 +2279,112 @@ mod tests {
         assert!(path.exists());
 
         fs::remove_dir_all(directory).expect("remove temp dir");
+    }
+
+    #[test]
+    fn standard_accounts_custom_categories_and_month_queries_work_together() {
+        let mut service = AppLedgerService::seeded();
+        let owner_id = service.current_user_id();
+        let overview = service.overview(owner_id);
+        let private_ledger = overview
+            .ledgers
+            .iter()
+            .find(|ledger| ledger.kind == "personal")
+            .expect("seeded private ledger");
+        let ledger_id = Uuid::parse_str(&private_ledger.id).expect("ledger uuid");
+        let mut account_names = overview
+            .accounts
+            .iter()
+            .filter(|account| account.ledger_id == private_ledger.id)
+            .filter(|account| {
+                matches!(account.kind.as_str(), "wechat" | "alipay" | "bank" | "cash")
+            })
+            .map(|account| account.name.as_str())
+            .collect::<Vec<_>>();
+        account_names.sort_unstable();
+        assert_eq!(account_names, vec!["微信", "支付宝", "现金", "银行账户"]);
+
+        let category = service
+            .create_category(AppCreateCategoryInput {
+                actor_user_id: owner_id,
+                ledger_id,
+                name: " 订阅服务 ".to_string(),
+                kind: CategoryKind::Expense,
+            })
+            .expect("create custom category");
+        assert_eq!(category.name, "订阅服务");
+        let duplicate = service.create_category(AppCreateCategoryInput {
+            actor_user_id: owner_id,
+            ledger_id,
+            name: "订阅服务".to_string(),
+            kind: CategoryKind::Expense,
+        });
+        assert!(matches!(duplicate, Err(AppServiceError::DuplicateCategory)));
+
+        let account_id = overview
+            .accounts
+            .iter()
+            .find(|account| account.ledger_id == private_ledger.id && account.kind == "wechat")
+            .and_then(|account| Uuid::parse_str(&account.id).ok())
+            .expect("standard WeChat account");
+        let category_id = Uuid::parse_str(&category.id).expect("category uuid");
+        let created = service
+            .create_transaction(AppCreateTransactionInput {
+                actor_user_id: owner_id,
+                ledger_id,
+                account_id,
+                category_id: Some(category_id),
+                kind: TransactionKind::Expense,
+                amount_minor: 2_000,
+                currency: "CNY".to_string(),
+                description: "工具订阅".to_string(),
+            })
+            .expect("create categorized transaction");
+        assert_eq!(created.category_id.as_deref(), Some(category.id.as_str()));
+
+        let wrong_direction = service.create_transaction(AppCreateTransactionInput {
+            actor_user_id: owner_id,
+            ledger_id,
+            account_id,
+            category_id: Some(category_id),
+            kind: TransactionKind::Income,
+            amount_minor: 2_000,
+            currency: "CNY".to_string(),
+            description: "错误分类".to_string(),
+        });
+        assert!(matches!(
+            wrong_direction,
+            Err(AppServiceError::CategoryDirectionMismatch)
+        ));
+
+        let transaction_id = Uuid::parse_str(&created.id).expect("transaction uuid");
+        let previous_month = shift_month_start(month_start(OffsetDateTime::now_utc()), -1);
+        service
+            .transactions
+            .get_mut(&transaction_id)
+            .expect("created transaction")
+            .occurred_at = previous_month;
+        let previous_key = month_key(previous_month);
+        let previous_page = service
+            .transactions_for_month(owner_id, ledger_id, Some(&previous_key))
+            .expect("load previous month");
+        assert!(previous_page
+            .transactions
+            .iter()
+            .any(|transaction| transaction.id == created.id));
+        assert!(previous_page.available_months.contains(&previous_key));
+        let current_page = service
+            .transactions_for_month(owner_id, ledger_id, None)
+            .expect("load current month");
+        assert!(!current_page
+            .transactions
+            .iter()
+            .any(|transaction| transaction.id == created.id));
+        assert!(!service
+            .overview(owner_id)
+            .transactions
+            .iter()
+            .any(|transaction| transaction.id == created.id));
     }
 
     #[test]
@@ -2193,6 +2632,7 @@ mod tests {
             actor_user_id: Uuid::parse_str(&bob.id).expect("uuid"),
             ledger_id: Uuid::parse_str(&alice_private_ledger.id).expect("uuid"),
             account_id: Uuid::parse_str(&alice_account.id).expect("uuid"),
+            category_id: None,
             kind: TransactionKind::Expense,
             amount_minor: 1_200,
             currency: "CNY".to_string(),
@@ -2234,7 +2674,7 @@ mod tests {
         let account = overview
             .accounts
             .iter()
-            .find(|account| account.ledger_id == public.id)
+            .find(|account| account.ledger_id == public.id && account.kind == "bank")
             .expect("seeded public account");
 
         let transaction = service
@@ -2242,6 +2682,7 @@ mod tests {
                 actor_user_id: service.current_user_id(),
                 ledger_id: Uuid::parse_str(&public.id).expect("uuid"),
                 account_id: Uuid::parse_str(&account.id).expect("uuid"),
+                category_id: None,
                 kind: TransactionKind::Expense,
                 amount_minor: 12_800,
                 currency: "CNY".to_string(),
@@ -2280,7 +2721,7 @@ mod tests {
         let public_account = overview
             .accounts
             .iter()
-            .find(|account| account.ledger_id == public.id)
+            .find(|account| account.ledger_id == public.id && account.kind == "bank")
             .expect("seeded public account");
         let pending = overview
             .transactions
@@ -2303,7 +2744,7 @@ mod tests {
         let public_account = overview
             .accounts
             .iter()
-            .find(|account| account.ledger_id == public.id)
+            .find(|account| account.ledger_id == public.id && account.kind == "bank")
             .expect("seeded public account");
 
         assert_eq!(approved.approval_state, "approved");
@@ -2331,7 +2772,7 @@ mod tests {
         let public_account = overview
             .accounts
             .iter()
-            .find(|account| account.ledger_id == public.id)
+            .find(|account| account.ledger_id == public.id && account.kind == "bank")
             .expect("seeded public account");
         assert_eq!(paid.payment_state, "paid_pending_receipt");
         assert!(paid.paid_at.is_some());
@@ -2359,7 +2800,7 @@ mod tests {
         let public_account = overview
             .accounts
             .iter()
-            .find(|account| account.ledger_id == public.id)
+            .find(|account| account.ledger_id == public.id && account.kind == "bank")
             .expect("seeded public account");
         assert_eq!(received.payment_state, "received");
         assert!(received.received_at.is_some());
@@ -2390,7 +2831,7 @@ mod tests {
         let public_account = overview
             .accounts
             .iter()
-            .find(|account| account.ledger_id == public.id)
+            .find(|account| account.ledger_id == public.id && account.kind == "bank")
             .expect("seeded public account");
         let pending = overview
             .transactions
@@ -2412,7 +2853,7 @@ mod tests {
         let public_account = overview
             .accounts
             .iter()
-            .find(|account| account.ledger_id == public.id)
+            .find(|account| account.ledger_id == public.id && account.kind == "bank")
             .expect("seeded public account");
 
         assert_eq!(rejected.approval_state, "rejected");
@@ -2454,13 +2895,14 @@ mod tests {
         let account = alice_overview
             .accounts
             .iter()
-            .find(|account| account.ledger_id == public.id)
+            .find(|account| account.ledger_id == public.id && account.kind == "bank")
             .expect("seeded public account");
         let transaction = service
             .create_transaction(AppCreateTransactionInput {
                 actor_user_id: service.current_user_id(),
                 ledger_id: Uuid::parse_str(&public.id).expect("uuid"),
                 account_id: Uuid::parse_str(&account.id).expect("uuid"),
+                category_id: None,
                 kind: TransactionKind::Expense,
                 amount_minor: 3_300,
                 currency: "CNY".to_string(),
@@ -2552,6 +2994,7 @@ mod tests {
             actor_user_id: service.current_user_id(),
             ledger_id: Uuid::parse_str(&private.id).expect("uuid"),
             account_id: Uuid::parse_str(&account.id).expect("uuid"),
+            category_id: None,
             kind: TransactionKind::Transfer,
             amount_minor: 1_000,
             currency: "CNY".to_string(),
@@ -2561,6 +3004,7 @@ mod tests {
             actor_user_id: service.current_user_id(),
             ledger_id: Uuid::parse_str(&private.id).expect("uuid"),
             account_id: Uuid::parse_str(&account.id).expect("uuid"),
+            category_id: None,
             kind: TransactionKind::Expense,
             amount_minor: 1_000,
             currency: "USD".to_string(),
@@ -2719,13 +3163,14 @@ mod tests {
         let account = overview
             .accounts
             .iter()
-            .find(|account| account.ledger_id == public.id)
+            .find(|account| account.ledger_id == public.id && account.kind == "bank")
             .expect("seeded public account");
         let transaction = service
             .create_transaction(AppCreateTransactionInput {
                 actor_user_id: service.current_user_id(),
                 ledger_id: Uuid::parse_str(&public.id).expect("uuid"),
                 account_id: Uuid::parse_str(&account.id).expect("uuid"),
+                category_id: None,
                 kind: TransactionKind::Expense,
                 amount_minor: 3_300,
                 currency: "CNY".to_string(),

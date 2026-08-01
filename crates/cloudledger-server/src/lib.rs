@@ -60,7 +60,11 @@ pub fn router(state: ServerState) -> Router {
         .route("/auth/logout", post(auth_routes::logout))
         .route("/app/overview", get(app_api::overview))
         .route("/app/analytics", get(app_api::financial_analysis))
-        .route("/app/transactions", post(app_api::create_transaction))
+        .route(
+            "/app/transactions",
+            get(app_api::transactions_for_month).post(app_api::create_transaction),
+        )
+        .route("/app/categories", post(app_api::create_category))
         .route("/app/approvals/decide", post(app_api::decide_approval))
         .route(
             "/app/payments/mark-paid",

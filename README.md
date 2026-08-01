@@ -110,7 +110,8 @@ The randomized admin page has separate platform and organization entry points.
 The raw platform token must first be exchanged for a revocable eight-hour
 platform session; it is not accepted as an API bearer token. The platform
 session creates and lists organizations. Every organization is created with its
-own organization-admin login, public ledger, and default company bank account.
+own organization-admin login, public ledger, and standard 微信、支付宝、银行账户、
+现金 accounts.
 Organization admins log in with their own email/phone and password and can
 manage employees only inside their organization.
 
@@ -149,6 +150,12 @@ member spending, and the largest paid expenses. Employees cannot access this
 view or its API. Expense cash flow uses `paid_at`; approval alone is shown as a
 future payment commitment and never counted as money already spent.
 
+The transaction view loads one month at a time instead of growing into an
+unbounded list. Users can switch among months that contain ledger activity.
+Quick entry uses the four standard account choices (微信、支付宝、银行账户、现金),
+and any authorized ledger member can add reusable income or expense categories
+for that ledger.
+
 Login brute-force protection is shared by the mobile and admin servers. By
 default, five failed attempts for one source IP and login identifier within 15
 minutes lock that login for 15 minutes; 20 failed attempts from one IP also lock
@@ -186,6 +193,8 @@ The mobile API owns app login and ledger operations:
 - `POST /auth/logout`
 - `GET /app/overview`
 - `GET /app/analytics?ledgerId=<uuid>&months=6`
+- `GET /app/transactions?ledgerId=<uuid>&month=YYYY-MM`
+- `POST /app/categories`
 - `POST /app/transactions`
 - `POST /app/approvals/decide`
 - `POST /app/payments/mark-paid`

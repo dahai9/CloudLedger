@@ -55,6 +55,9 @@ interface AppState {
   error?: string;
   view: ViewMode;
   filter: TransactionFilter;
+  activityMonth: string;
+  categoryEditing: boolean;
+  categoryName: string;
   form: QuickEntryForm;
   authForm: AuthForm;
   profileForm: ProfileForm;
@@ -83,6 +86,9 @@ const state: AppState = {
   analysisLoading: false,
   view: "activity",
   filter: "all",
+  activityMonth: currentMonthKey(),
+  categoryEditing: false,
+  categoryName: "",
   form: {
     direction: "expense",
     amount: "",
@@ -166,8 +172,9 @@ async function loadInitialState() {
     state.ledgers = ledgers;
     state.activeLedgerId = activeLedgerId;
     state.dashboard = activeLedgerId
-      ? await cloudLedgerApi.getLedgerDashboard(activeLedgerId)
+      ? await cloudLedgerApi.getLedgerDashboard(activeLedgerId, state.activityMonth)
       : undefined;
+    state.activityMonth = state.dashboard?.selectedTransactionMonth ?? currentMonthKey();
     state.authStatus = "authenticated";
     syncProfileFormFromUser();
     resetFormForDashboard();
@@ -245,8 +252,12 @@ async function switchLedger(ledgerId: string) {
   try {
     state.loading = true;
     state.activeLedgerId = ledgerId;
+    state.activityMonth = currentMonthKey();
+    state.categoryEditing = false;
+    state.categoryName = "";
     render();
-    state.dashboard = await cloudLedgerApi.getLedgerDashboard(ledgerId);
+    state.dashboard = await cloudLedgerApi.getLedgerDashboard(ledgerId, state.activityMonth);
+    state.activityMonth = state.dashboard.selectedTransactionMonth;
     state.analysis = undefined;
     state.analysisError = undefined;
     state.view = "activity";
@@ -257,6 +268,27 @@ async function switchLedger(ledgerId: string) {
     state.error = friendlyError(error, "切换账本失败");
   } finally {
     state.loading = false;
+    render();
+  }
+}
+
+async function loadActivityMonth(month: string) {
+  const ledgerId = state.activeLedgerId;
+  if (!ledgerId || month === state.activityMonth || state.pendingAction) {
+    return;
+  }
+  try {
+    state.pendingAction = "activity-month";
+    state.activityMonth = month;
+    render();
+    state.dashboard = await cloudLedgerApi.getLedgerDashboard(ledgerId, month);
+    state.activityMonth = state.dashboard.selectedTransactionMonth;
+    resetFormForDashboard({ preserveDraft: true });
+    state.error = undefined;
+  } catch (error) {
+    showToast(friendlyError(error, "加载月份流水失败"));
+  } finally {
+    state.pendingAction = undefined;
     render();
   }
 }
@@ -332,8 +364,9 @@ async function refreshRemoteState(
     state.ledgers = ledgers;
     state.activeLedgerId = activeLedgerId;
     state.dashboard = activeLedgerId
-      ? await cloudLedgerApi.getLedgerDashboard(activeLedgerId)
+      ? await cloudLedgerApi.getLedgerDashboard(activeLedgerId, state.activityMonth)
       : undefined;
+    state.activityMonth = state.dashboard?.selectedTransactionMonth ?? currentMonthKey();
     state.error = undefined;
     syncProfileFormFromUser();
     resetFormForDashboard({ preserveDraft: true });
@@ -375,8 +408,9 @@ function resetFormForDashboard(options: { preserveDraft?: boolean } = {}) {
     return;
   }
 
-  const preservedAccount = dashboard.accounts.find((account) => account.id === state.form.accountId);
-  const firstAccount = preservedAccount ?? dashboard.accounts[0];
+  const entryAccounts = entryAccountsForDashboard(dashboard);
+  const preservedAccount = entryAccounts.find((account) => account.id === state.form.accountId);
+  const firstAccount = preservedAccount ?? entryAccounts[0];
   const categories = categoriesForDirection(state.form.direction);
   const preservedCategory = categories.find((category) => category.id === state.form.categoryId);
 
@@ -403,6 +437,13 @@ function syncProfileFormFromUser() {
 
 function categoriesForDirection(direction: TransactionDirection): Category[] {
   return state.dashboard?.categories.filter((category) => category.direction === direction) ?? [];
+}
+
+function entryAccountsForDashboard(dashboard: LedgerDashboard) {
+  const rank: Record<string, number> = { wechat: 0, alipay: 1, bank: 2, cash: 3 };
+  return dashboard.accounts
+    .filter((account) => account.kind in rank)
+    .sort((left, right) => rank[left.kind] - rank[right.kind]);
 }
 
 function render() {
@@ -627,7 +668,7 @@ function renderBalancePanel(dashboard: LedgerDashboard) {
 function renderQuickEntry(dashboard: LedgerDashboard) {
   const form = state.form;
   const categories = categoriesForDirection(form.direction);
-  const accountOptions = dashboard.accounts
+  const accountOptions = entryAccountsForDashboard(dashboard)
     .map(
       (account) => `
         <option value="${escapeHtml(account.id)}" ${form.accountId === account.id ? "selected" : ""}>
@@ -680,11 +721,37 @@ function renderQuickEntry(dashboard: LedgerDashboard) {
           <span>账户</span>
           <select id="accountSelect">${accountOptions}</select>
         </label>
-        <label>
-          <span>分类</span>
+        <div class="form-field category-field">
+          <div class="field-label-row">
+            <span>分类</span>
+            <button
+              id="addCategoryButton"
+              class="icon-button"
+              type="button"
+              title="添加分类"
+              aria-label="添加分类"
+              aria-expanded="${state.categoryEditing}"
+            >+</button>
+          </div>
           <select id="categorySelect">${categoryOptions}</select>
-        </label>
+        </div>
       </div>
+
+      ${
+        state.categoryEditing
+          ? `<div class="category-editor">
+              <input
+                id="categoryNameInput"
+                maxlength="24"
+                autocomplete="off"
+                placeholder="新${form.direction === "expense" ? "支出" : "收入"}分类"
+                value="${escapeHtml(state.categoryName)}"
+              />
+              <button id="saveCategoryButton" class="icon-button is-confirm" type="button" title="保存分类" aria-label="保存分类" ${state.pendingAction === "create-category" ? "disabled" : ""}>✓</button>
+              <button id="cancelCategoryButton" class="icon-button" type="button" title="取消" aria-label="取消">×</button>
+            </div>`
+          : ""
+      }
 
       <label class="memo-field">
         <span>备注</span>
@@ -977,6 +1044,17 @@ function renderTransactionList(dashboard: LedgerDashboard) {
           ${renderFilterButton("approved", "已入账")}
           ${renderFilterButton("rejected", "驳回")}
         </div>
+      </div>
+      <div class="activity-month-bar">
+        <label for="activityMonthSelect">月份</label>
+        <select id="activityMonthSelect">
+          ${dashboard.availableTransactionMonths
+            .map(
+              (month) => `<option value="${escapeHtml(month)}" ${month === dashboard.selectedTransactionMonth ? "selected" : ""}>${escapeHtml(formatMonthLabel(month))}</option>`,
+            )
+            .join("")}
+        </select>
+        <span>${filtered.length} / ${dashboard.recentTransactions.length} 笔</span>
       </div>
       <div class="transaction-list">
         ${
@@ -1299,6 +1377,34 @@ function bindEvents() {
     state.form.categoryId = target.value;
   });
 
+  app.querySelector<HTMLButtonElement>("#addCategoryButton")?.addEventListener("click", () => {
+    state.categoryEditing = !state.categoryEditing;
+    state.categoryName = "";
+    render();
+    app.querySelector<HTMLInputElement>("#categoryNameInput")?.focus();
+  });
+
+  app.querySelector<HTMLInputElement>("#categoryNameInput")?.addEventListener("input", (event) => {
+    state.categoryName = (event.currentTarget as HTMLInputElement).value;
+  });
+
+  app.querySelector<HTMLInputElement>("#categoryNameInput")?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void saveCategory();
+    }
+  });
+
+  app.querySelector<HTMLButtonElement>("#saveCategoryButton")?.addEventListener("click", () => {
+    void saveCategory();
+  });
+
+  app.querySelector<HTMLButtonElement>("#cancelCategoryButton")?.addEventListener("click", () => {
+    state.categoryEditing = false;
+    state.categoryName = "";
+    render();
+  });
+
   app.querySelector<HTMLInputElement>("#memoInput")?.addEventListener("input", (event) => {
     const target = event.currentTarget as HTMLInputElement;
     state.form.memo = target.value;
@@ -1328,6 +1434,10 @@ function bindEvents() {
       state.filter = button.dataset.filter as TransactionFilter;
       render();
     });
+  });
+
+  app.querySelector<HTMLSelectElement>("#activityMonthSelect")?.addEventListener("change", (event) => {
+    void loadActivityMonth((event.currentTarget as HTMLSelectElement).value);
   });
 
   app.querySelectorAll<HTMLButtonElement>("[data-view-target]").forEach((button) => {
@@ -1432,6 +1542,7 @@ async function decideApproval(transactionId: string, decision: "approve" | "reje
     render();
     const transaction = await cloudLedgerApi.decideApproval(transactionId, decision, decisionNote);
     state.analysis = undefined;
+    state.activityMonth = transactionMonthKey(transaction.occurredAt);
     await refreshDashboard();
     state.view = "activity";
     state.filter = decision === "approve" ? "approved" : "rejected";
@@ -1462,12 +1573,11 @@ async function updatePaymentState(
     state.loading = true;
     state.pendingAction = transactionId;
     render();
-    if (action === "mark-paid") {
-      await cloudLedgerApi.markTransactionPaid(transactionId);
-    } else {
-      await cloudLedgerApi.confirmTransactionReceipt(transactionId);
-    }
+    const transaction = action === "mark-paid"
+      ? await cloudLedgerApi.markTransactionPaid(transactionId)
+      : await cloudLedgerApi.confirmTransactionReceipt(transactionId);
     state.analysis = undefined;
+    state.activityMonth = transactionMonthKey(transaction.occurredAt);
     await refreshDashboard();
     state.view = "activity";
     showToast(action === "mark-paid" ? "已标记打款，等待申请人确认" : "已确认收到款项");
@@ -1475,6 +1585,45 @@ async function updatePaymentState(
     showToast(friendlyError(error, action === "mark-paid" ? "标记打款失败" : "确认收款失败"));
   } finally {
     state.loading = false;
+    state.pendingAction = undefined;
+    render();
+  }
+}
+
+async function saveCategory() {
+  const dashboard = state.dashboard;
+  const name = state.categoryName.trim();
+  if (!dashboard || state.pendingAction) {
+    return;
+  }
+  if (!name) {
+    showToast("请输入分类名称");
+    return;
+  }
+  if (Array.from(name).length > 24) {
+    showToast("分类名称不能超过 24 个字符");
+    return;
+  }
+
+  try {
+    state.pendingAction = "create-category";
+    render();
+    const category = await cloudLedgerApi.createCategory(
+      dashboard.ledger.id,
+      name,
+      state.form.direction,
+    );
+    state.dashboard = await cloudLedgerApi.getLedgerDashboard(
+      dashboard.ledger.id,
+      state.activityMonth,
+    );
+    state.form.categoryId = category.id;
+    state.categoryEditing = false;
+    state.categoryName = "";
+    showToast(`已添加分类：${category.name}`);
+  } catch (error) {
+    showToast(friendlyError(error, "添加分类失败"));
+  } finally {
     state.pendingAction = undefined;
     render();
   }
@@ -1489,6 +1638,14 @@ async function submitQuickEntry() {
   const amountCents = parseAmountToCents(state.form.amount);
   if (!amountCents || amountCents <= 0) {
     showToast("请输入有效金额");
+    return;
+  }
+  if (!state.form.accountId) {
+    showToast("请选择账户");
+    return;
+  }
+  if (!state.form.categoryId) {
+    showToast("请选择分类");
     return;
   }
 
@@ -1511,6 +1668,7 @@ async function submitQuickEntry() {
     state.analysis = undefined;
     state.form.amount = "";
     state.form.memo = "";
+    state.activityMonth = currentMonthKey();
     await refreshDashboard();
     state.view = "activity";
     showToast(
@@ -1570,6 +1728,18 @@ function friendlyError(error: unknown, fallback: string) {
   if (message.includes("transaction was not found")) {
     return "流水不存在或已被移除";
   }
+  if (message.includes("category already exists")) {
+    return "这个分类已经存在";
+  }
+  if (message.includes("category name is required")) {
+    return "分类名称不能为空且不能超过 24 个字符";
+  }
+  if (message.includes("category direction does not match")) {
+    return "分类与当前收支方向不匹配";
+  }
+  if (message.includes("transaction month must use")) {
+    return "流水月份格式无效";
+  }
   if (message.includes("organization admin accounts cannot use the business app")) {
     return "组织管理员账号只能登录后台，不能用于前台业务";
   }
@@ -1618,6 +1788,19 @@ function formatPeriodMonth(value: string) {
   return periodMonthFormatter.format(new Date(value));
 }
 
+function currentMonthKey() {
+  return transactionMonthKey(new Date().toISOString());
+}
+
+function transactionMonthKey(value: string) {
+  return value.slice(0, 7);
+}
+
+function formatMonthLabel(month: string) {
+  const [year, monthNumber] = month.split("-");
+  return `${year}年${Number(monthNumber)}月`;
+}
+
 function formatCompactNumber(value: number) {
   return new Intl.NumberFormat("zh-CN", {
     maximumFractionDigits: 1,
@@ -1628,6 +1811,8 @@ function accountKindLabel(kind: string) {
   const labels: Record<string, string> = {
     cash: "现金",
     bank: "银行账户",
+    wechat: "微信",
+    alipay: "支付宝",
     company: "公司账户",
     wallet: "电子钱包",
     credit: "信用账户",

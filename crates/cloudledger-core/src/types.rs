@@ -132,6 +132,8 @@ pub enum FinancialAccountKind {
     Cash,
     Bank,
     Wallet,
+    Wechat,
+    Alipay,
     Credit,
     Receivable,
     Payable,

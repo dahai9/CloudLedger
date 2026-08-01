@@ -378,6 +378,7 @@ impl ApiError {
             AppServiceError::UserNotFound
             | AppServiceError::LedgerNotFound
             | AppServiceError::AccountNotFound
+            | AppServiceError::CategoryNotFound
             | AppServiceError::TransactionNotFound => StatusCode::NOT_FOUND,
             AppServiceError::Unauthorized => StatusCode::FORBIDDEN,
             AppServiceError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,

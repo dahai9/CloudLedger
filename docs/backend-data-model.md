@@ -39,9 +39,13 @@ records applied versions and checksums in SQLx's `_sqlx_migrations` table.
   `admin` are backend-only administration markers; `business_owner` and
   `employee` are business roles.
 - `ledgers`: personal or organization-public ledger ownership.
-- `financial_accounts`: account and opening balance within a ledger.
+- `financial_accounts`: account and opening balance within a ledger. New and
+  migrated ledgers expose `wechat`, `alipay`, `bank`, and `cash` as the four
+  standard quick-entry accounts; legacy account kinds remain readable.
+- `categories`: ledger-scoped income or expense classification with a
+  case-insensitive unique name per direction.
 - `transactions`: accounting event, approval state, independent payment state,
-  and approval/payment/receipt actors and timestamps.
+  category, and approval/payment/receipt actors and timestamps.
 - `audit_logs`: actor, action, resource, and immutable event time.
 
 ## Authentication Model
@@ -66,6 +70,21 @@ This is the compatibility adapter for the current service architecture. Future
 high-volume work can replace full snapshot materialization with entity-level
 repositories without changing the relational model or moving authority back to
 SQLite.
+
+## Transaction Browsing
+
+Transaction history is loaded one calendar month at a time through
+`GET /app/transactions?ledgerId=<uuid>&month=YYYY-MM`. The response contains
+the selected month, all available month keys for the ledger, and only that
+month's rows ordered newest first. The general overview contains the current
+month plus any older transactions that still need approval, payment, or receipt
+confirmation, so operational queues remain complete without sending an
+unbounded history on every refresh.
+
+Income and expense transactions reference a ledger category. Migration 0003
+backfills existing transactions to `其他收入` or `其他支出`, adds the foreign-key
+constraint, and seeds common categories. Authorized business users can add a
+category to a ledger; duplicate names in the same direction are rejected.
 
 ## Financial Analysis Model
 
@@ -111,6 +130,8 @@ semantics.
   and only the original applicant can confirm receipt.
 - Payment-state actor/timestamp combinations are constrained in PostgreSQL and
   indexed by ledger plus payment state.
+- Income and expense transactions reference a category from the same ledger and
+  with the matching direction; transfer remains reserved for future work.
 
 ## Legacy Import
 

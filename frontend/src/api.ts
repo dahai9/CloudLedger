@@ -28,10 +28,18 @@ export interface AccountDto {
   currency: string;
 }
 
+export interface CategoryDto {
+  id: string;
+  ledgerId: string;
+  name: string;
+  kind: "income" | "expense";
+}
+
 export interface TransactionDto {
   id: string;
   ledgerId: string;
   accountId: string;
+  categoryId?: string;
   kind: TransactionKind;
   amountMinor: number;
   currency: string;
@@ -62,6 +70,7 @@ export interface LedgerOverview {
   currentUser: UserDto;
   ledgers: LedgerDto[];
   accounts: AccountDto[];
+  categories: CategoryDto[];
   transactions: TransactionDto[];
   auditLogs: AuditLogDto[];
   monthlyIncomeMinor: number;
@@ -69,6 +78,13 @@ export interface LedgerOverview {
   pendingApprovalCount: number;
   pendingPaymentCount: number;
   pendingReceiptCount: number;
+}
+
+export interface TransactionMonthDto {
+  ledgerId: string;
+  month: string;
+  availableMonths: string[];
+  transactions: TransactionDto[];
 }
 
 export interface FinancialAnalysisDto {
@@ -133,10 +149,17 @@ export interface AnalysisExpenseDto {
 export interface CreateTransactionInput {
   ledgerId: string;
   accountId: string;
+  categoryId: string;
   kind: TransactionKind;
   amountMinor: number;
   currency: string;
   description: string;
+}
+
+export interface CreateCategoryInput {
+  ledgerId: string;
+  name: string;
+  kind: "income" | "expense";
 }
 
 export interface DecideApprovalInput {
@@ -164,6 +187,17 @@ export async function createTransaction(
   input: CreateTransactionInput
 ): Promise<TransactionDto> {
   return invoke<TransactionDto>("create_transaction", { input });
+}
+
+export async function loadTransactionsForMonth(
+  ledgerId: string,
+  month?: string,
+): Promise<TransactionMonthDto> {
+  return invoke<TransactionMonthDto>("get_transactions_for_month", { ledgerId, month });
+}
+
+export async function createCategory(input: CreateCategoryInput): Promise<CategoryDto> {
+  return invoke<CategoryDto>("create_category", { input });
 }
 
 export async function decideApproval(

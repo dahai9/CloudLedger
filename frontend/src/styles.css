@@ -130,6 +130,7 @@ button {
 
 .ledger-picker > span,
 .quick-entry label > span,
+.field-label-row > span,
 .amount-field span,
 .profile-form label > span {
   color: var(--muted);
@@ -510,9 +511,50 @@ button {
 
 .amount-field,
 .memo-field,
-.quick-entry label {
+.quick-entry label,
+.form-field {
   display: grid;
   gap: 7px;
+}
+
+.field-label-row {
+  display: flex;
+  min-height: 24px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.icon-button {
+  display: inline-grid;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  cursor: pointer;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--ink);
+  font-size: 20px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.icon-button:hover,
+.icon-button:focus-visible {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.icon-button.is-confirm {
+  background: var(--green);
+  color: #fff;
+}
+
+.icon-button:disabled {
+  cursor: wait;
+  opacity: 0.55;
 }
 
 .amount-field input {
@@ -532,6 +574,21 @@ button {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 10px;
+}
+
+.category-editor {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 32px 32px;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcf8;
+}
+
+.category-editor input {
+  min-width: 0;
 }
 
 @media (max-width: 520px) {
@@ -634,6 +691,37 @@ button {
 
 .filter-tab.is-active {
   background: #fff;
+}
+
+.activity-month-bar {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  margin: 0 12px 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcf8;
+}
+
+.activity-month-bar label,
+.activity-month-bar span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.activity-month-bar select {
+  width: 100%;
+  min-width: 0;
+  min-height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--ink);
 }
 
 .transaction-list,
@@ -1262,6 +1350,15 @@ button {
 }
 
 @media (max-width: 420px) {
+  .activity-panel > .section-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .filter-tabs {
+    width: 100%;
+  }
+
   .analysis-heading {
     align-items: stretch;
     flex-direction: column;

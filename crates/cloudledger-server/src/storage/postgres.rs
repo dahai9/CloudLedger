@@ -1,6 +1,8 @@
 use std::{future::Future, path::Path, pin::Pin, time::Duration};
 
-use cloudledger_core::{AuditLog, FinancialAccount, Ledger, Membership, Money, Organization, User};
+use cloudledger_core::{
+    AuditLog, Category, FinancialAccount, Ledger, Membership, Money, Organization, User,
+};
 use cloudledger_service::{AppLedgerService, AppLedgerSnapshot};
 use serde::{de::DeserializeOwned, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction as PgTransaction};
@@ -182,6 +184,21 @@ impl PostgresStore {
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+        let categories = sqlx::query(
+            "SELECT id, ledger_id, name, kind FROM categories ORDER BY ledger_id, kind, name, id",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(Category {
+                id: row.try_get("id")?,
+                ledger_id: row.try_get("ledger_id")?,
+                name: row.try_get("name")?,
+                kind: enum_from_db(&row.try_get::<String, _>("kind")?)?,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
         let transactions = sqlx::query(
             "SELECT id, ledger_id, account_id, category_id, kind, amount_minor, currency, occurred_at, description, approval_state, payment_state, created_by, submitted_by, approved_by, approved_at, paid_by, paid_at, received_by, received_at, version, created_at, updated_at, deleted_at FROM transactions ORDER BY id",
         )
@@ -247,6 +264,7 @@ impl PostgresStore {
             memberships,
             ledgers,
             accounts,
+            categories,
             transactions,
             audit_logs,
         }))
@@ -321,7 +339,7 @@ where
         sqlx::Executor::execute(
             &mut **transaction,
             sqlx::raw_sql(
-                "DELETE FROM audit_logs; DELETE FROM transactions; DELETE FROM financial_accounts; DELETE FROM ledgers; DELETE FROM organization_memberships; DELETE FROM organizations; DELETE FROM domain_users; DELETE FROM app_metadata;",
+                "DELETE FROM audit_logs; DELETE FROM transactions; DELETE FROM categories; DELETE FROM financial_accounts; DELETE FROM ledgers; DELETE FROM organization_memberships; DELETE FROM organizations; DELETE FROM domain_users; DELETE FROM app_metadata;",
             ),
         )
         .await?;
@@ -389,6 +407,19 @@ where
                     .bind(&account.opening_balance.currency)
                     .bind(account.created_at)
                     .bind(account.deleted_at),
+            )
+            .await?;
+        }
+        for category in &snapshot.categories {
+            sqlx::Executor::execute(
+                &mut **transaction,
+                sqlx::query(
+                    "INSERT INTO categories (id, ledger_id, name, kind) VALUES ($1, $2, $3, $4)",
+                )
+                .bind(category.id)
+                .bind(category.ledger_id)
+                .bind(&category.name)
+                .bind(enum_to_db(category.kind)?),
             )
             .await?;
         }
@@ -569,6 +600,7 @@ mod tests {
             "organization_memberships",
             "ledgers",
             "financial_accounts",
+            "categories",
             "transactions",
             "audit_logs",
             "auth_users",
@@ -589,13 +621,13 @@ mod tests {
         .fetch_one(&store.pool)
         .await
         .expect("read migration version");
-        assert_eq!(migration_version, 2);
+        assert_eq!(migration_version, 3);
         let migration_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE success")
                 .fetch_one(&store.pool)
                 .await
                 .expect("count applied migrations");
-        assert_eq!(migration_count, 2);
+        assert_eq!(migration_count, 3);
         let admin_organization_fk_is_deferred: bool = sqlx::query_scalar(
             "SELECT condeferrable FROM pg_constraint WHERE conname = 'auth_users_organization_id_fkey'",
         )
@@ -621,7 +653,7 @@ mod tests {
                 .fetch_one(&reopened_store.pool)
                 .await
                 .expect("count migrations after reconnect");
-        assert_eq!(migration_count, 2);
+        assert_eq!(migration_count, 3);
         reopened_store.pool.close().await;
 
         reset_public_schema(&database_url).await;

@@ -75,7 +75,15 @@ export interface FinancialAccount {
   id: string;
   ledgerId: string;
   name: string;
-  kind: "cash" | "bank" | "wallet" | "company" | "receivable" | "payable";
+  kind:
+    | "wechat"
+    | "alipay"
+    | "cash"
+    | "bank"
+    | "wallet"
+    | "company"
+    | "receivable"
+    | "payable";
   balanceCents: number;
 }
 
@@ -144,6 +152,8 @@ export interface LedgerDashboard {
   ledger: Ledger;
   accounts: FinancialAccount[];
   categories: Category[];
+  selectedTransactionMonth: string;
+  availableTransactionMonths: string[];
   recentTransactions: Transaction[];
   approvalQueue: ApprovalQueueItem[];
   auditTrail: AuditLogEntry[];

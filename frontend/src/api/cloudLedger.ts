@@ -1,10 +1,12 @@
 import type {
   AccountDto,
   AuditLogDto,
+  CategoryDto,
   FinancialAnalysisDto,
   LedgerDto,
   LedgerOverview,
   TransactionDto,
+  TransactionMonthDto,
 } from "../api";
 import { cloudBaseUrl } from "../config";
 import type {
@@ -32,8 +34,13 @@ export interface CloudLedgerApi {
   getUserSession(): Promise<UserSession>;
   checkCloudStatus(): Promise<UserSession["cloudStatus"]>;
   listLedgers(): Promise<Ledger[]>;
-  getLedgerDashboard(ledgerId: string): Promise<LedgerDashboard>;
+  getLedgerDashboard(ledgerId: string, month?: string): Promise<LedgerDashboard>;
   getFinancialAnalysis(ledgerId: string, months: AnalysisMonths): Promise<FinancialAnalysis>;
+  createCategory(
+    ledgerId: string,
+    name: string,
+    direction: Category["direction"],
+  ): Promise<Category>;
   createTransaction(draft: NewTransactionDraft): Promise<Transaction>;
   decideApproval(
     transactionId: string,
@@ -135,9 +142,13 @@ const serverApi: CloudLedgerApi = {
     return overview.ledgers.map((ledger) => mapLedger(ledger, overview));
   },
 
-  async getLedgerDashboard(ledgerId) {
+  async getLedgerDashboard(ledgerId, month) {
     const overview = await getOverview();
-    return mapDashboard(ledgerId, overview);
+    const monthQuery = month ? `&month=${encodeURIComponent(month)}` : "";
+    const transactionMonth = await authenticatedJson<TransactionMonthDto>(
+      `/app/transactions?ledgerId=${encodeURIComponent(ledgerId)}${monthQuery}`,
+    );
+    return mapDashboard(ledgerId, overview, transactionMonth);
   },
 
   async getFinancialAnalysis(ledgerId, months) {
@@ -145,6 +156,15 @@ const serverApi: CloudLedgerApi = {
       `/app/analytics?ledgerId=${encodeURIComponent(ledgerId)}&months=${months}`,
     );
     return mapFinancialAnalysis(analysis);
+  },
+
+  async createCategory(ledgerId, name, direction) {
+    const category = await authenticatedJson<CategoryDto>("/app/categories", {
+      method: "POST",
+      body: { ledgerId, name, kind: direction },
+    });
+    overviewCache = undefined;
+    return mapCategory(category);
   },
 
   async createTransaction(draft) {
@@ -157,6 +177,7 @@ const serverApi: CloudLedgerApi = {
       body: {
         ledgerId: draft.ledgerId,
         accountId: draft.accountId,
+        categoryId: draft.categoryId,
         kind: draft.direction,
         amountMinor: draft.amountCents,
         currency: account?.currency ?? "CNY",
@@ -367,6 +388,8 @@ function getInstallationId() {
 }
 
 const nowIso = () => new Date().toISOString();
+const transactionMonthKey = (value: string) => value.slice(0, 7);
+const currentMonthKey = () => transactionMonthKey(nowIso());
 
 const mockLedgers: Ledger[] = [
   {
@@ -403,29 +426,57 @@ const mockAccounts: FinancialAccount[] = [
     balanceCents: 34200,
   },
   {
-    id: "wallet",
+    id: "wechat",
     ledgerId: "personal-main",
-    name: "电子钱包",
-    kind: "wallet",
+    name: "微信",
+    kind: "wechat",
     balanceCents: 152220,
+  },
+  {
+    id: "alipay-personal",
+    ledgerId: "personal-main",
+    name: "支付宝",
+    kind: "alipay",
+    balanceCents: 0,
+  },
+  {
+    id: "bank-personal",
+    ledgerId: "personal-main",
+    name: "银行账户",
+    kind: "bank",
+    balanceCents: 0,
+  },
+  {
+    id: "wechat-org",
+    ledgerId: "org-growth",
+    name: "微信",
+    kind: "wechat",
+    balanceCents: 0,
+  },
+  {
+    id: "alipay-org",
+    ledgerId: "org-growth",
+    name: "支付宝",
+    kind: "alipay",
+    balanceCents: 0,
   },
   {
     id: "company-bank",
     ledgerId: "org-growth",
-    name: "公司基本户",
-    kind: "company",
-    balanceCents: 6237000,
+    name: "银行账户",
+    kind: "bank",
+    balanceCents: 8429500,
   },
   {
-    id: "receivable",
+    id: "cash-org",
     ledgerId: "org-growth",
-    name: "应收账款",
-    kind: "receivable",
-    balanceCents: 2192500,
+    name: "现金",
+    kind: "cash",
+    balanceCents: 0,
   },
 ];
 
-const mockCategories: Category[] = [
+let mockCategories: Category[] = [
   { id: "meals", ledgerId: "personal-main", name: "餐饮", direction: "expense" },
   { id: "transport", ledgerId: "personal-main", name: "交通", direction: "expense" },
   { id: "salary", ledgerId: "personal-main", name: "工资", direction: "income" },
@@ -442,7 +493,7 @@ let mockTransactions: Transaction[] = [
     title: "早餐",
     amountCents: 1800,
     direction: "expense",
-    accountName: "电子钱包",
+    accountName: "微信",
     categoryName: "餐饮",
     approvalState: "approved",
     paymentState: "not_applicable",
@@ -458,7 +509,7 @@ let mockTransactions: Transaction[] = [
     title: "地铁",
     amountCents: 600,
     direction: "expense",
-    accountName: "电子钱包",
+    accountName: "微信",
     categoryName: "交通",
     approvalState: "approved",
     paymentState: "not_applicable",
@@ -473,7 +524,7 @@ let mockTransactions: Transaction[] = [
     title: "对象存储月账单",
     amountCents: 98600,
     direction: "expense",
-    accountName: "公司基本户",
+    accountName: "银行账户",
     categoryName: "云资源",
     approvalState: "pending",
     paymentState: "not_applicable",
@@ -489,7 +540,7 @@ let mockTransactions: Transaction[] = [
     title: "企业客户回款",
     amountCents: 320000,
     direction: "income",
-    accountName: "应收账款",
+    accountName: "银行账户",
     categoryName: "合同回款",
     approvalState: "approved",
     paymentState: "not_applicable",
@@ -592,14 +643,29 @@ const mockApi: CloudLedgerApi = {
     return mockLedgers;
   },
 
-  async getLedgerDashboard(ledgerId) {
+  async getLedgerDashboard(ledgerId, month) {
     const ledger = mockLedgers.find((item) => item.id === ledgerId) ?? mockLedgers[0];
+    const selectedMonth = month ?? currentMonthKey();
+    const availableTransactionMonths = Array.from(
+      new Set([
+        currentMonthKey(),
+        selectedMonth,
+        ...mockTransactions
+          .filter((item) => item.ledgerId === ledger.id)
+          .map((item) => transactionMonthKey(item.occurredAt)),
+      ]),
+    ).sort((left, right) => right.localeCompare(left));
     return {
       ledger,
       accounts: mockAccounts.filter((item) => item.ledgerId === ledger.id),
       categories: mockCategories.filter((item) => item.ledgerId === ledger.id),
+      selectedTransactionMonth: selectedMonth,
+      availableTransactionMonths,
       recentTransactions: mockTransactions
-        .filter((item) => item.ledgerId === ledger.id)
+        .filter(
+          (item) =>
+            item.ledgerId === ledger.id && transactionMonthKey(item.occurredAt) === selectedMonth,
+        )
         .sort((a, b) => Date.parse(b.occurredAt) - Date.parse(a.occurredAt)),
       approvalQueue: mockApprovalQueue.filter((item) => item.ledgerId === ledger.id),
       auditTrail: mockAuditTrail.filter((item) => item.ledgerId === ledger.id),
@@ -608,6 +674,28 @@ const mockApi: CloudLedgerApi = {
 
   async getFinancialAnalysis(ledgerId, months) {
     return buildMockFinancialAnalysis(ledgerId, months);
+  },
+
+  async createCategory(ledgerId, name, direction) {
+    const normalizedName = name.trim();
+    if (
+      mockCategories.some(
+        (item) =>
+          item.ledgerId === ledgerId &&
+          item.direction === direction &&
+          item.name.toLocaleLowerCase() === normalizedName.toLocaleLowerCase(),
+      )
+    ) {
+      throw new Error("category already exists");
+    }
+    const category: Category = {
+      id: crypto.randomUUID(),
+      ledgerId,
+      name: normalizedName,
+      direction,
+    };
+    mockCategories = [...mockCategories, category];
+    return category;
   },
 
   async createTransaction(draft) {
@@ -929,13 +1017,19 @@ function buildMockFinancialAnalysis(
   };
 }
 
-function mapDashboard(ledgerId: string, overview: LedgerOverview): LedgerDashboard {
+function mapDashboard(
+  ledgerId: string,
+  overview: LedgerOverview,
+  transactionMonth: TransactionMonthDto,
+): LedgerDashboard {
   const ledgerDto = overview.ledgers.find((item) => item.id === ledgerId) ?? overview.ledgers[0];
   const ledger = mapLedger(ledgerDto, overview);
   const accounts = overview.accounts.filter((item) => item.ledgerId === ledger.id).map(mapAccount);
-  const categories = buildCategories(ledger.id, overview);
-  const recentTransactions = overview.transactions
+  const categories = overview.categories
     .filter((item) => item.ledgerId === ledger.id)
+    .map(mapCategory)
+    .sort((left, right) => left.name.localeCompare(right.name, "zh-CN"));
+  const recentTransactions = transactionMonth.transactions
     .map((item) => mapTransaction(item, overview))
     .sort((a, b) => Date.parse(b.occurredAt) - Date.parse(a.occurredAt));
 
@@ -943,6 +1037,8 @@ function mapDashboard(ledgerId: string, overview: LedgerOverview): LedgerDashboa
     ledger,
     accounts,
     categories,
+    selectedTransactionMonth: transactionMonth.month,
+    availableTransactionMonths: transactionMonth.availableMonths,
     recentTransactions,
     approvalQueue: mapApprovalQueue(ledger.id, overview).sort(
       (a, b) => Date.parse(b.submittedAt) - Date.parse(a.submittedAt),
@@ -1041,24 +1137,18 @@ function mapAccount(account: AccountDto): FinancialAccount {
   };
 }
 
-function buildCategories(ledgerId: string, overview: LedgerOverview): Category[] {
-  const directions = new Set(
-    overview.transactions.filter((item) => item.ledgerId === ledgerId).map((item) => item.kind),
-  );
-  const defaults: Category[] = [
-    { id: `${ledgerId}:expense`, ledgerId, name: "支出", direction: "expense" },
-    { id: `${ledgerId}:income`, ledgerId, name: "收入", direction: "income" },
-  ];
-
-  if (directions.has("transfer")) {
-    defaults.push({ id: `${ledgerId}:transfer`, ledgerId, name: "转账", direction: "expense" });
-  }
-
-  return defaults;
+function mapCategory(category: CategoryDto): Category {
+  return {
+    id: category.id,
+    ledgerId: category.ledgerId,
+    name: category.name,
+    direction: category.kind,
+  };
 }
 
 function mapTransaction(transaction: TransactionDto, overview: LedgerOverview): Transaction {
   const account = overview.accounts.find((item) => item.id === transaction.accountId);
+  const category = overview.categories.find((item) => item.id === transaction.categoryId);
 
   return {
     id: transaction.id,
@@ -1068,7 +1158,7 @@ function mapTransaction(transaction: TransactionDto, overview: LedgerOverview): 
     amountCents: transaction.amountMinor,
     direction: transaction.kind === "income" ? "income" : "expense",
     accountName: account?.name ?? "未知账户",
-    categoryName: transaction.kind === "income" ? "收入" : "支出",
+    categoryName: category?.name ?? (transaction.kind === "income" ? "其他收入" : "其他支出"),
     approvalState: normalizeApprovalState(transaction.approvalState),
     paymentState: transaction.paymentState,
     actorName: transaction.createdBy,
@@ -1115,13 +1205,18 @@ function mapAuditLog(entry: AuditLogDto): AuditLogEntry {
 }
 
 function categoryFromDraft(draft: NewTransactionDraft, overview: LedgerOverview): Category | undefined {
-  return buildCategories(draft.ledgerId, overview).find((category) => category.id === draft.categoryId);
+  return overview.categories
+    .filter((category) => category.ledgerId === draft.ledgerId)
+    .map(mapCategory)
+    .find((category) => category.id === draft.categoryId);
 }
 
 function normalizeAccountKind(kind: string): FinancialAccount["kind"] {
   if (
     kind === "cash" ||
     kind === "bank" ||
+    kind === "wechat" ||
+    kind === "alipay" ||
     kind === "wallet" ||
     kind === "company" ||
     kind === "receivable" ||
