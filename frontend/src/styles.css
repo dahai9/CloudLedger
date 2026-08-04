@@ -200,6 +200,11 @@ button {
   outline: none;
 }
 
+.turnstile-slot {
+  min-height: 65px;
+  overflow: hidden;
+}
+
 .quick-entry select,
 .quick-entry input {
   width: 100%;

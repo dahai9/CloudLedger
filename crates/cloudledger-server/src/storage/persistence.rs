@@ -2,7 +2,10 @@ use std::{future::Future, path::PathBuf, pin::Pin};
 
 use cloudledger_service::{AppLedgerService, AppLedgerSnapshot};
 
-use crate::auth::{AuthService, AuthSnapshot};
+use crate::{
+    audit::SecurityAuditEvent,
+    auth::{AuthService, AuthSnapshot},
+};
 
 use super::PostgresStore;
 
@@ -19,6 +22,18 @@ pub struct JsonStore {
 }
 
 impl BackendStore {
+    pub(crate) fn append_security_event(
+        &self,
+        event: SecurityAuditEvent,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            match self {
+                Self::Postgres(store) => store.append_security_event(event).await,
+                Self::Json(_) => Ok(()),
+            }
+        })
+    }
+
     pub(crate) fn json(ledger_state_path: PathBuf, auth_state_path: PathBuf) -> Self {
         Self::Json(JsonStore {
             ledger_state_path,

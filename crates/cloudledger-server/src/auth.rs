@@ -9,8 +9,10 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
-use rand_core::OsRng;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
@@ -43,6 +45,8 @@ pub enum AuthError {
     InvalidCredentials,
     #[error("too many login attempts; try again in {retry_after_seconds} seconds")]
     LoginRateLimited { retry_after_seconds: u64 },
+    #[error("turnstile_required")]
+    TurnstileRequired,
     #[error("organization admin accounts cannot use the business app")]
     BusinessAppAccessDenied,
     #[error("business accounts cannot use the organization admin backend")]
@@ -51,6 +55,8 @@ pub enum AuthError {
     AdminOrganizationRequired,
     #[error("session was not found")]
     SessionNotFound,
+    #[error("refresh token replay detected; session family revoked")]
+    RefreshReplayDetected,
     #[error("password hashing failed")]
     PasswordHashFailed,
     #[error("storage error: {0}")]
@@ -166,27 +172,43 @@ pub(crate) struct StoredUser {
     #[serde(default)]
     pub(crate) organization_id: Option<Uuid>,
     pub(crate) created_at: OffsetDateTime,
+    #[serde(default = "unix_epoch")]
+    pub(crate) updated_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SessionKind {
     #[default]
-    App,
+    #[serde(alias = "app")]
+    Tauri,
+    Web,
     Admin,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct StoredSession {
+    #[serde(default)]
+    pub(crate) id: Uuid,
+    #[serde(default)]
+    pub(crate) family_id: Uuid,
     pub(crate) user_id: Uuid,
     pub(crate) installation_id: String,
+    /// Hex-encoded SHA-256 digest. Raw bearer material never enters snapshots.
     pub(crate) access_token: String,
     pub(crate) refresh_token: String,
     #[serde(default)]
     pub(crate) kind: SessionKind,
     pub(crate) created_at: OffsetDateTime,
-    pub(crate) refreshed_at: OffsetDateTime,
+    #[serde(default = "unix_epoch")]
+    pub(crate) access_expires_at: OffsetDateTime,
+    #[serde(default)]
+    pub(crate) refresh_expires_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub(crate) rotated_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub(crate) revoked_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -325,6 +347,7 @@ impl AuthService {
             return Err(AuthError::PhoneAlreadyRegistered);
         }
 
+        let now = OffsetDateTime::now_utc();
         let user = StoredUser {
             id: input.user_id.unwrap_or_else(Uuid::new_v4),
             display_name,
@@ -333,7 +356,8 @@ impl AuthService {
             password_hash: hash_password(&password)?,
             account_kind: AccountKind::Business,
             organization_id: None,
-            created_at: OffsetDateTime::now_utc(),
+            created_at: now,
+            updated_at: now,
         };
         self.bind_installation(&installation_id, user.id)?;
         if let Some(email) = &user.email {
@@ -344,7 +368,7 @@ impl AuthService {
         }
         let user_id = user.id;
         self.users_by_id.insert(user_id, user);
-        self.issue_session(user_id, installation_id)
+        self.issue_session(user_id, installation_id, Uuid::new_v4(), SessionKind::Tauri)
     }
 
     pub fn create_or_update_admin_user(
@@ -396,6 +420,7 @@ impl AuthService {
             account_kind: input.account_kind,
             organization_id: input.organization_id,
             created_at,
+            updated_at: OffsetDateTime::now_utc(),
         };
         if let Some(email) = &user.email {
             self.user_ids_by_email.insert(email.clone(), user.id);
@@ -420,6 +445,15 @@ impl AuthService {
     }
 
     pub fn login(&mut self, input: LoginInput) -> Result<Session, AuthError> {
+        self.login_for_client(input, SessionKind::Tauri)
+    }
+
+    pub(crate) fn login_for_client(
+        &mut self,
+        input: LoginInput,
+        client_kind: SessionKind,
+    ) -> Result<Session, AuthError> {
+        debug_assert!(client_kind != SessionKind::Admin);
         let email = input.email.and_then(normalize_optional_email);
         let phone = input.phone.and_then(normalize_optional_phone);
         require_login_identifier(&email, &phone)?;
@@ -437,7 +471,7 @@ impl AuthService {
             return Err(AuthError::BusinessAppAccessDenied);
         }
         self.bind_installation(&installation_id, user_id)?;
-        self.issue_session(user_id, installation_id)
+        self.issue_session(user_id, installation_id, Uuid::new_v4(), client_kind)
     }
 
     pub fn admin_login(&mut self, input: AdminLoginInput) -> Result<AdminSession, AuthError> {
@@ -460,36 +494,77 @@ impl AuthService {
     }
 
     pub fn refresh(&mut self, input: RefreshInput) -> Result<Session, AuthError> {
+        self.refresh_for_client(input, SessionKind::Tauri)
+    }
+
+    pub(crate) fn refresh_for_client(
+        &mut self,
+        input: RefreshInput,
+        client_kind: SessionKind,
+    ) -> Result<Session, AuthError> {
         let installation_id = normalize_installation_id(&input.installation_id)?;
+        let refresh_hash = token_digest(input.refresh_token.trim());
         let access_token = self
             .access_tokens_by_refresh_token
-            .remove(input.refresh_token.trim())
+            .get(&refresh_hash)
+            .cloned()
             .ok_or(AuthError::SessionNotFound)?;
         let session = self
             .sessions_by_access_token
-            .remove(&access_token)
+            .get(&access_token)
+            .cloned()
             .ok_or(AuthError::SessionNotFound)?;
-        if session.kind != SessionKind::App {
+        if session.kind != client_kind {
             return Err(AuthError::SessionNotFound);
         }
-        if session_expired(session.refreshed_at, APP_REFRESH_TOKEN_TTL) {
+        if session.rotated_at.is_some() || session.revoked_at.is_some() {
+            self.revoke_family(session.family_id);
+            return Err(AuthError::RefreshReplayDetected);
+        }
+        if session
+            .refresh_expires_at
+            .is_none_or(|expires_at| OffsetDateTime::now_utc() >= expires_at)
+        {
             return Err(AuthError::SessionNotFound);
         }
         if session.installation_id != installation_id {
             return Err(AuthError::InstallationAlreadyBound);
         }
-        self.issue_session(session.user_id, installation_id)
+        if let Some(stored) = self.sessions_by_access_token.get_mut(&access_token) {
+            stored.rotated_at = Some(OffsetDateTime::now_utc());
+        }
+        self.issue_session(
+            session.user_id,
+            installation_id,
+            session.family_id,
+            client_kind,
+        )
     }
 
     pub fn logout(&mut self, access_token: &str) -> Result<(), AuthError> {
         let access_token = normalize_bearer_token(access_token);
+        let access_token = token_digest(access_token);
         let session = self
             .sessions_by_access_token
-            .remove(access_token)
+            .get_mut(&access_token)
             .ok_or(AuthError::SessionNotFound)?;
-        self.access_tokens_by_refresh_token
-            .remove(&session.refresh_token);
+        session.revoked_at = Some(OffsetDateTime::now_utc());
         Ok(())
+    }
+
+    pub fn logout_refresh(&mut self, refresh_token: &str) -> Result<Uuid, AuthError> {
+        let refresh_hash = token_digest(refresh_token);
+        let access_hash = self
+            .access_tokens_by_refresh_token
+            .get(&refresh_hash)
+            .ok_or(AuthError::SessionNotFound)?;
+        let session = self
+            .sessions_by_access_token
+            .get(access_hash)
+            .cloned()
+            .ok_or(AuthError::SessionNotFound)?;
+        self.revoke_family(session.family_id);
+        Ok(session.user_id)
     }
 
     pub fn authenticate_access_token(
@@ -497,14 +572,18 @@ impl AuthService {
         access_token: &str,
     ) -> Result<AuthenticatedSession, AuthError> {
         let access_token = normalize_bearer_token(access_token);
+        let access_token = token_digest(access_token);
         let session = self
             .sessions_by_access_token
-            .get(access_token)
+            .get(&access_token)
             .ok_or(AuthError::InvalidCredentials)?;
-        if session.kind != SessionKind::App {
+        if !matches!(session.kind, SessionKind::Tauri | SessionKind::Web)
+            || session.rotated_at.is_some()
+            || session.revoked_at.is_some()
+        {
             return Err(AuthError::InvalidCredentials);
         }
-        if session_expired(session.refreshed_at, APP_ACCESS_TOKEN_TTL) {
+        if OffsetDateTime::now_utc() >= session.access_expires_at {
             return Err(AuthError::InvalidCredentials);
         }
         let user = self
@@ -525,14 +604,15 @@ impl AuthService {
         access_token: &str,
     ) -> Result<AdminAuthenticatedSession, AuthError> {
         let access_token = normalize_bearer_token(access_token);
+        let access_token = token_digest(access_token);
         let session = self
             .sessions_by_access_token
-            .get(access_token)
+            .get(&access_token)
             .ok_or(AuthError::InvalidCredentials)?;
-        if session.kind != SessionKind::Admin {
+        if session.kind != SessionKind::Admin || session.revoked_at.is_some() {
             return Err(AuthError::InvalidCredentials);
         }
-        if session_expired(session.created_at, ADMIN_SESSION_TTL) {
+        if OffsetDateTime::now_utc() >= session.access_expires_at {
             return Err(AuthError::InvalidCredentials);
         }
         let user = self
@@ -563,6 +643,7 @@ impl AuthService {
 
         user.account_kind = AccountKind::OrganizationAdmin;
         user.organization_id = Some(organization_id);
+        user.updated_at = OffsetDateTime::now_utc();
         self.revoke_user_sessions(user_id);
         true
     }
@@ -571,21 +652,31 @@ impl AuthService {
         self.users_by_id.get(&user_id).map(|user| user.account_kind)
     }
 
+    pub fn organization_id(&self, user_id: Uuid) -> Option<Uuid> {
+        self.users_by_id
+            .get(&user_id)
+            .and_then(|user| user.organization_id)
+    }
+
     pub fn update_profile(
         &mut self,
         access_token: &str,
         input: UpdateProfileInput,
     ) -> Result<AuthenticatedSession, AuthError> {
         let access_token = normalize_bearer_token(access_token);
+        let access_token = token_digest(access_token);
         let session = self
             .sessions_by_access_token
-            .get(access_token)
+            .get(&access_token)
             .ok_or(AuthError::InvalidCredentials)?
             .clone();
-        if session.kind != SessionKind::App {
+        if !matches!(session.kind, SessionKind::Tauri | SessionKind::Web)
+            || session.rotated_at.is_some()
+            || session.revoked_at.is_some()
+        {
             return Err(AuthError::InvalidCredentials);
         }
-        if session_expired(session.refreshed_at, APP_ACCESS_TOKEN_TTL) {
+        if OffsetDateTime::now_utc() >= session.access_expires_at {
             return Err(AuthError::InvalidCredentials);
         }
         let display_name = normalize_display_name(&input.display_name)?;
@@ -597,6 +688,7 @@ impl AuthService {
             return Err(AuthError::BusinessAppAccessDenied);
         }
         user.display_name = display_name;
+        user.updated_at = OffsetDateTime::now_utc();
         Ok(AuthenticatedSession {
             user: auth_user_dto(user),
             installation_id: session.installation_id,
@@ -646,6 +738,8 @@ impl AuthService {
         &mut self,
         user_id: Uuid,
         installation_id: String,
+        family_id: Uuid,
+        kind: SessionKind,
     ) -> Result<Session, AuthError> {
         self.prune_expired_sessions();
         let user = self
@@ -653,21 +747,28 @@ impl AuthService {
             .get(&user_id)
             .ok_or(AuthError::InvalidCredentials)?;
         let now = OffsetDateTime::now_utc();
-        let access_token = format!("access_{}", Uuid::new_v4());
-        let refresh_token = format!("refresh_{}", Uuid::new_v4());
+        let access_token = random_token();
+        let refresh_token = random_token();
+        let access_token_hash = token_digest(&access_token);
+        let refresh_token_hash = token_digest(&refresh_token);
         let stored = StoredSession {
+            id: Uuid::new_v4(),
+            family_id,
             user_id,
             installation_id: installation_id.clone(),
-            access_token: access_token.clone(),
-            refresh_token: refresh_token.clone(),
-            kind: SessionKind::App,
+            access_token: access_token_hash.clone(),
+            refresh_token: refresh_token_hash.clone(),
+            kind,
             created_at: now,
-            refreshed_at: now,
+            access_expires_at: now + APP_ACCESS_TOKEN_TTL,
+            refresh_expires_at: Some(now + APP_REFRESH_TOKEN_TTL),
+            rotated_at: None,
+            revoked_at: None,
         };
         self.access_tokens_by_refresh_token
-            .insert(refresh_token.clone(), access_token.clone());
+            .insert(refresh_token_hash, access_token_hash.clone());
         self.sessions_by_access_token
-            .insert(access_token.clone(), stored);
+            .insert(access_token_hash, stored);
         Ok(Session {
             user: auth_user_dto(user),
             access_token,
@@ -686,17 +787,23 @@ impl AuthService {
             .organization_id
             .ok_or(AuthError::AdminOrganizationRequired)?;
         let now = OffsetDateTime::now_utc();
-        let access_token = format!("admin_access_{}", Uuid::new_v4());
+        let access_token = random_token();
+        let access_token_hash = token_digest(&access_token);
         self.sessions_by_access_token.insert(
-            access_token.clone(),
+            access_token_hash.clone(),
             StoredSession {
+                id: Uuid::new_v4(),
+                family_id: Uuid::new_v4(),
                 user_id,
                 installation_id: String::new(),
-                access_token: access_token.clone(),
+                access_token: access_token_hash,
                 refresh_token: String::new(),
                 kind: SessionKind::Admin,
                 created_at: now,
-                refreshed_at: now,
+                access_expires_at: now + ADMIN_SESSION_TTL,
+                refresh_expires_at: None,
+                rotated_at: None,
+                revoked_at: None,
             },
         );
         Ok(AdminSession {
@@ -707,19 +814,10 @@ impl AuthService {
     }
 
     fn revoke_user_sessions(&mut self, user_id: Uuid) {
-        let access_tokens = self
-            .sessions_by_access_token
-            .iter()
-            .filter_map(|(access_token, session)| {
-                (session.user_id == user_id).then_some(access_token.clone())
-            })
-            .collect::<Vec<_>>();
-        for access_token in access_tokens {
-            if let Some(session) = self.sessions_by_access_token.remove(&access_token) {
-                if !session.refresh_token.is_empty() {
-                    self.access_tokens_by_refresh_token
-                        .remove(&session.refresh_token);
-                }
+        let now = OffsetDateTime::now_utc();
+        for session in self.sessions_by_access_token.values_mut() {
+            if session.user_id == user_id {
+                session.revoked_at = Some(now);
             }
         }
         self.installations_by_id
@@ -731,28 +829,43 @@ impl AuthService {
             .sessions_by_access_token
             .iter()
             .filter_map(|(access_token, session)| {
-                let expired = match session.kind {
-                    SessionKind::App => {
-                        session_expired(session.refreshed_at, APP_REFRESH_TOKEN_TTL)
-                    }
-                    SessionKind::Admin => session_expired(session.created_at, ADMIN_SESSION_TTL),
-                };
+                let expired = session
+                    .refresh_expires_at
+                    .unwrap_or(session.access_expires_at)
+                    <= OffsetDateTime::now_utc();
                 expired.then_some(access_token.clone())
             })
             .collect::<Vec<_>>();
         for access_token in expired_access_tokens {
             if let Some(session) = self.sessions_by_access_token.remove(&access_token) {
-                if !session.refresh_token.is_empty() {
-                    self.access_tokens_by_refresh_token
-                        .remove(&session.refresh_token);
-                }
+                self.access_tokens_by_refresh_token
+                    .remove(&session.refresh_token);
+            }
+        }
+    }
+
+    fn revoke_family(&mut self, family_id: Uuid) {
+        let now = OffsetDateTime::now_utc();
+        for session in self.sessions_by_access_token.values_mut() {
+            if session.family_id == family_id {
+                session.revoked_at = Some(now);
             }
         }
     }
 }
 
-fn session_expired(timestamp: OffsetDateTime, ttl: Duration) -> bool {
-    OffsetDateTime::now_utc() - timestamp >= ttl
+fn random_token() -> String {
+    let mut token = [0_u8; 32];
+    OsRng.fill_bytes(&mut token);
+    URL_SAFE_NO_PAD.encode(token)
+}
+
+pub(crate) fn token_digest(token: &str) -> String {
+    hex::encode(Sha256::digest(token.trim().as_bytes()))
+}
+
+fn unix_epoch() -> OffsetDateTime {
+    OffsetDateTime::UNIX_EPOCH
 }
 
 fn hash_password(password: &str) -> Result<String, AuthError> {
@@ -946,9 +1059,9 @@ mod tests {
             .is_err());
 
         auth.sessions_by_access_token
-            .get_mut(&admin_session.access_token)
+            .get_mut(&token_digest(&admin_session.access_token))
             .expect("stored admin session")
-            .created_at = OffsetDateTime::now_utc() - Duration::hours(9);
+            .access_expires_at = OffsetDateTime::now_utc() - Duration::seconds(1);
         assert!(auth
             .authenticate_admin_access_token(&admin_session.access_token)
             .is_err());
@@ -1085,6 +1198,46 @@ mod tests {
                 .id,
             refreshed.user.id
         );
+        assert_eq!(
+            auth.refresh(RefreshInput {
+                refresh_token: first.refresh_token,
+                installation_id: "phone-1".to_string(),
+            })
+            .unwrap_err(),
+            AuthError::RefreshReplayDetected
+        );
+        assert!(auth
+            .authenticate_access_token(&refreshed.access_token)
+            .is_err());
+    }
+
+    #[test]
+    fn raw_tokens_are_32_random_bytes_and_never_enter_snapshots() {
+        let mut auth = AuthService::default();
+        let session = auth
+            .register(RegisterInput {
+                user_id: None,
+                display_name: "Alice".to_string(),
+                email: Some("alice@example.com".to_string()),
+                phone: None,
+                password: "correct-password".to_string(),
+                installation_id: "phone-1".to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            URL_SAFE_NO_PAD.decode(&session.access_token).unwrap().len(),
+            32
+        );
+        assert_eq!(
+            URL_SAFE_NO_PAD
+                .decode(&session.refresh_token)
+                .unwrap()
+                .len(),
+            32
+        );
+        let snapshot = serde_json::to_string(&auth.snapshot().sessions).unwrap();
+        assert!(!snapshot.contains(&session.access_token));
+        assert!(!snapshot.contains(&session.refresh_token));
     }
 
     #[test]
@@ -1101,9 +1254,9 @@ mod tests {
             })
             .unwrap();
         auth.sessions_by_access_token
-            .get_mut(&first.access_token)
+            .get_mut(&token_digest(&first.access_token))
             .expect("stored app session")
-            .refreshed_at = OffsetDateTime::now_utc() - Duration::minutes(16);
+            .access_expires_at = OffsetDateTime::now_utc() - Duration::seconds(1);
         assert!(auth.authenticate_access_token(&first.access_token).is_err());
 
         let refreshed = auth
@@ -1113,9 +1266,9 @@ mod tests {
             })
             .expect("refresh within refresh-token lifetime");
         auth.sessions_by_access_token
-            .get_mut(&refreshed.access_token)
+            .get_mut(&token_digest(&refreshed.access_token))
             .expect("stored refreshed session")
-            .refreshed_at = OffsetDateTime::now_utc() - Duration::days(31);
+            .refresh_expires_at = Some(OffsetDateTime::now_utc() - Duration::seconds(1));
         assert_eq!(
             auth.refresh(RefreshInput {
                 refresh_token: refreshed.refresh_token,

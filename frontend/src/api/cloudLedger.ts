@@ -9,6 +9,7 @@ import type {
   TransactionMonthDto,
 } from "../api";
 import { cloudBaseUrl } from "../config";
+import { invoke } from "@tauri-apps/api/core";
 import type {
   ApprovalQueueItem,
   AnalysisMonths,
@@ -29,6 +30,7 @@ import type {
 export interface CloudLedgerApi {
   getStoredSession(): AuthSession | undefined;
   login(input: LoginDraft): Promise<UserSession>;
+  getLoginSecurity(): Promise<LoginSecurity>;
   updateProfile(input: UpdateProfileDraft): Promise<UserSession>;
   logout(): Promise<void>;
   getUserSession(): Promise<UserSession>;
@@ -52,16 +54,35 @@ export interface CloudLedgerApi {
   listApprovalQueue(ledgerId: string): Promise<ApprovalQueueItem[]>;
   listAuditTrail(ledgerId: string): Promise<AuditLogEntry[]>;
   isAuthRequired(error: unknown): boolean;
+  isTurnstileRequired(error: unknown): boolean;
+}
+
+export interface LoginSecurity {
+  turnstileEnabled: boolean;
+  turnstileSiteKey?: string;
 }
 
 let overviewCache: LedgerOverview | undefined;
-const sessionStorageKey = "cloudledger.session";
 const installationStorageKey = "cloudledger.installationId";
+const isTauriRuntime =
+  "__TAURI_INTERNALS__" in window || window.location.hostname === "tauri.localhost";
+let memorySession: AuthSession | undefined;
+let sessionRestoreAttempted = false;
 
 class AuthRequiredError extends Error {
   constructor(message = "请先登录") {
     super(message);
     this.name = "AuthRequiredError";
+  }
+}
+
+class HttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+  ) {
+    super(code || `HTTP ${status}`);
+    this.name = "HttpError";
   }
 }
 
@@ -72,17 +93,26 @@ const getOverview = async () => {
 
 const serverApi: CloudLedgerApi = {
   getStoredSession() {
-    return loadStoredSession();
+    return memorySession;
   },
 
   async login(input) {
-    const session = await authJson("/auth/login", authPayload(input));
-    storeSession(session);
+    const session = await authJson(
+      isTauriRuntime ? "/auth/tauri/login" : "/auth/web/login",
+      authPayload(input),
+    );
+    await storeSession(session);
     overviewCache = undefined;
     return {
       currentUser: session.user,
       cloudStatus: await fetchCloudStatus(),
     };
+  },
+
+  async getLoginSecurity() {
+    const response = await cloudFetch("/auth/security");
+    if (!response.ok) throw await responseError(response);
+    return response.json() as Promise<LoginSecurity>;
   },
 
   async updateProfile(input) {
@@ -93,9 +123,9 @@ const serverApi: CloudLedgerApi = {
         body: { displayName: input.displayName.trim() },
       },
     );
-    const session = loadStoredSession();
+    const session = memorySession;
     if (session) {
-      storeSession({
+      memorySession = normalizeSession({
         ...session,
         user: me.user,
         installationId: me.installationId,
@@ -110,23 +140,30 @@ const serverApi: CloudLedgerApi = {
 
   async logout() {
     try {
-      await authenticatedJson("/auth/logout", { method: "POST", empty: true });
+      if (isTauriRuntime) {
+        await authenticatedJson("/auth/tauri/logout", { method: "POST", empty: true });
+      } else {
+        const response = await cloudFetch("/auth/web/logout", { method: "POST" });
+        if (!response.ok && response.status !== 401) throw await responseError(response);
+      }
     } catch (error) {
       if (!serverApi.isAuthRequired(error)) {
         throw error;
       }
     } finally {
-      clearSession();
+      await clearSession();
       overviewCache = undefined;
     }
   },
 
   async getUserSession() {
-    const session = loadStoredSession();
+    const session = await restoreSession();
     if (!session) {
       throw new AuthRequiredError();
     }
-    const me = await authenticatedJson<{ user: AuthSession["user"]; installationId: string }>("/auth/me");
+    const me = await authenticatedJson<{ user: AuthSession["user"]; installationId: string }>(
+      isTauriRuntime ? "/auth/tauri/me" : "/auth/me",
+    );
     return {
       currentUser: me.user,
       cloudStatus: await fetchCloudStatus(),
@@ -232,6 +269,10 @@ const serverApi: CloudLedgerApi = {
   isAuthRequired(error) {
     return error instanceof AuthRequiredError;
   },
+
+  isTurnstileRequired(error) {
+    return error instanceof HttpError && error.status === 428 && error.code === "turnstile_required";
+  },
 };
 
 interface JsonRequestOptions {
@@ -249,6 +290,7 @@ function authPayload(input: LoginDraft) {
     phone: isEmail ? undefined : identifier,
     password: input.password,
     installationId: getInstallationId(),
+    turnstileToken: input.turnstileToken,
   };
 }
 
@@ -269,7 +311,7 @@ async function authenticatedJson<T>(
   options: JsonRequestOptions = {},
   allowRefresh = true,
 ): Promise<T> {
-  const session = loadStoredSession();
+  const session = memorySession;
   if (!session) {
     throw new AuthRequiredError();
   }
@@ -284,13 +326,13 @@ async function authenticatedJson<T>(
   });
 
   if (response.status === 401 && allowRefresh) {
-    await refreshStoredSession(session);
+      await refreshStoredSession(session);
     return authenticatedJson<T>(path, options, false);
   }
 
   if (!response.ok) {
     if (response.status === 401) {
-      clearSession();
+      await clearSession();
       throw new AuthRequiredError();
     }
     throw await responseError(response);
@@ -304,61 +346,94 @@ async function authenticatedJson<T>(
 }
 
 async function refreshStoredSession(session: AuthSession) {
-  const response = await cloudFetch("/auth/refresh", {
+  const path = isTauriRuntime ? "/auth/tauri/refresh" : "/auth/web/refresh";
+  const response = await cloudFetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      refreshToken: session.refreshToken,
-      installationId: session.installationId,
-    }),
+    credentials: "include",
+    body: isTauriRuntime
+      ? JSON.stringify({
+          refreshToken: session.refreshToken,
+          installationId: session.installationId,
+        })
+      : JSON.stringify({ installationId: session.installationId }),
   });
 
   if (!response.ok) {
-    clearSession();
+    await clearSession();
     throw new AuthRequiredError();
   }
 
-  storeSession(normalizeSession((await response.json()) as AuthSession));
+  await storeSession(normalizeSession((await response.json()) as AuthSession));
 }
 
 async function responseError(response: Response) {
   const body = (await response.json().catch(() => ({}))) as { error?: string };
-  return new Error(body.error || `HTTP ${response.status}`);
+  return new HttpError(response.status, body.error ?? "");
 }
 
 async function cloudFetch(path: string, init?: RequestInit) {
   try {
-    return await fetch(`${cloudBaseUrl}${path}`, init);
+    return await fetch(`${cloudBaseUrl}${path}`, {
+      credentials: isTauriRuntime ? init?.credentials : "include",
+      ...init,
+    });
   } catch (error) {
     const detail = error instanceof DOMException && error.name === "AbortError" ? "请求超时" : "网络请求失败";
     throw new Error(`无法连接后端 ${cloudBaseUrl}（${detail}）`, { cause: error });
   }
 }
 
-function loadStoredSession(): AuthSession | undefined {
-  const raw = window.localStorage.getItem(sessionStorageKey);
-  if (!raw) {
-    return undefined;
+async function restoreSession(): Promise<AuthSession | undefined> {
+  if (memorySession || sessionRestoreAttempted) return memorySession;
+  sessionRestoreAttempted = true;
+  if (isTauriRuntime) {
+    const secure = await invoke<{ refreshToken: string; installationId: string } | null>(
+      "secure_session_load",
+    );
+    if (secure) {
+      await refreshStoredSession({
+        accessToken: "",
+        refreshToken: secure.refreshToken,
+        installationId: secure.installationId,
+        user: { id: "", displayName: "" },
+      });
+    }
+  } else {
+    try {
+      await refreshStoredSession({
+        accessToken: "",
+        installationId: getInstallationId(),
+        user: { id: "", displayName: "" },
+      });
+    } catch (error) {
+      if (!(error instanceof AuthRequiredError)) throw error;
+    }
   }
+  return memorySession;
+}
 
-  try {
-    return normalizeSession(JSON.parse(raw) as AuthSession);
-  } catch {
-    clearSession();
-    return undefined;
+async function storeSession(session: AuthSession) {
+  const normalized = normalizeSession(session);
+  memorySession = normalized;
+  if (isTauriRuntime && normalized.refreshToken) {
+    await invoke("secure_session_store", {
+      refreshToken: normalized.refreshToken,
+      installationId: normalized.installationId,
+    });
   }
 }
 
-function storeSession(session: AuthSession) {
-  window.localStorage.setItem(sessionStorageKey, JSON.stringify(normalizeSession(session)));
-}
-
-function clearSession() {
-  window.localStorage.removeItem(sessionStorageKey);
+async function clearSession() {
+  memorySession = undefined;
+  sessionRestoreAttempted = true;
+  if (isTauriRuntime) {
+    await invoke("secure_session_clear");
+  }
 }
 
 function normalizeSession(session: AuthSession): AuthSession {
-  if (!session.accessToken || !session.refreshToken || !session.installationId || !session.user?.id) {
+  if (!session.accessToken || !session.installationId || !session.user?.id) {
     throw new AuthRequiredError("登录状态无效");
   }
 
@@ -617,6 +692,10 @@ const mockApi: CloudLedgerApi = {
     };
   },
 
+  async getLoginSecurity() {
+    return { turnstileEnabled: false };
+  },
+
   async updateProfile(input) {
     return {
       currentUser: { id: "demo-user", displayName: input.displayName.trim() || "Alice" },
@@ -820,6 +899,10 @@ const mockApi: CloudLedgerApi = {
   },
 
   isAuthRequired() {
+    return false;
+  },
+
+  isTurnstileRequired() {
     return false;
   },
 };

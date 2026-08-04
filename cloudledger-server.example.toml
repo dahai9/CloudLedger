@@ -1,12 +1,18 @@
 [server]
-api_bind_addr = "0.0.0.0:8787"
+mode = "reverse_proxy"
+api_bind_addr = "127.0.0.1:8787"
 admin_bind_addr = "127.0.0.1:8788"
+public_api_url = "https://api.ledger.example.com"
+public_admin_url = "https://admin.ledger.example.com"
+allow_insecure_lan = false
+web_login_enabled = false
 data_dir = ".cloudledger-server"
 
 [database]
 # The database and login must exist before CloudLedger starts. Percent-encode
 # reserved characters in the username or password.
 url = "postgres://cloudledger:change-this-password@127.0.0.1:5432/cloudledger"
+auto_migrate = false
 max_connections = 10
 connect_timeout_seconds = 10
 
@@ -17,13 +23,26 @@ path = ""
 token = ""
 
 [security.login]
+turnstile_after_failures = 3
 max_failures_per_login = 5
 max_failures_per_ip = 20
 window_seconds = 900
 lockout_seconds = 900
 
 [security.turnstile]
-# Configure both keys when the admin service is reachable beyond loopback.
+# Production requires both keys. Secrets never belong in frontend config.
 site_key = ""
 secret_key = ""
 verify_url = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+
+[security.network]
+# Caddy is on the same host. Only peers in this list may supply X-Forwarded-For.
+trusted_proxy_cidrs = ["127.0.0.1/32", "::1/128"]
+cors_allowed_origins = ["tauri://localhost", "https://tauri.localhost"]
+
+[security.audit]
+# Leave empty only for the first secure initialization. CloudLedger generates
+# 32-byte keys and rewrites this private config file. Back it up before launch.
+key_id = ""
+hmac_key = ""
+identifier_hmac_key = ""

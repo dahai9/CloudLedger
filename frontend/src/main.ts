@@ -31,6 +31,8 @@ interface QuickEntryForm {
 interface AuthForm {
   identifier: string;
   password: string;
+  turnstileToken: string;
+  turnstileSiteKey?: string;
 }
 
 interface ProfileForm {
@@ -100,6 +102,7 @@ const state: AppState = {
   authForm: {
     identifier: "",
     password: "",
+    turnstileToken: "",
   },
   profileForm: {
     displayName: "",
@@ -119,6 +122,7 @@ const periodMonthFormatter = new Intl.DateTimeFormat("zh-CN", {
 });
 const autoRefreshMs = 10_000;
 let autoRefreshInFlight = false;
+let turnstileScriptPromise: Promise<void> | undefined;
 
 void loadInitialState();
 window.setInterval(() => {
@@ -215,10 +219,30 @@ async function submitAuthForm() {
     state.loading = true;
     state.pendingAction = "auth";
     render();
-    const draft: LoginDraft = { identifier, password };
+    const draft: LoginDraft = {
+      identifier,
+      password,
+      turnstileToken: state.authForm.turnstileToken || undefined,
+    };
     await cloudLedgerApi.login(draft);
+    state.authForm.turnstileToken = "";
+    state.authForm.turnstileSiteKey = undefined;
     await loadInitialState();
   } catch (error) {
+    if (cloudLedgerApi.isTurnstileRequired(error)) {
+      try {
+        const security = await cloudLedgerApi.getLoginSecurity();
+        if (security.turnstileEnabled && security.turnstileSiteKey) {
+          state.authForm.turnstileToken = "";
+          state.authForm.turnstileSiteKey = security.turnstileSiteKey;
+          return;
+        }
+      } catch {
+        showToast("人机验证服务暂时不可用");
+        return;
+      }
+    }
+    state.authForm.turnstileToken = "";
     showToast(friendlyError(error, "登录失败"));
   } finally {
     state.loading = false;
@@ -476,6 +500,14 @@ function render() {
   `;
 
   bindEvents();
+  if (state.authStatus === "anonymous" && state.authForm.turnstileSiteKey) {
+    void mountTurnstile().catch(() => {
+      turnstileScriptPromise = undefined;
+      state.authForm.turnstileToken = "";
+      state.authForm.turnstileSiteKey = undefined;
+      showToast("人机验证服务暂时不可用");
+    });
+  }
 }
 
 function pickDefaultLedgerId(ledgers: Ledger[]) {
@@ -603,12 +635,70 @@ function renderLogin() {
             value="${escapeHtml(state.authForm.password)}"
           />
         </label>
-        <button class="primary-button" type="submit" ${state.loading ? "disabled" : ""}>
+        ${
+          state.authForm.turnstileSiteKey
+            ? '<div class="turnstile-slot" id="businessTurnstile"></div>'
+            : ""
+        }
+        <button class="primary-button" type="submit" ${
+          state.loading || (state.authForm.turnstileSiteKey && !state.authForm.turnstileToken)
+            ? "disabled"
+            : ""
+        }>
           ${state.pendingAction === "auth" ? "处理中" : "登录"}
         </button>
       </form>
     </section>
   `;
+}
+
+async function mountTurnstile() {
+  const target = app.querySelector<HTMLElement>("#businessTurnstile");
+  const sitekey = state.authForm.turnstileSiteKey;
+  if (!target || !sitekey) return;
+  await loadTurnstileScript();
+  if (!window.turnstile || !target.isConnected || target.childElementCount > 0) return;
+  window.turnstile.render(target, {
+    sitekey,
+    action: "business-login",
+    callback(token) {
+      state.authForm.turnstileToken = token;
+      app.querySelector<HTMLButtonElement>("#authForm button[type='submit']")?.removeAttribute(
+        "disabled",
+      );
+    },
+    "expired-callback"() {
+      state.authForm.turnstileToken = "";
+      app.querySelector<HTMLButtonElement>("#authForm button[type='submit']")?.setAttribute(
+        "disabled",
+        "",
+      );
+    },
+    "error-callback"() {
+      state.authForm.turnstileToken = "";
+      app.querySelector<HTMLButtonElement>("#authForm button[type='submit']")?.setAttribute(
+        "disabled",
+        "",
+      );
+    },
+  });
+}
+
+function loadTurnstileScript(): Promise<void> {
+  if (window.turnstile) return Promise.resolve();
+  if (turnstileScriptPromise) return turnstileScriptPromise;
+  turnstileScriptPromise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+    script.async = true;
+    script.defer = true;
+    script.addEventListener("load", () => resolve(), { once: true });
+    script.addEventListener("error", () => reject(new Error("turnstile script unavailable")), {
+      once: true,
+    });
+    document.head.append(script);
+  });
+  return turnstileScriptPromise;
 }
 
 function renderLedgerSwitchButton(ledger: Ledger) {

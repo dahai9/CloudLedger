@@ -7,10 +7,12 @@ use std::{
 use cloudledger_service::AppLedgerService;
 use uuid::Uuid;
 
+use crate::audit::AuditSigner;
 use crate::auth::AuthService;
 use crate::config::BackendConfig;
-use crate::login_protection::{LoginProtection, LoginProtectionConfig};
+use crate::login_protection::{LoginProtectionConfig, SharedLoginProtection};
 use crate::platform_auth::PlatformSessions;
+use crate::request_security::RequestSecurity;
 use crate::storage::{BackendStore, PostgresStore};
 use crate::turnstile::TurnstileVerifier;
 
@@ -28,19 +30,25 @@ pub struct ServerState {
     pub(crate) write_gate: Arc<tokio::sync::Mutex<()>>,
     pub ledger_service: Arc<Mutex<AppLedgerService>>,
     pub auth_service: Arc<Mutex<AuthService>>,
-    pub login_protection: Arc<Mutex<LoginProtection>>,
+    pub login_protection: Arc<SharedLoginProtection>,
     pub platform_sessions: Arc<Mutex<PlatformSessions>>,
     pub admin_token: Arc<String>,
     pub admin_path: Arc<String>,
     pub turnstile: Arc<TurnstileVerifier>,
+    pub request_security: RequestSecurity,
+    pub cors_allowed_origins: Arc<Vec<String>>,
+    pub web_login_enabled: bool,
 }
 
 struct StateInitialization {
     data_dir: PathBuf,
     admin_token: String,
     admin_path: String,
-    login_protection_config: LoginProtectionConfig,
+    login_protection: SharedLoginProtection,
     turnstile: TurnstileVerifier,
+    request_security: RequestSecurity,
+    cors_allowed_origins: Vec<String>,
+    web_login_enabled: bool,
     ledger_service: AppLedgerService,
     auth_service: AuthService,
     storage: BackendStore,
@@ -53,7 +61,11 @@ impl ServerState {
         fs::create_dir_all(&data_dir)?;
         let ledger_state_path = data_dir.join(LEDGER_STATE_FILE);
         let auth_state_path = data_dir.join(AUTH_STATE_FILE);
-        let postgres = PostgresStore::connect(&config.database).await?;
+        let postgres = PostgresStore::connect_with_audit(
+            &config.database,
+            AuditSigner::from_config(&config.security.audit)?,
+        )
+        .await?;
         let (ledger_service, mut auth_service, imported_legacy) = postgres
             .load_or_import(&ledger_state_path, &auth_state_path)
             .await?;
@@ -65,12 +77,20 @@ impl ServerState {
         if migrate_organization_admin_accounts(&ledger_service, &mut auth_service) {
             postgres.save_auth(auth_service.snapshot()).await?;
         }
+        let login_protection = SharedLoginProtection::postgres(
+            postgres.pool(),
+            LoginProtectionConfig::from_settings(&config.security.login),
+            config.security.audit.identifier_hmac_key_bytes()?,
+        );
         Self::load_with_security(StateInitialization {
             data_dir,
             admin_token: config.admin.token.clone(),
             admin_path: config.admin.path.clone(),
-            login_protection_config: LoginProtectionConfig::from_settings(&config.security.login),
+            login_protection,
             turnstile: TurnstileVerifier::from_config(&config.security.turnstile)?,
+            request_security: RequestSecurity::from_config(&config.security.network),
+            cors_allowed_origins: config.security.network.cors_allowed_origins.clone(),
+            web_login_enabled: config.server.web_login_enabled,
             ledger_service,
             auth_service,
             storage: BackendStore::Postgres(postgres),
@@ -88,12 +108,19 @@ impl ServerState {
         if migrate_organization_admin_accounts(&ledger_service, &mut auth_service) {
             auth_service.save_to_path(&auth_state_path)?;
         }
+        let login_protection = SharedLoginProtection::memory(
+            LoginProtectionConfig::from_settings(&config.security.login),
+            config.security.audit.identifier_hmac_key_bytes()?,
+        );
         Self::load_with_security(StateInitialization {
             data_dir,
             admin_token: config.admin.token,
             admin_path: config.admin.path,
-            login_protection_config: LoginProtectionConfig::from_settings(&config.security.login),
+            login_protection,
             turnstile: TurnstileVerifier::from_config(&config.security.turnstile)?,
+            request_security: RequestSecurity::from_config(&config.security.network),
+            cors_allowed_origins: config.security.network.cors_allowed_origins.clone(),
+            web_login_enabled: config.server.web_login_enabled,
             ledger_service,
             auth_service,
             storage: BackendStore::json(ledger_state_path, auth_state_path),
@@ -105,8 +132,11 @@ impl ServerState {
             data_dir,
             admin_token,
             admin_path,
-            login_protection_config,
+            login_protection,
             turnstile,
+            request_security,
+            cors_allowed_origins,
+            web_login_enabled,
             ledger_service,
             auth_service,
             storage,
@@ -124,11 +154,14 @@ impl ServerState {
             write_gate: Arc::new(tokio::sync::Mutex::new(())),
             ledger_service: Arc::new(Mutex::new(ledger_service)),
             auth_service: Arc::new(Mutex::new(auth_service)),
-            login_protection: Arc::new(Mutex::new(LoginProtection::new(login_protection_config))),
+            login_protection: Arc::new(login_protection),
             platform_sessions: Arc::new(Mutex::new(PlatformSessions::default())),
             admin_token: Arc::new(admin_token),
             admin_path: Arc::new(admin_path),
             turnstile: Arc::new(turnstile),
+            request_security,
+            cors_allowed_origins: Arc::new(cors_allowed_origins),
+            web_login_enabled,
             data_dir,
         })
     }

@@ -13,4 +13,16 @@ interface Window {
   readonly __CLOUDLEDGER_CONFIG__?: {
     readonly apiBaseUrl?: string;
   };
+  readonly turnstile?: {
+    render(
+      target: HTMLElement,
+      options: {
+        sitekey: string;
+        action: string;
+        callback(token: string): void;
+        "expired-callback"(): void;
+        "error-callback"(): void;
+      },
+    ): string;
+  };
 }

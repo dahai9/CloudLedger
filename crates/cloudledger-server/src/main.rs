@@ -1,24 +1,67 @@
 use std::{ffi::OsString, net::SocketAddr, path::PathBuf};
 
-use cloudledger_server::config::{BackendConfig, DEFAULT_CONFIG_PATH};
+use cloudledger_server::{
+    audit::AuditSigner,
+    config::{BackendConfig, RunMode, DEFAULT_CONFIG_PATH},
+    storage::PostgresStore,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config_path = parse_config_path(std::env::args_os().skip(1))?;
+    let (command, config_path) = parse_command(std::env::args_os().skip(1))?;
     let config = BackendConfig::load_or_create(&config_path)?;
+    if command == Command::Migrate {
+        let migration_url = std::env::var("CLOUDLEDGER_MIGRATION_DATABASE_URL").map_err(|_| {
+            anyhow::anyhow!(
+                "CLOUDLEDGER_MIGRATION_DATABASE_URL is required for the one-time migrate command"
+            )
+        })?;
+        config.validate_migration_database_url(&migration_url)?;
+        let mut migration_database = config.database.clone();
+        migration_database.url = migration_url;
+        migration_database.auto_migrate = true;
+        let store = PostgresStore::connect_with_audit(
+            &migration_database,
+            AuditSigner::from_config(&config.security.audit)?,
+        )
+        .await?;
+        let report = store.verify_audit().await?;
+        println!(
+            "migration complete; audit chains: {}, events: {}",
+            report.chains, report.events
+        );
+        return Ok(());
+    }
+    if command == Command::AuditVerify {
+        let store = PostgresStore::connect_with_audit(
+            &config.database,
+            AuditSigner::from_config(&config.security.audit)?,
+        )
+        .await?;
+        let report = store.verify_audit().await?;
+        println!("{}", serde_json::to_string(&report)?);
+        return Ok(());
+    }
     let addr = config.server.api_bind_addr;
     let admin_addr = config.server.admin_bind_addr;
     let state = cloudledger_server::ServerState::load_from_config(&config).await?;
 
+    if config.server.mode == RunMode::Development && config.server.allow_insecure_lan {
+        eprintln!(
+            "WARNING: INSECURE DEVELOPMENT LAN MODE ENABLED; credentials and data may cross plaintext HTTP"
+        );
+    }
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
     println!(
-        "cloudledger-server API listening on http://{addr} with server id {}",
-        state.server_id
+        "cloudledger-server API listening on http://{addr} (public {}) with server id {}",
+        config.server.public_api_url, state.server_id
     );
     println!(
-        "cloudledger-server admin listening on http://{admin_addr}/{}; backend config: {}",
+        "cloudledger-server admin listening on http://{admin_addr}/{} (public {}); backend config: {}",
         state.admin_path,
+        config.server.public_admin_url,
         config_path.display()
     );
     let api_server = axum::serve(
@@ -34,24 +77,40 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn parse_config_path(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<PathBuf> {
-    let mut args = args.into_iter();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Command {
+    Serve,
+    Migrate,
+    AuditVerify,
+}
+
+fn parse_command(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<(Command, PathBuf)> {
+    let mut args = args.into_iter().peekable();
+    let command = if args.peek().is_some_and(|value| value == "audit") {
+        args.next();
+        if args.next().as_deref() != Some(std::ffi::OsStr::new("verify")) {
+            anyhow::bail!("usage: cloudledger-server audit verify [--config <path>]");
+        }
+        Command::AuditVerify
+    } else if args.peek().is_some_and(|value| value == "migrate") {
+        args.next();
+        Command::Migrate
+    } else {
+        Command::Serve
+    };
     let Some(argument) = args.next() else {
-        return Ok(PathBuf::from(DEFAULT_CONFIG_PATH));
+        return Ok((command, PathBuf::from(DEFAULT_CONFIG_PATH)));
     };
     if argument != "--config" {
-        anyhow::bail!(
-            "unknown argument {}; usage: cloudledger-server [--config <path>]",
-            argument.to_string_lossy()
-        );
+        anyhow::bail!("usage: cloudledger-server [migrate|audit verify] [--config <path>]");
     }
     let path = args
         .next()
         .ok_or_else(|| anyhow::anyhow!("--config requires a file path"))?;
     if args.next().is_some() {
-        anyhow::bail!("usage: cloudledger-server [--config <path>]");
+        anyhow::bail!("usage: cloudledger-server [migrate|audit verify] [--config <path>]");
     }
-    Ok(PathBuf::from(path))
+    Ok((command, PathBuf::from(path)))
 }
 
 #[cfg(test)]
@@ -61,13 +120,27 @@ mod tests {
     #[test]
     fn config_path_defaults_and_accepts_override() {
         assert_eq!(
-            parse_config_path(Vec::<OsString>::new()).unwrap(),
-            PathBuf::from(DEFAULT_CONFIG_PATH)
+            parse_command(Vec::<OsString>::new()).unwrap(),
+            (Command::Serve, PathBuf::from(DEFAULT_CONFIG_PATH))
         );
         assert_eq!(
-            parse_config_path([OsString::from("--config"), OsString::from("other.toml")]).unwrap(),
-            PathBuf::from("other.toml")
+            parse_command([OsString::from("migrate")]).unwrap(),
+            (Command::Migrate, PathBuf::from(DEFAULT_CONFIG_PATH))
         );
-        assert!(parse_config_path([OsString::from("--unknown")]).is_err());
+        assert_eq!(
+            parse_command([OsString::from("--config"), OsString::from("other.toml")]).unwrap(),
+            (Command::Serve, PathBuf::from("other.toml"))
+        );
+        assert_eq!(
+            parse_command([
+                OsString::from("audit"),
+                OsString::from("verify"),
+                OsString::from("--config"),
+                OsString::from("other.toml")
+            ])
+            .unwrap(),
+            (Command::AuditVerify, PathBuf::from("other.toml"))
+        );
+        assert!(parse_command([OsString::from("--unknown")]).is_err());
     }
 }

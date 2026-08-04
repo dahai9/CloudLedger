@@ -9,6 +9,7 @@ use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction as PgTran
 use uuid::Uuid;
 
 use crate::{
+    audit::{AuditSigner, SecurityAuditEvent},
     auth::{AuthService, AuthSnapshot, StoredSession, StoredUser},
     config::DatabaseConfig,
 };
@@ -18,20 +19,53 @@ use super::migrations;
 #[derive(Debug, Clone)]
 pub struct PostgresStore {
     pool: PgPool,
+    audit: AuditSigner,
 }
 
 impl PostgresStore {
+    pub(crate) fn pool(&self) -> PgPool {
+        self.pool.clone()
+    }
+
+    pub async fn verify_audit(&self) -> anyhow::Result<crate::audit::AuditVerificationReport> {
+        self.audit.verify(&self.pool).await
+    }
+
+    pub(crate) async fn append_security_event(
+        &self,
+        event: SecurityAuditEvent,
+    ) -> anyhow::Result<()> {
+        let mut transaction = self.pool.begin().await?;
+        self.audit
+            .append(&mut transaction, event.into_append())
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub async fn connect(config: &DatabaseConfig) -> anyhow::Result<Self> {
+        Self::connect_with_audit(config, AuditSigner::development_default()).await
+    }
+
+    pub async fn connect_with_audit(
+        config: &DatabaseConfig,
+        audit: AuditSigner,
+    ) -> anyhow::Result<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(config.max_connections)
             .acquire_timeout(Duration::from_secs(config.connect_timeout_seconds))
             .connect(&config.url)
             .await
             .map_err(|error| anyhow::anyhow!("connect to PostgreSQL: {error}"))?;
-        migrations::migrate(&pool)
-            .await
-            .map_err(|error| anyhow::anyhow!("migrate PostgreSQL schema: {error}"))?;
-        Ok(Self { pool })
+        if config.auto_migrate {
+            migrations::migrate(&pool)
+                .await
+                .map_err(|error| anyhow::anyhow!("migrate PostgreSQL schema: {error}"))?;
+        } else {
+            migrations::ensure_current(&pool).await?;
+        }
+        audit.initialize_legacy(&pool).await?;
+        Ok(Self { pool, audit })
     }
 
     pub async fn load_or_import(
@@ -57,6 +91,9 @@ impl PostgresStore {
     pub(crate) async fn save_ledger(&self, snapshot: AppLedgerSnapshot) -> anyhow::Result<()> {
         let mut transaction = self.pool.begin().await?;
         replace_ledger(&mut transaction, &snapshot).await?;
+        self.audit
+            .append_domain_logs(&mut transaction, &snapshot.audit_logs)
+            .await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -75,6 +112,9 @@ impl PostgresStore {
     ) -> anyhow::Result<()> {
         let mut transaction = self.pool.begin().await?;
         replace_ledger(&mut transaction, &ledger).await?;
+        self.audit
+            .append_domain_logs(&mut transaction, &ledger.audit_logs)
+            .await?;
         replace_auth(&mut transaction, &auth).await?;
         transaction.commit().await?;
         Ok(())
@@ -236,22 +276,39 @@ impl PostgresStore {
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
         let audit_logs = sqlx::query(
-            "SELECT id, organization_id, ledger_id, actor_user_id, action, resource_type, resource_id, summary, created_at FROM audit_logs ORDER BY created_at, id",
+            "SELECT id, scope_key, actor_id, action, resource_type, resource_id, metadata, occurred_at FROM audit_events WHERE (metadata ? 'ledger_id') ORDER BY occurred_at, id",
         )
         .fetch_all(&self.pool)
         .await?
         .into_iter()
         .map(|row| {
+            let metadata: serde_json::Value = row.try_get("metadata")?;
+            let ledger_id = metadata
+                .get("ledger_id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| anyhow::anyhow!("audit event is missing ledger_id"))?
+                .parse()?;
+            let organization_id = row
+                .try_get::<String, _>("scope_key")?
+                .strip_prefix("organization:")
+                .map(str::parse)
+                .transpose()?;
             Ok(AuditLog {
                 id: row.try_get("id")?,
-                organization_id: row.try_get("organization_id")?,
-                ledger_id: row.try_get("ledger_id")?,
-                actor_user_id: row.try_get("actor_user_id")?,
+                organization_id,
+                ledger_id,
+                actor_user_id: row
+                    .try_get::<Option<Uuid>, _>("actor_id")?
+                    .ok_or_else(|| anyhow::anyhow!("audit event is missing actor_id"))?,
                 action: row.try_get("action")?,
                 resource_type: row.try_get("resource_type")?,
                 resource_id: row.try_get("resource_id")?,
-                summary: row.try_get("summary")?,
-                created_at: row.try_get("created_at")?,
+                summary: metadata
+                    .get("summary")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                created_at: row.try_get("occurred_at")?,
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -272,7 +329,7 @@ impl PostgresStore {
 
     async fn load_auth(&self) -> anyhow::Result<AuthService> {
         let users = sqlx::query(
-            "SELECT id, display_name, email, phone, password_hash, account_kind, organization_id, created_at FROM auth_users ORDER BY id",
+            "SELECT id, display_name, email, phone, password_hash, account_kind, organization_id, created_at, updated_at FROM auth_users ORDER BY id",
         )
         .fetch_all(&self.pool)
         .await?
@@ -287,6 +344,7 @@ impl PostgresStore {
                 account_kind: enum_from_db(&row.try_get::<String, _>("account_kind")?)?,
                 organization_id: row.try_get("organization_id")?,
                 created_at: row.try_get("created_at")?,
+                updated_at: row.try_get("updated_at")?,
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -299,25 +357,31 @@ impl PostgresStore {
         .map(|row| Ok((row.try_get("installation_id")?, row.try_get("user_id")?)))
         .collect::<anyhow::Result<Vec<_>>>()?;
         let sessions = sqlx::query(
-            "SELECT access_token, user_id, installation_id, refresh_token, kind, created_at, refreshed_at FROM auth_sessions ORDER BY access_token",
+            "SELECT id, family_id, user_id, installation_id, access_token_hash, refresh_token_hash, client_kind, access_expires_at, refresh_expires_at, created_at, rotated_at, revoked_at FROM auth_sessions ORDER BY id",
         )
         .fetch_all(&self.pool)
         .await?
         .into_iter()
-        .map(|row| {
-            Ok(StoredSession {
+            .map(|row| {
+                Ok(StoredSession {
+                id: row.try_get("id")?,
+                family_id: row.try_get("family_id")?,
                 user_id: row.try_get("user_id")?,
                 installation_id: row
                     .try_get::<Option<String>, _>("installation_id")?
                     .unwrap_or_default(),
-                access_token: row.try_get("access_token")?,
+                access_token: hex::encode(row.try_get::<Vec<u8>, _>("access_token_hash")?),
                 refresh_token: row
-                    .try_get::<Option<String>, _>("refresh_token")?
+                    .try_get::<Option<Vec<u8>>, _>("refresh_token_hash")?
+                    .map(hex::encode)
                     .unwrap_or_default(),
-                kind: enum_from_db(&row.try_get::<String, _>("kind")?)?,
+                kind: enum_from_db(&row.try_get::<String, _>("client_kind")?)?,
                 created_at: row.try_get("created_at")?,
-                refreshed_at: row.try_get("refreshed_at")?,
-            })
+                access_expires_at: row.try_get("access_expires_at")?,
+                refresh_expires_at: row.try_get("refresh_expires_at")?,
+                rotated_at: row.try_get("rotated_at")?,
+                revoked_at: row.try_get("revoked_at")?,
+                })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(AuthService::from_snapshot(AuthSnapshot {
@@ -339,7 +403,7 @@ where
         sqlx::Executor::execute(
             &mut **transaction,
             sqlx::raw_sql(
-                "DELETE FROM audit_logs; DELETE FROM transactions; DELETE FROM categories; DELETE FROM financial_accounts; DELETE FROM ledgers; DELETE FROM organization_memberships; DELETE FROM organizations; DELETE FROM domain_users; DELETE FROM app_metadata;",
+                "DELETE FROM transactions; DELETE FROM categories; DELETE FROM financial_accounts; DELETE FROM ledgers; DELETE FROM organization_memberships; DELETE FROM organizations; DELETE FROM domain_users; DELETE FROM app_metadata;",
             ),
         )
         .await?;
@@ -453,22 +517,6 @@ where
             )
             .await?;
         }
-        for audit in &snapshot.audit_logs {
-            sqlx::Executor::execute(
-                &mut **transaction,
-                sqlx::query("INSERT INTO audit_logs (id, organization_id, ledger_id, actor_user_id, action, resource_type, resource_id, summary, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)")
-                    .bind(audit.id)
-                    .bind(audit.organization_id)
-                    .bind(audit.ledger_id)
-                    .bind(audit.actor_user_id)
-                    .bind(&audit.action)
-                    .bind(&audit.resource_type)
-                    .bind(audit.resource_id)
-                    .bind(&audit.summary)
-                    .bind(audit.created_at),
-            )
-            .await?;
-        }
         sqlx::Executor::execute(
             &mut **transaction,
             sqlx::query("INSERT INTO app_metadata (singleton_id, schema_version, current_user_id) VALUES (1, $1, $2)")
@@ -488,17 +536,15 @@ where
     'connection: 'a,
 {
     Box::pin(async move {
-        sqlx::Executor::execute(
-            &mut **transaction,
-            sqlx::raw_sql(
-                "DELETE FROM auth_sessions; DELETE FROM auth_installations; DELETE FROM auth_users;",
-            ),
+        sqlx::query(
+            "DELETE FROM auth_sessions WHERE COALESCE(refresh_expires_at, access_expires_at) <= CURRENT_TIMESTAMP",
         )
+        .execute(&mut **transaction)
         .await?;
         for user in &snapshot.users {
             sqlx::Executor::execute(
                 &mut **transaction,
-                sqlx::query("INSERT INTO auth_users (id, display_name, email, phone, password_hash, account_kind, organization_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)")
+                sqlx::query("INSERT INTO auth_users (id, display_name, email, phone, password_hash, account_kind, organization_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (id) DO UPDATE SET display_name = EXCLUDED.display_name, email = EXCLUDED.email, phone = EXCLUDED.phone, password_hash = EXCLUDED.password_hash, account_kind = EXCLUDED.account_kind, organization_id = EXCLUDED.organization_id, updated_at = EXCLUDED.updated_at WHERE EXCLUDED.updated_at > auth_users.updated_at")
                     .bind(user.id)
                     .bind(&user.display_name)
                     .bind(&user.email)
@@ -506,7 +552,8 @@ where
                     .bind(&user.password_hash)
                     .bind(enum_to_db(user.account_kind)?)
                     .bind(user.organization_id)
-                    .bind(user.created_at),
+                    .bind(user.created_at)
+                    .bind(user.updated_at),
             )
             .await?;
         }
@@ -514,7 +561,7 @@ where
             sqlx::Executor::execute(
                 &mut **transaction,
                 sqlx::query(
-                    "INSERT INTO auth_installations (installation_id, user_id) VALUES ($1, $2)",
+                    "INSERT INTO auth_installations (installation_id, user_id) VALUES ($1, $2) ON CONFLICT (installation_id) DO NOTHING",
                 )
                 .bind(installation_id)
                 .bind(user_id),
@@ -524,18 +571,25 @@ where
         for session in &snapshot.sessions {
             let installation_id =
                 (!session.installation_id.is_empty()).then_some(session.installation_id.as_str());
-            let refresh_token =
-                (!session.refresh_token.is_empty()).then_some(session.refresh_token.as_str());
+            let access_token_hash = hex::decode(&session.access_token)?;
+            let refresh_token_hash = (!session.refresh_token.is_empty())
+                .then(|| hex::decode(&session.refresh_token))
+                .transpose()?;
             sqlx::Executor::execute(
                 &mut **transaction,
-                sqlx::query("INSERT INTO auth_sessions (access_token, user_id, installation_id, refresh_token, kind, created_at, refreshed_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
-                    .bind(&session.access_token)
+                sqlx::query("INSERT INTO auth_sessions (id, family_id, user_id, installation_id, access_token_hash, refresh_token_hash, client_kind, access_expires_at, refresh_expires_at, created_at, rotated_at, revoked_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (id) DO UPDATE SET rotated_at = COALESCE(auth_sessions.rotated_at, EXCLUDED.rotated_at), revoked_at = COALESCE(auth_sessions.revoked_at, EXCLUDED.revoked_at)")
+                    .bind(session.id)
+                    .bind(session.family_id)
                     .bind(session.user_id)
                     .bind(installation_id)
-                    .bind(refresh_token)
+                    .bind(access_token_hash)
+                    .bind(refresh_token_hash)
                     .bind(enum_to_db(session.kind)?)
+                    .bind(session.access_expires_at)
+                    .bind(session.refresh_expires_at)
                     .bind(session.created_at)
-                    .bind(session.refreshed_at),
+                    .bind(session.rotated_at)
+                    .bind(session.revoked_at),
             )
             .await?;
         }
@@ -579,6 +633,7 @@ mod tests {
 
         let config = DatabaseConfig {
             url: database_url.clone(),
+            auto_migrate: true,
             max_connections: 4,
             connect_timeout_seconds: 10,
         };
@@ -602,10 +657,13 @@ mod tests {
             "financial_accounts",
             "categories",
             "transactions",
-            "audit_logs",
+            "audit_logs_legacy",
+            "audit_events",
             "auth_users",
             "auth_installations",
             "auth_sessions",
+            "login_failure_buckets",
+            "security_rate_limits",
         ];
         for table in EXPECTED_TABLES {
             let relation: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
@@ -621,13 +679,13 @@ mod tests {
         .fetch_one(&store.pool)
         .await
         .expect("read migration version");
-        assert_eq!(migration_version, 3);
+        assert_eq!(migration_version, 4);
         let migration_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE success")
                 .fetch_one(&store.pool)
                 .await
                 .expect("count applied migrations");
-        assert_eq!(migration_count, 3);
+        assert_eq!(migration_count, 4);
         let admin_organization_fk_is_deferred: bool = sqlx::query_scalar(
             "SELECT condeferrable FROM pg_constraint WHERE conname = 'auth_users_organization_id_fkey'",
         )
@@ -653,7 +711,7 @@ mod tests {
                 .fetch_one(&reopened_store.pool)
                 .await
                 .expect("count migrations after reconnect");
-        assert_eq!(migration_count, 3);
+        assert_eq!(migration_count, 4);
         reopened_store.pool.close().await;
 
         reset_public_schema(&database_url).await;
@@ -767,6 +825,7 @@ mod tests {
         );
 
         store.pool.close().await;
+        reset_public_schema(&database_url).await;
 
         let mut workflow_ledger = AppLedgerService::seeded();
         let business_owner_id = workflow_ledger.current_user_id();
@@ -846,6 +905,118 @@ mod tests {
         assert!(persisted.paid_at.is_some());
         assert_eq!(persisted.received_by, Some(employee_id));
         assert!(persisted.received_at.is_some());
+
+        let audit_report = restarted_store
+            .verify_audit()
+            .await
+            .expect("verify intact audit chains");
+        assert!(audit_report.events > 0);
+        assert!(sqlx::query("UPDATE audit_events SET action = 'tampered'")
+            .execute(&restarted_store.pool)
+            .await
+            .is_err());
+
+        let mut session_auth = AuthService::default();
+        let session_user_id = Uuid::new_v4();
+        session_auth
+            .create_or_update_admin_user(AdminCreateUserInput {
+                user_id: session_user_id,
+                display_name: "Session User".to_string(),
+                email: Some("session-user@example.com".to_string()),
+                phone: None,
+                password: Some("integration-password".to_string()),
+                account_kind: AccountKind::Business,
+                organization_id: None,
+            })
+            .expect("create session user");
+        let mut second_instance_auth = session_auth.clone();
+        let raw_session = session_auth
+            .login(crate::auth::LoginInput {
+                email: Some("session-user@example.com".to_string()),
+                phone: None,
+                password: "integration-password".to_string(),
+                installation_id: "integration-device".to_string(),
+            })
+            .expect("issue secure session");
+        restarted_store
+            .save_auth(session_auth.snapshot())
+            .await
+            .expect("persist secure session");
+        let second_raw_session = second_instance_auth
+            .login(crate::auth::LoginInput {
+                email: Some("session-user@example.com".to_string()),
+                phone: None,
+                password: "integration-password".to_string(),
+                installation_id: "second-integration-device".to_string(),
+            })
+            .expect("issue session from a stale second instance");
+        restarted_store
+            .save_auth(second_instance_auth.snapshot())
+            .await
+            .expect("merge second instance auth state");
+        let (_, merged_auth, _) = restarted_store
+            .load_or_import(&ledger_path, &auth_path)
+            .await
+            .expect("reload merged auth state");
+        assert!(merged_auth
+            .authenticate_access_token(&raw_session.access_token)
+            .is_ok());
+        assert!(merged_auth
+            .authenticate_access_token(&second_raw_session.access_token)
+            .is_ok());
+        let stored_tokens: (String, Option<String>) = sqlx::query_as(
+            "SELECT encode(access_token_hash, 'hex'), encode(refresh_token_hash, 'hex') FROM auth_sessions WHERE access_token_hash = decode($1, 'hex')",
+        )
+        .bind(crate::auth::token_digest(&raw_session.access_token))
+        .fetch_one(&restarted_store.pool)
+        .await
+        .expect("read token digests");
+        assert_ne!(stored_tokens.0, raw_session.access_token);
+        assert_ne!(
+            stored_tokens.1.as_deref(),
+            Some(raw_session.refresh_token.as_str())
+        );
+        assert_eq!(stored_tokens.0.len(), 64);
+        assert_eq!(stored_tokens.1.as_deref().map(str::len), Some(64));
+
+        use crate::login_protection::{LoginProtectionConfig, LoginSurface, SharedLoginProtection};
+        let shared_one = SharedLoginProtection::postgres(
+            restarted_store.pool(),
+            LoginProtectionConfig::from_settings(&crate::config::LoginSecurityConfig::default()),
+            [0x44; 32],
+        );
+        let shared_two = SharedLoginProtection::postgres(
+            restarted_store.pool(),
+            LoginProtectionConfig::from_settings(&crate::config::LoginSecurityConfig::default()),
+            [0x44; 32],
+        );
+        let shared_ip = "192.0.2.44".parse().expect("test IP");
+        for _ in 0..3 {
+            shared_one
+                .record_failure(shared_ip, LoginSurface::Business, "shared@example.com")
+                .await
+                .expect("record shared failure");
+        }
+        assert!(shared_two
+            .challenge_required(shared_ip, LoginSurface::Business, "shared@example.com")
+            .await
+            .expect("read shared challenge state"));
+
+        sqlx::query("ALTER TABLE audit_events DISABLE TRIGGER audit_events_reject_update_delete")
+            .execute(&restarted_store.pool)
+            .await
+            .expect("simulate privileged database tampering");
+        sqlx::query(
+            "UPDATE audit_events SET event_hash = decode(repeat('00', 32), 'hex') WHERE id = (SELECT id FROM audit_events ORDER BY scope_key, sequence LIMIT 1)",
+        )
+        .execute(&restarted_store.pool)
+        .await
+        .expect("tamper with one audit hash");
+        sqlx::query("ALTER TABLE audit_events ENABLE TRIGGER audit_events_reject_update_delete")
+            .execute(&restarted_store.pool)
+            .await
+            .expect("restore immutable trigger");
+        assert!(restarted_store.verify_audit().await.is_err());
 
         restarted_store.pool.close().await;
         fs::remove_dir_all(data_dir).expect("remove integration data directory");

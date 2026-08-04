@@ -1,0 +1,48 @@
+{
+	servers {
+		timeouts {
+			read_body 15s
+			read_header 10s
+			write 30s
+			idle 2m
+		}
+	}
+}
+
+{$CLOUDLEDGER_API_DOMAIN} {
+	request_body {
+		max_size 64KB
+	}
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+	reverse_proxy 127.0.0.1:8787 {
+		header_up X-Forwarded-For {http.request.remote.host}
+		header_up X-Forwarded-Proto https
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 30s
+		}
+	}
+}
+
+{$CLOUDLEDGER_ADMIN_DOMAIN} {
+	request_body {
+		max_size 64KB
+	}
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+	reverse_proxy 127.0.0.1:8788 {
+		header_up X-Forwarded-For {http.request.remote.host}
+		header_up X-Forwarded-Proto https
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 30s
+		}
+	}
+}

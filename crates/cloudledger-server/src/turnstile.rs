@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::config::{TurnstileConfig, DEFAULT_TURNSTILE_VERIFY_URL};
 
-const EXPECTED_ACTION: &str = "admin-login";
+const DEFAULT_EXPECTED_ACTION: &str = "admin-login";
 
 #[derive(Debug, Error)]
 pub enum TurnstileError {
@@ -72,6 +72,16 @@ impl TurnstileVerifier {
     }
 
     pub async fn verify(&self, token: &str, remote_ip: IpAddr) -> Result<(), TurnstileError> {
+        self.verify_for_action(token, remote_ip, DEFAULT_EXPECTED_ACTION)
+            .await
+    }
+
+    pub async fn verify_for_action(
+        &self,
+        token: &str,
+        remote_ip: IpAddr,
+        expected_action: &str,
+    ) -> Result<(), TurnstileError> {
         let Some(secret_key) = self.secret_key.as_deref() else {
             return Ok(());
         };
@@ -98,7 +108,7 @@ impl TurnstileVerifier {
             .json::<TurnstileVerificationResponse>()
             .await
             .map_err(|_| TurnstileError::Unavailable)?;
-        if verification.success && verification.action.as_deref() == Some(EXPECTED_ACTION) {
+        if verification.success && verification.action.as_deref() == Some(expected_action) {
             Ok(())
         } else {
             Err(TurnstileError::Rejected)
@@ -147,7 +157,7 @@ mod tests {
             serde_json::from_str(r#"{"success":false,"error-codes":["invalid-input-response"]}"#)
                 .expect("rejected response");
         assert!(success.success);
-        assert_eq!(success.action.as_deref(), Some(EXPECTED_ACTION));
+        assert_eq!(success.action.as_deref(), Some(DEFAULT_EXPECTED_ACTION));
         assert!(!rejected.success);
     }
 
@@ -163,7 +173,9 @@ mod tests {
         let app = Router::new()
             .route(
                 "/ok",
-                post(|| async { Json(json!({"success": true, "action": EXPECTED_ACTION})) }),
+                post(|| async {
+                    Json(json!({"success": true, "action": DEFAULT_EXPECTED_ACTION}))
+                }),
             )
             .route(
                 "/wrong-action",

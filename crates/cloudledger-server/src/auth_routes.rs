@@ -1,9 +1,9 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 
 use axum::{
-    extract::{ConnectInfo, State},
+    extract::{Extension, State},
     http::{
-        header::{AUTHORIZATION, RETRY_AFTER},
+        header::{AUTHORIZATION, COOKIE, RETRY_AFTER, SET_COOKIE},
         HeaderMap, HeaderValue, StatusCode,
     },
     response::{IntoResponse, Response},
@@ -13,21 +13,59 @@ use cloudledger_service::{AppEnsureUserIdentityInput, AppServiceError};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    audit::SecurityAuditEvent,
     auth::{
         AuthError, AuthService, AuthenticatedSession, LoginInput, RefreshInput, Session,
-        UpdateProfileInput,
+        SessionKind, UpdateProfileInput,
     },
-    login_protection::LoginSurface,
+    login_protection::{LoginSurface, SecurityRateKind},
+    request_security::RequestContext,
+    turnstile::TurnstileError,
     ServerState,
 };
 
-pub async fn login(
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+const WEB_REFRESH_COOKIE: &str = "__Host-cloudledger_refresh";
+
+pub async fn auth_security(State(state): State<ServerState>) -> Json<AuthSecurityResponse> {
+    Json(AuthSecurityResponse {
+        turnstile_enabled: state.turnstile.is_enabled(),
+        turnstile_site_key: state.turnstile.site_key().map(str::to_string),
+    })
+}
+
+pub async fn tauri_login(
+    Extension(context): Extension<RequestContext>,
     State(state): State<ServerState>,
     Json(request): Json<LoginRequest>,
 ) -> Result<Json<Session>, ApiError> {
+    login_for_client(&state, context.client_ip, request, SessionKind::Tauri)
+        .await
+        .map(Json)
+}
+
+async fn login_for_client(
+    state: &ServerState,
+    client_ip: IpAddr,
+    request: LoginRequest,
+    client_kind: SessionKind,
+) -> Result<Session, ApiError> {
     let identifier = login_identifier(request.email.as_deref(), request.phone.as_deref());
-    check_login_attempt(&state, peer_addr.ip(), LoginSurface::Business, &identifier)?;
+    check_login_attempt(state, client_ip, LoginSurface::Business, &identifier).await?;
+    if state
+        .login_protection
+        .challenge_required(client_ip, LoginSurface::Business, &identifier)
+        .await
+        .map_err(ApiError::from_storage)?
+    {
+        if request.turnstile_token.trim().is_empty() {
+            return Err(ApiError::from_auth(AuthError::TurnstileRequired));
+        }
+        state
+            .turnstile
+            .verify_for_action(&request.turnstile_token, client_ip, "business-login")
+            .await
+            .map_err(ApiError::from_turnstile)?;
+    }
     let _write_guard = state.write_gate.lock().await;
 
     let (login_result, staged_auth) = {
@@ -36,35 +74,38 @@ pub async fn login(
             .lock()
             .map_err(|_| ApiError::internal("auth service lock poisoned"))?;
         let mut staged_auth = auth.clone();
-        let result = staged_auth.login(LoginInput {
-            email: request.email,
-            phone: request.phone,
-            password: request.password,
-            installation_id: request.installation_id,
-        });
+        let result = staged_auth.login_for_client(
+            LoginInput {
+                email: request.email,
+                phone: request.phone,
+                password: request.password,
+                installation_id: request.installation_id,
+            },
+            client_kind,
+        );
         (result, staged_auth)
     };
     let session = match login_result {
         Ok(session) => {
-            record_login_success(&state, peer_addr.ip(), LoginSurface::Business, &identifier)?;
+            record_login_success(state, client_ip, LoginSurface::Business, &identifier).await?;
             session
         }
         Err(AuthError::InvalidCredentials) => {
             if let Some(error) =
-                record_login_failure(&state, peer_addr.ip(), LoginSurface::Business, &identifier)?
+                record_login_failure(state, client_ip, LoginSurface::Business, &identifier).await?
             {
                 return Err(ApiError::from_auth(error));
             }
             return Err(ApiError::from_auth(AuthError::InvalidCredentials));
         }
         Err(error) => {
-            record_login_success(&state, peer_addr.ip(), LoginSurface::Business, &identifier)?;
+            record_login_success(state, client_ip, LoginSurface::Business, &identifier).await?;
             return Err(ApiError::from_auth(error));
         }
     };
 
     persist_auth_and_ledger_identity(
-        &state,
+        state,
         staged_auth,
         &AuthenticatedSession {
             user: session.user.clone(),
@@ -72,13 +113,32 @@ pub async fn login(
         },
     )
     .await?;
-    Ok(Json(session))
+    append_session_audit(state, &session, "session_issued", client_kind).await?;
+    Ok(session)
 }
 
-pub async fn refresh(
+pub async fn tauri_refresh(
+    Extension(context): Extension<RequestContext>,
     State(state): State<ServerState>,
     Json(request): Json<RefreshRequest>,
 ) -> Result<Json<Session>, ApiError> {
+    refresh_for_client(&state, context.client_ip, request, SessionKind::Tauri)
+        .await
+        .map(Json)
+}
+
+async fn refresh_for_client(
+    state: &ServerState,
+    client_ip: IpAddr,
+    request: RefreshRequest,
+    client_kind: SessionKind,
+) -> Result<Session, ApiError> {
+    state
+        .login_protection
+        .check_security_request(SecurityRateKind::Refresh, client_ip)
+        .await
+        .map_err(ApiError::from_storage)?
+        .map_err(ApiError::from_auth)?;
     let _write_guard = state.write_gate.lock().await;
     let (session, staged_auth) = {
         let auth = state
@@ -87,15 +147,18 @@ pub async fn refresh(
             .map_err(|_| ApiError::internal("auth service lock poisoned"))?;
         let mut staged_auth = auth.clone();
         let session = staged_auth
-            .refresh(RefreshInput {
-                refresh_token: request.refresh_token,
-                installation_id: request.installation_id,
-            })
+            .refresh_for_client(
+                RefreshInput {
+                    refresh_token: request.refresh_token,
+                    installation_id: request.installation_id,
+                },
+                client_kind,
+            )
             .map_err(ApiError::from_auth)?;
         (session, staged_auth)
     };
     persist_auth_and_ledger_identity(
-        &state,
+        state,
         staged_auth,
         &AuthenticatedSession {
             user: session.user.clone(),
@@ -103,7 +166,40 @@ pub async fn refresh(
         },
     )
     .await?;
-    Ok(Json(session))
+    append_session_audit(state, &session, "session_rotated", client_kind).await?;
+    Ok(session)
+}
+
+pub async fn web_login(
+    Extension(context): Extension<RequestContext>,
+    State(state): State<ServerState>,
+    Json(request): Json<LoginRequest>,
+) -> Result<Response, ApiError> {
+    require_web_login(&state, context)?;
+    let session = login_for_client(&state, context.client_ip, request, SessionKind::Web).await?;
+    Ok(web_session_response(session, false))
+}
+
+pub async fn web_refresh(
+    Extension(context): Extension<RequestContext>,
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<WebRefreshRequest>,
+) -> Result<Response, ApiError> {
+    require_web_login(&state, context)?;
+    let refresh_token = cookie_value(&headers, WEB_REFRESH_COOKIE)
+        .ok_or_else(|| ApiError::unauthorized("refresh cookie required"))?;
+    let session = refresh_for_client(
+        &state,
+        context.client_ip,
+        RefreshRequest {
+            refresh_token,
+            installation_id: request.installation_id,
+        },
+        SessionKind::Web,
+    )
+    .await?;
+    Ok(web_session_response(session, false))
 }
 
 pub async fn me(
@@ -147,11 +243,12 @@ pub async fn update_me(
     }))
 }
 
-pub async fn logout(
+pub async fn tauri_logout(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let token = bearer_token(&headers)?;
+    let authenticated = authenticate(&state, &headers)?;
     let _write_guard = state.write_gate.lock().await;
     let staged_auth = {
         let auth = state
@@ -171,7 +268,156 @@ pub async fn logout(
         .auth_service
         .lock()
         .map_err(|_| ApiError::internal("auth service lock poisoned"))? = staged_auth;
+    state
+        .storage
+        .append_security_event(SecurityAuditEvent {
+            scope_key: business_audit_scope(authenticated.user.organization_id),
+            actor_type: "business_user".to_string(),
+            actor_id: Some(authenticated.user.id),
+            action: "session_revoked".to_string(),
+            resource_type: "session".to_string(),
+            resource_id: None,
+            metadata: serde_json::json!({"client_kind": "tauri"}),
+        })
+        .await
+        .map_err(ApiError::from_storage)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn append_session_audit(
+    state: &ServerState,
+    session: &Session,
+    action: &str,
+    client_kind: SessionKind,
+) -> Result<(), ApiError> {
+    let client_kind = match client_kind {
+        SessionKind::Tauri => "tauri",
+        SessionKind::Web => "web",
+        SessionKind::Admin => "admin",
+    };
+    state
+        .storage
+        .append_security_event(SecurityAuditEvent {
+            scope_key: business_audit_scope(session.user.organization_id),
+            actor_type: "business_user".to_string(),
+            actor_id: Some(session.user.id),
+            action: action.to_string(),
+            resource_type: "session".to_string(),
+            resource_id: None,
+            metadata: serde_json::json!({"client_kind": client_kind}),
+        })
+        .await
+        .map_err(ApiError::from_storage)
+}
+
+pub async fn web_logout(
+    Extension(context): Extension<RequestContext>,
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    require_web_login(&state, context)?;
+    if let Some(refresh_token) = cookie_value(&headers, WEB_REFRESH_COOKIE) {
+        let _write_guard = state.write_gate.lock().await;
+        let (user_id, organization_id, staged_auth) = {
+            let auth = state
+                .auth_service
+                .lock()
+                .map_err(|_| ApiError::internal("auth service lock poisoned"))?;
+            let mut staged_auth = auth.clone();
+            let user_id = staged_auth
+                .logout_refresh(&refresh_token)
+                .map_err(ApiError::from_auth)?;
+            let organization_id = staged_auth.organization_id(user_id);
+            (user_id, organization_id, staged_auth)
+        };
+        state
+            .storage
+            .save_auth(staged_auth.snapshot())
+            .await
+            .map_err(ApiError::from_storage)?;
+        *state
+            .auth_service
+            .lock()
+            .map_err(|_| ApiError::internal("auth service lock poisoned"))? = staged_auth;
+        state
+            .storage
+            .append_security_event(SecurityAuditEvent {
+                scope_key: business_audit_scope(organization_id),
+                actor_type: "business_user".to_string(),
+                actor_id: Some(user_id),
+                action: "session_revoked".to_string(),
+                resource_type: "session".to_string(),
+                resource_id: None,
+                metadata: serde_json::json!({"client_kind": "web"}),
+            })
+            .await
+            .map_err(ApiError::from_storage)?;
+    }
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().insert(
+        SET_COOKIE,
+        HeaderValue::from_static(
+            "__Host-cloudledger_refresh=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict",
+        ),
+    );
+    Ok(response)
+}
+
+fn business_audit_scope(organization_id: Option<uuid::Uuid>) -> String {
+    organization_id
+        .map(|organization_id| format!("organization:{organization_id}"))
+        .unwrap_or_else(|| "platform".to_string())
+}
+
+pub async fn legacy_upgrade() -> Response {
+    (
+        StatusCode::UPGRADE_REQUIRED,
+        Json(ErrorResponse {
+            error: "client_upgrade_required".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+fn require_web_login(state: &ServerState, context: RequestContext) -> Result<(), ApiError> {
+    if !state.web_login_enabled {
+        return Err(ApiError::not_found("web login is disabled"));
+    }
+    if !context.forwarded_https {
+        return Err(ApiError::bad_request("web login requires HTTPS"));
+    }
+    Ok(())
+}
+
+fn web_session_response(session: Session, _clear_old_cookie: bool) -> Response {
+    let cookie = format!(
+        "{WEB_REFRESH_COOKIE}={}; Path=/; Max-Age=2592000; Secure; HttpOnly; SameSite=Strict",
+        session.refresh_token
+    );
+    let body = WebSessionResponse {
+        user: session.user,
+        access_token: session.access_token,
+        installation_id: session.installation_id,
+    };
+    let mut response = Json(body).into_response();
+    response.headers_mut().insert(
+        SET_COOKIE,
+        HeaderValue::from_str(&cookie).expect("valid refresh cookie"),
+    );
+    response
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(COOKIE)
+        .and_then(|header| header.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|cookie| {
+                let (key, value) = cookie.trim().split_once('=')?;
+                (key == name).then(|| value.to_string())
+            })
+        })
+        .filter(|value| !value.trim().is_empty())
 }
 
 pub(crate) fn authenticate(
@@ -241,7 +487,7 @@ fn login_identifier(email: Option<&str>, phone: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
-fn check_login_attempt(
+async fn check_login_attempt(
     state: &ServerState,
     ip: IpAddr,
     surface: LoginSurface,
@@ -249,26 +495,38 @@ fn check_login_attempt(
 ) -> Result<(), ApiError> {
     state
         .login_protection
-        .lock()
-        .map_err(|_| ApiError::internal("login protection lock poisoned"))?
         .check(ip, surface, identifier)
+        .await
+        .map_err(ApiError::from_storage)?
         .map_err(ApiError::from_auth)
 }
 
-fn record_login_failure(
+async fn record_login_failure(
     state: &ServerState,
     ip: IpAddr,
     surface: LoginSurface,
     identifier: &str,
 ) -> Result<Option<AuthError>, ApiError> {
-    Ok(state
+    let rate_limit = state
         .login_protection
-        .lock()
-        .map_err(|_| ApiError::internal("login protection lock poisoned"))?
-        .record_failure(ip, surface, identifier))
+        .record_failure(ip, surface, identifier)
+        .await
+        .map_err(ApiError::from_storage)?;
+    if rate_limit.is_some() {
+        return Ok(rate_limit);
+    }
+    if state
+        .login_protection
+        .challenge_required(ip, surface, identifier)
+        .await
+        .map_err(ApiError::from_storage)?
+    {
+        return Ok(Some(AuthError::TurnstileRequired));
+    }
+    Ok(None)
 }
 
-fn record_login_success(
+async fn record_login_success(
     state: &ServerState,
     ip: IpAddr,
     surface: LoginSurface,
@@ -276,9 +534,9 @@ fn record_login_success(
 ) -> Result<(), ApiError> {
     state
         .login_protection
-        .lock()
-        .map_err(|_| ApiError::internal("login protection lock poisoned"))?
-        .record_success(ip, surface, identifier);
+        .record_success(ip, surface, identifier)
+        .await
+        .map_err(ApiError::from_storage)?;
     Ok(())
 }
 
@@ -289,6 +547,8 @@ pub struct LoginRequest {
     phone: Option<String>,
     password: String,
     installation_id: String,
+    #[serde(default)]
+    turnstile_token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,6 +556,19 @@ pub struct LoginRequest {
 pub struct RefreshRequest {
     refresh_token: String,
     installation_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebRefreshRequest {
+    installation_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthSecurityResponse {
+    turnstile_enabled: bool,
+    turnstile_site_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -308,6 +581,14 @@ pub struct UpdateProfileRequest {
 #[serde(rename_all = "camelCase")]
 pub struct MeResponse {
     user: crate::auth::AuthUserDto,
+    installation_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebSessionResponse {
+    user: crate::auth::AuthUserDto,
+    access_token: String,
     installation_id: String,
 }
 
@@ -333,6 +614,22 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+            retry_after_seconds: None,
+        }
+    }
+
+    pub(crate) fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+            retry_after_seconds: None,
+        }
+    }
+
     pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -349,8 +646,11 @@ impl ApiError {
             _ => None,
         };
         let status = match &error {
-            AuthError::InvalidCredentials | AuthError::SessionNotFound => StatusCode::UNAUTHORIZED,
+            AuthError::InvalidCredentials
+            | AuthError::SessionNotFound
+            | AuthError::RefreshReplayDetected => StatusCode::UNAUTHORIZED,
             AuthError::LoginRateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+            AuthError::TurnstileRequired => StatusCode::PRECONDITION_REQUIRED,
             AuthError::BusinessAppAccessDenied | AuthError::AdminAccessDenied => {
                 StatusCode::FORBIDDEN
             }
@@ -393,6 +693,18 @@ impl ApiError {
 
     pub(crate) fn from_storage(error: anyhow::Error) -> Self {
         Self::internal(format!("storage error: {error}"))
+    }
+
+    fn from_turnstile(error: TurnstileError) -> Self {
+        match error {
+            TurnstileError::TokenRequired => Self::from_auth(AuthError::TurnstileRequired),
+            TurnstileError::Rejected => Self::unauthorized("turnstile verification rejected"),
+            TurnstileError::Unavailable => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: "turnstile verification unavailable".to_string(),
+                retry_after_seconds: None,
+            },
+        }
     }
 }
 

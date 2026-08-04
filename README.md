@@ -31,7 +31,7 @@ nix develop path:. -c npm run tauri:android:build -- --debug --target aarch64
 Use debug builds during development. Do not run a release Android build unless
 release signing or publication is the explicit target.
 
-Run the development cloud server on the LAN:
+Run the development cloud server on loopback:
 
 ```bash
 nix develop path:. -c cargo run -p cloudledger-server
@@ -49,20 +49,31 @@ nix develop path:. -c cargo run -p cloudledger-server -- --config /etc/cloudledg
 
 The generated file contains these sections:
 
-- `[server]`: mobile API bind address, admin bind address, and data directory.
-- `[database]`: PostgreSQL URL, pool size, and connection timeout.
+- `[server]`: run mode, loopback listeners, public HTTPS URLs, and data directory.
+- `[database]`: runtime PostgreSQL URL, migration policy, pool size, and timeout.
 - `[admin]`: randomized admin URL path and platform token.
 - `[security.login]`: identifier/IP failure limits, time window, and lockout.
 - `[security.turnstile]`: Cloudflare site key, secret key, and verification URL.
+- `[security.network]`: trusted proxy CIDRs and exact CORS origins.
+- `[security.audit]`: audit HMAC key ID and 32-byte signing/identifier keys.
 
-PostgreSQL is required before the backend starts. Create the database and a
-dedicated login, copy `cloudledger-server.example.toml`, then set
-`database.url` to that database. CloudLedger creates and versions tables inside
-the existing database; it does not create the database or PostgreSQL login.
-The relational model is designed before implementation, then frozen as
-reviewable SQL migrations in `crates/cloudledger-server/migrations`. The
-backend applies pending migrations at startup through SQLx. See
-`docs/backend-data-model.md` for the ownership and migration rules.
+PostgreSQL is required before the backend starts. Production uses separate
+`cloudledger_migration` and `cloudledger_runtime` logins. Bootstrap them with
+`deploy/postgres_roles.sql`, put only the runtime URL in `database.url`, then run
+the one-time migration with the migration URL in
+`CLOUDLEDGER_MIGRATION_DATABASE_URL`:
+
+```bash
+CLOUDLEDGER_MIGRATION_DATABASE_URL='postgres://cloudledger_migration:...@127.0.0.1/cloudledger' \
+  cloudledger-server migrate --config /etc/cloudledger/server.toml
+```
+
+Production (`server.mode = "reverse_proxy"`) requires
+`database.auto_migrate = false`; the long-running service never receives the
+migration credential. Development may enable automatic migrations. The
+relational model is frozen as reviewable SQL migrations in
+`crates/cloudledger-server/migrations`. See `docs/backend-data-model.md` and
+`docs/security-hardening.md` for the data and deployment rules.
 
 PostgreSQL is authoritative for server-shared organizations, ledgers,
 transactions, audit logs, users, installations, and sessions. SQLite remains
@@ -76,16 +87,18 @@ and are never consulted again after database state exists. Back up both files
 and PostgreSQL before an upgrade; do not delete the JSON sources until the
 import and a server restart have been verified.
 
-The mobile API defaults to `0.0.0.0:8787` so an Android test phone can reach it
-on the LAN. The mobile frontend reads its separate runtime backend URL from
-`frontend/public/config.js`. Set `apiBaseUrl` there before an Android build, or
+Both API and admin listeners default to loopback. Production requires loopback
+listeners and HTTPS public URLs behind `deploy/Caddyfile`. The mobile frontend
+reads its separate runtime backend URL from `frontend/public/config.js`. Set
+`apiBaseUrl` there before an Android build, or
 edit `dist/config.js` when deploying the web build. An empty value makes the
 web development UI use the current page hostname on port `8787`.
 `VITE_CLOUDLEDGER_CLOUD_URL` remains a build-time fallback when the runtime
 value is empty.
 
-For example, an Android build that reaches the development machine over LAN can
-use:
+In development only, LAN HTTP requires both a specific LAN bind address and
+`server.allow_insecure_lan = true`; startup prints a high-visibility warning.
+For example, an Android debug build can then use:
 
 ```js
 window.__CLOUDLEDGER_CONFIG__ = {
@@ -93,10 +106,10 @@ window.__CLOUDLEDGER_CONFIG__ = {
 };
 ```
 
-The admin backend is intentionally separated from the mobile API. Its
-`server.admin_bind_addr` defaults to `127.0.0.1:8788`. For LAN admin testing,
-set it to a specific private address such as `10.0.0.42:8788`; the server
-rejects `0.0.0.0` and public IPs for this admin port.
+The admin backend is intentionally separated from the mobile API and defaults
+to `127.0.0.1:8788`. Development LAN binding follows the same explicit
+`allow_insecure_lan` opt-in. Production never binds either service to a LAN or
+public address.
 
 On first initialization the server generates a high-entropy path such as
 `manage-0123456789abcdef0123456789abcdef` plus a platform token and writes both
@@ -116,9 +129,10 @@ Organization admins log in with their own email/phone and password and can
 manage employees only inside their organization.
 
 New organization-admin accounts are backend-only identities and do not receive
-a personal ledger; `POST /auth/login` rejects them. Employee accounts use the
-mobile/Web business frontend, belong to one organization only, and cannot log in
-to the organization admin backend. Existing persisted `owner` or `admin`
+a personal ledger; `/auth/tauri/login` and `/auth/web/login` reject them.
+Employee accounts use the mobile/Web business frontend, belong to one
+organization only, and cannot log in to the organization admin backend.
+Existing persisted `owner` or `admin`
 membership accounts are migrated to backend-only organization admins when the
 server starts.
 
@@ -164,33 +178,43 @@ that source even when identifiers are rotated. Rate-limited responses use HTTP
 characters. Existing password hashes remain valid until the password is reset.
 Tune the defaults under `[security.login]` in the backend config.
 
-The limits use the direct TCP peer address. Deployments behind a reverse proxy
-must enforce equivalent limits at the proxy because forwarded client IP headers
-are intentionally not trusted by the application.
+Login failures and security request buckets are stored in PostgreSQL so all
+server instances share them. Identifiers are stored only as keyed HMAC values.
+The application accepts `X-Forwarded-For` and `X-Forwarded-Proto` only from
+`security.network.trusted_proxy_cidrs`; untrusted peers cannot spoof their
+source. Caddy overwrites forwarding headers with the direct client address.
 
-Cloudflare Turnstile protects both organization and platform login forms. Put
-the widget credentials configured for the admin hostname in
+Cloudflare Turnstile always protects organization and platform login forms and
+is required for production startup. Business login does not send a challenge
+until the third failed attempt returns `428 turnstile_required`; the client then
+loads the widget and submits its one-time token. Put the widget credentials in
 `security.turnstile.site_key` and `security.turnstile.secret_key`. Keep the
 secret key only in this backend config; never put it in frontend `config.js`.
 
-The server refuses a non-loopback admin bind unless both keys are configured.
-Turnstile may be omitted only for loopback-only local development. When a
-reverse proxy exposes a loopback-bound admin server, the application cannot
-detect that public exposure, so the keys and proxy-level request limits are
-still required for a secure deployment. Turnstile responses must carry the
-`admin-login` action and are verified server-side with the direct peer IP.
+Turnstile may be omitted only for loopback-only local development. Business
+tokens must carry the `business-login` action; admin tokens use `admin-login`.
+Both are verified server-side with the trusted client IP.
 
-Business access tokens expire after 15 minutes and use the existing rotating
-refresh flow. Refresh tokens expire after 30 days. Organization-admin sessions
-expire after 8 hours and require a new login; changing an account password or
-account type continues to revoke all of that user's sessions immediately.
+Business access tokens expire after 15 minutes and refresh tokens after 30
+days. Refresh tokens are single-use; replay revokes the entire session family.
+PostgreSQL stores only SHA-256 token digests. Tauri keeps access tokens only in
+memory. Android encrypts the refresh token with a non-exportable Keystore
+AES-GCM key in the no-backup directory. Desktop uses the OS credential store
+when available and otherwise falls back to a memory-only session. Development
+Web login uses a Secure, HttpOnly, SameSite=Strict refresh cookie and a memory
+access token; production disables Web login. No session is stored in browser
+`localStorage`.
+
+Organization-admin and platform sessions expire after eight hours and require
+a new login; changing an account password or account type revokes all of that
+user's sessions immediately.
 
 The mobile API owns app login and ledger operations:
 
-- `POST /auth/login`
-- `POST /auth/refresh`
-- `GET /auth/me`
-- `POST /auth/logout`
+- `POST /auth/tauri/login`
+- `POST /auth/tauri/refresh`
+- `GET /auth/tauri/me`
+- `POST /auth/tauri/logout`
 - `GET /app/overview`
 - `GET /app/analytics?ledgerId=<uuid>&months=6`
 - `GET /app/transactions?ledgerId=<uuid>&month=YYYY-MM`
@@ -199,6 +223,10 @@ The mobile API owns app login and ledger operations:
 - `POST /app/approvals/decide`
 - `POST /app/payments/mark-paid`
 - `POST /app/payments/confirm-receipt`
+
+Development Web auth uses `/auth/web/login|refresh|logout`. The legacy
+`/auth/login|refresh|logout` endpoints return `426 client_upgrade_required` for
+one compatibility release.
 
 Login binds the server session to the app installation id. The Android UI does
 not expose registration, account switching, or organization membership

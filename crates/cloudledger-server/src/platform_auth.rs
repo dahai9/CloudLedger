@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use rand_core::{OsRng, RngCore};
 use subtle::ConstantTimeEq;
 use time::{Duration, OffsetDateTime};
-use uuid::Uuid;
 
 const PLATFORM_SESSION_TTL: Duration = Duration::hours(8);
 
@@ -14,7 +15,9 @@ pub struct PlatformSessions {
 impl PlatformSessions {
     pub fn issue(&mut self) -> String {
         self.prune();
-        let token = format!("platform_access_{}", Uuid::new_v4());
+        let mut token_bytes = [0_u8; 32];
+        OsRng.fill_bytes(&mut token_bytes);
+        let token = URL_SAFE_NO_PAD.encode(token_bytes);
         self.expires_at_by_token.insert(
             token.clone(),
             OffsetDateTime::now_utc() + PLATFORM_SESSION_TTL,
@@ -52,6 +55,7 @@ mod tests {
     fn platform_sessions_are_revocable() {
         let mut sessions = PlatformSessions::default();
         let token = sessions.issue();
+        assert_eq!(URL_SAFE_NO_PAD.decode(&token).unwrap().len(), 32);
         assert!(sessions.authenticate(&token));
         sessions.revoke(&token);
         assert!(!sessions.authenticate(&token));

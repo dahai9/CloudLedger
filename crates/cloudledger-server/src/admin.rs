@@ -1,7 +1,7 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 
 use axum::{
-    extract::{ConnectInfo, Path, Request, State},
+    extract::{Extension, Path, Request, State},
     http::{
         header::{AUTHORIZATION, RETRY_AFTER},
         HeaderMap, HeaderValue, StatusCode,
@@ -20,12 +20,14 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
+    audit::SecurityAuditEvent,
     auth::{
         AccountKind, AdminAuthenticatedSession, AdminCreateUserInput, AdminLoginInput,
         AdminSession, AuthError, AuthUserDto,
     },
     login_protection::LoginSurface,
     platform_auth::{platform_token_matches, PlatformSessions},
+    request_security::RequestContext,
     turnstile::TurnstileError,
     ServerState,
 };
@@ -88,8 +90,8 @@ async fn protect_admin_authorization(
     }
     let Some(peer_ip) = request
         .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|connect_info| connect_info.0.ip())
+        .get::<RequestContext>()
+        .map(|context| context.client_ip)
     else {
         return AdminApiError::internal("client address is unavailable").into_response();
     };
@@ -98,7 +100,9 @@ async fn protect_admin_authorization(
         peer_ip,
         LoginSurface::AdminAuthorization,
         ADMIN_AUTHORIZATION_IDENTIFIER,
-    ) {
+    )
+    .await
+    {
         return error.into_response();
     }
 
@@ -109,7 +113,9 @@ async fn protect_admin_authorization(
             peer_ip,
             LoginSurface::AdminAuthorization,
             ADMIN_AUTHORIZATION_IDENTIFIER,
-        ) {
+        )
+        .await
+        {
             Ok(Some(error)) => AdminApiError::from_auth(error).into_response(),
             Ok(None) => response,
             Err(error) => error.into_response(),
@@ -120,27 +126,30 @@ async fn protect_admin_authorization(
         peer_ip,
         LoginSurface::AdminAuthorization,
         ADMIN_AUTHORIZATION_IDENTIFIER,
-    ) {
+    )
+    .await
+    {
         return error.into_response();
     }
     response
 }
 
 async fn admin_login(
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    Extension(context): Extension<RequestContext>,
     State(state): State<ServerState>,
     Json(request): Json<AdminLoginRequest>,
 ) -> Result<Json<AdminSession>, AdminApiError> {
     let identifier = request.identifier.trim().to_lowercase();
     check_login_attempt(
         &state,
-        peer_addr.ip(),
+        context.client_ip,
         LoginSurface::OrganizationAdmin,
         &identifier,
-    )?;
+    )
+    .await?;
     state
         .turnstile
-        .verify(&request.turnstile_token, peer_addr.ip())
+        .verify(&request.turnstile_token, context.client_ip)
         .await
         .map_err(AdminApiError::from_turnstile)?;
     let (email, phone) = if identifier.contains('@') {
@@ -171,19 +180,22 @@ async fn admin_login(
         Ok(session) => {
             record_login_success(
                 &state,
-                peer_addr.ip(),
+                context.client_ip,
                 LoginSurface::OrganizationAdmin,
                 &identifier,
-            )?;
+            )
+            .await?;
             session
         }
         Err(AuthError::InvalidCredentials) => {
             if let Some(error) = record_login_failure(
                 &state,
-                peer_addr.ip(),
+                context.client_ip,
                 LoginSurface::OrganizationAdmin,
                 &identifier,
-            )? {
+            )
+            .await?
+            {
                 return Err(AdminApiError::from_auth(error));
             }
             return Err(AdminApiError::from_auth(AuthError::InvalidCredentials));
@@ -191,13 +203,27 @@ async fn admin_login(
         Err(error) => {
             record_login_success(
                 &state,
-                peer_addr.ip(),
+                context.client_ip,
                 LoginSurface::OrganizationAdmin,
                 &identifier,
-            )?;
+            )
+            .await?;
             return Err(AdminApiError::from_auth(error));
         }
     };
+    state
+        .storage
+        .append_security_event(SecurityAuditEvent {
+            scope_key: format!("organization:{}", session.organization_id),
+            actor_type: "organization_admin".to_string(),
+            actor_id: Some(session.user.id),
+            action: "admin_login".to_string(),
+            resource_type: "session".to_string(),
+            resource_id: None,
+            metadata: serde_json::json!({"client_kind": "admin"}),
+        })
+        .await
+        .map_err(AdminApiError::from_storage)?;
     Ok(Json(session))
 }
 
@@ -209,28 +235,31 @@ async fn admin_security(State(state): State<ServerState>) -> Json<AdminSecurityR
 }
 
 async fn platform_login(
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    Extension(context): Extension<RequestContext>,
     State(state): State<ServerState>,
     Json(request): Json<PlatformLoginRequest>,
 ) -> Result<Json<PlatformLoginResponse>, AdminApiError> {
     check_login_attempt(
         &state,
-        peer_addr.ip(),
+        context.client_ip,
         LoginSurface::Platform,
         "platform-token",
-    )?;
+    )
+    .await?;
     state
         .turnstile
-        .verify(&request.turnstile_token, peer_addr.ip())
+        .verify(&request.turnstile_token, context.client_ip)
         .await
         .map_err(AdminApiError::from_turnstile)?;
     if !platform_token_matches(&state.admin_token, &request.platform_token) {
         if let Some(error) = record_login_failure(
             &state,
-            peer_addr.ip(),
+            context.client_ip,
             LoginSurface::Platform,
             "platform-token",
-        )? {
+        )
+        .await?
+        {
             return Err(AdminApiError::from_auth(error));
         }
         return Err(AdminApiError::from_auth(AuthError::InvalidCredentials));
@@ -238,11 +267,25 @@ async fn platform_login(
 
     record_login_success(
         &state,
-        peer_addr.ip(),
+        context.client_ip,
         LoginSurface::Platform,
         "platform-token",
-    )?;
+    )
+    .await?;
     let access_token = lock_platform_sessions(&state)?.issue();
+    state
+        .storage
+        .append_security_event(SecurityAuditEvent {
+            scope_key: "platform".to_string(),
+            actor_type: "platform_admin".to_string(),
+            actor_id: None,
+            action: "admin_login".to_string(),
+            resource_type: "session".to_string(),
+            resource_id: None,
+            metadata: serde_json::json!({"client_kind": "platform"}),
+        })
+        .await
+        .map_err(AdminApiError::from_storage)?;
     Ok(Json(PlatformLoginResponse { access_token }))
 }
 
@@ -254,8 +297,23 @@ async fn admin_logout(
     let _write_guard = state.write_gate.lock().await;
     let principal = authenticate_principal(&headers, &state)?;
     match principal {
-        AdminPrincipal::Platform => lock_platform_sessions(&state)?.revoke(token),
-        AdminPrincipal::Organization(_) => {
+        AdminPrincipal::Platform => {
+            lock_platform_sessions(&state)?.revoke(token);
+            state
+                .storage
+                .append_security_event(SecurityAuditEvent {
+                    scope_key: "platform".to_string(),
+                    actor_type: "platform_admin".to_string(),
+                    actor_id: None,
+                    action: "session_revoked".to_string(),
+                    resource_type: "session".to_string(),
+                    resource_id: None,
+                    metadata: serde_json::json!({"client_kind": "platform"}),
+                })
+                .await
+                .map_err(AdminApiError::from_storage)?;
+        }
+        AdminPrincipal::Organization(session) => {
             let staged_auth = {
                 let auth = lock_auth(&state)?;
                 let mut staged_auth = auth.clone();
@@ -270,6 +328,19 @@ async fn admin_logout(
                 .await
                 .map_err(AdminApiError::from_storage)?;
             *lock_auth(&state)? = staged_auth;
+            state
+                .storage
+                .append_security_event(SecurityAuditEvent {
+                    scope_key: format!("organization:{}", session.organization_id),
+                    actor_type: "organization_admin".to_string(),
+                    actor_id: Some(session.user.id),
+                    action: "session_revoked".to_string(),
+                    resource_type: "session".to_string(),
+                    resource_id: None,
+                    metadata: serde_json::json!({"client_kind": "admin"}),
+                })
+                .await
+                .map_err(AdminApiError::from_storage)?;
         }
     }
     Ok(StatusCode::NO_CONTENT)
@@ -366,6 +437,19 @@ async fn create_organization(
     let response = organization_with_members(&staged_service, organization_id)?;
 
     persist_staged_state(&state, staged_auth, staged_service).await?;
+    state
+        .storage
+        .append_security_event(SecurityAuditEvent {
+            scope_key: format!("organization:{organization_id}"),
+            actor_type: "platform_admin".to_string(),
+            actor_id: None,
+            action: "organization_created".to_string(),
+            resource_type: "organization".to_string(),
+            resource_id: Some(organization_id),
+            metadata: serde_json::json!({"admin_user_id": admin_user_id}),
+        })
+        .await
+        .map_err(AdminApiError::from_storage)?;
     Ok(Json(response))
 }
 
@@ -390,7 +474,8 @@ async fn add_member(
     Json(request): Json<AddMemberRequest>,
 ) -> Result<Json<MembershipDto>, AdminApiError> {
     let _write_guard = state.write_gate.lock().await;
-    require_organization_admin(authenticate_principal(&headers, &state)?, organization_id)?;
+    let actor =
+        require_organization_admin(authenticate_principal(&headers, &state)?, organization_id)?;
     require_employee_role(request.role)?;
     let AddMemberRequest {
         display_name,
@@ -416,6 +501,19 @@ async fn add_member(
         .map_err(AdminApiError::from_service)?;
     sync_business_auth_user(&mut staged_auth, &member, password)?;
     persist_staged_state(&state, staged_auth, staged_service).await?;
+    state
+        .storage
+        .append_security_event(SecurityAuditEvent {
+            scope_key: format!("organization:{organization_id}"),
+            actor_type: "organization_admin".to_string(),
+            actor_id: Some(actor.user.id),
+            action: "member_added".to_string(),
+            resource_type: "membership".to_string(),
+            resource_id: Uuid::parse_str(&member.id).ok(),
+            metadata: serde_json::json!({"user_id": member.user_id, "role": member.role}),
+        })
+        .await
+        .map_err(AdminApiError::from_storage)?;
     Ok(Json(member))
 }
 
@@ -426,7 +524,8 @@ async fn update_member_role(
     Json(request): Json<UpdateMemberRoleRequest>,
 ) -> Result<Json<MembershipDto>, AdminApiError> {
     let _write_guard = state.write_gate.lock().await;
-    require_organization_admin(authenticate_principal(&headers, &state)?, organization_id)?;
+    let actor =
+        require_organization_admin(authenticate_principal(&headers, &state)?, organization_id)?;
     require_employee_role(request.role)?;
     let (member, staged_service) = {
         let auth = lock_auth(&state)?;
@@ -444,6 +543,19 @@ async fn update_member_role(
         (member, staged_service)
     };
     persist_service(&state, staged_service).await?;
+    state
+        .storage
+        .append_security_event(SecurityAuditEvent {
+            scope_key: format!("organization:{organization_id}"),
+            actor_type: "organization_admin".to_string(),
+            actor_id: Some(actor.user.id),
+            action: "member_role_changed".to_string(),
+            resource_type: "membership".to_string(),
+            resource_id: Some(membership_id),
+            metadata: serde_json::json!({"role": member.role}),
+        })
+        .await
+        .map_err(AdminApiError::from_storage)?;
     Ok(Json(member))
 }
 
@@ -453,7 +565,8 @@ async fn remove_member(
     Path((organization_id, membership_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, AdminApiError> {
     let _write_guard = state.write_gate.lock().await;
-    require_organization_admin(authenticate_principal(&headers, &state)?, organization_id)?;
+    let actor =
+        require_organization_admin(authenticate_principal(&headers, &state)?, organization_id)?;
     let staged_service = {
         let auth = lock_auth(&state)?;
         let service = lock_service(&state)?;
@@ -466,6 +579,19 @@ async fn remove_member(
         staged_service
     };
     persist_service(&state, staged_service).await?;
+    state
+        .storage
+        .append_security_event(SecurityAuditEvent {
+            scope_key: format!("organization:{organization_id}"),
+            actor_type: "organization_admin".to_string(),
+            actor_id: Some(actor.user.id),
+            action: "member_removed".to_string(),
+            resource_type: "membership".to_string(),
+            resource_id: Some(membership_id),
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .map_err(AdminApiError::from_storage)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -476,7 +602,8 @@ async fn reset_member_password(
     Json(request): Json<ResetPasswordRequest>,
 ) -> Result<Json<MembershipDto>, AdminApiError> {
     let _write_guard = state.write_gate.lock().await;
-    require_organization_admin(authenticate_principal(&headers, &state)?, organization_id)?;
+    let actor =
+        require_organization_admin(authenticate_principal(&headers, &state)?, organization_id)?;
     let (member, staged_auth) = {
         let auth = lock_auth(&state)?;
         let service = lock_service(&state)?;
@@ -491,8 +618,23 @@ async fn reset_member_password(
         .save_auth(staged_auth.snapshot())
         .await
         .map_err(AdminApiError::from_storage)?;
-    let mut auth = lock_auth(&state)?;
-    *auth = staged_auth;
+    {
+        let mut auth = lock_auth(&state)?;
+        *auth = staged_auth;
+    }
+    state
+        .storage
+        .append_security_event(SecurityAuditEvent {
+            scope_key: format!("organization:{organization_id}"),
+            actor_type: "organization_admin".to_string(),
+            actor_id: Some(actor.user.id),
+            action: "password_reset".to_string(),
+            resource_type: "membership".to_string(),
+            resource_id: Some(membership_id),
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .map_err(AdminApiError::from_storage)?;
     Ok(Json(member))
 }
 
@@ -616,10 +758,10 @@ fn require_platform(principal: AdminPrincipal) -> Result<(), AdminApiError> {
 fn require_organization_admin(
     principal: AdminPrincipal,
     organization_id: Uuid,
-) -> Result<(), AdminApiError> {
+) -> Result<AdminAuthenticatedSession, AdminApiError> {
     match principal {
         AdminPrincipal::Organization(session) if session.organization_id == organization_id => {
-            Ok(())
+            Ok(session)
         }
         AdminPrincipal::Organization(_) => Err(AdminApiError::forbidden(
             "organization admin cannot manage another organization",
@@ -667,7 +809,7 @@ fn lock_platform_sessions(
         .map_err(|_| AdminApiError::internal("platform session lock poisoned"))
 }
 
-fn check_login_attempt(
+async fn check_login_attempt(
     state: &ServerState,
     ip: IpAddr,
     surface: LoginSurface,
@@ -675,26 +817,26 @@ fn check_login_attempt(
 ) -> Result<(), AdminApiError> {
     state
         .login_protection
-        .lock()
-        .map_err(|_| AdminApiError::internal("login protection lock poisoned"))?
         .check(ip, surface, identifier)
+        .await
+        .map_err(AdminApiError::from_storage)?
         .map_err(AdminApiError::from_auth)
 }
 
-fn record_login_failure(
+async fn record_login_failure(
     state: &ServerState,
     ip: IpAddr,
     surface: LoginSurface,
     identifier: &str,
 ) -> Result<Option<AuthError>, AdminApiError> {
-    Ok(state
+    state
         .login_protection
-        .lock()
-        .map_err(|_| AdminApiError::internal("login protection lock poisoned"))?
-        .record_failure(ip, surface, identifier))
+        .record_failure(ip, surface, identifier)
+        .await
+        .map_err(AdminApiError::from_storage)
 }
 
-fn record_login_success(
+async fn record_login_success(
     state: &ServerState,
     ip: IpAddr,
     surface: LoginSurface,
@@ -702,9 +844,9 @@ fn record_login_success(
 ) -> Result<(), AdminApiError> {
     state
         .login_protection
-        .lock()
-        .map_err(|_| AdminApiError::internal("login protection lock poisoned"))?
-        .record_success(ip, surface, identifier);
+        .record_success(ip, surface, identifier)
+        .await
+        .map_err(AdminApiError::from_storage)?;
     Ok(())
 }
 
@@ -886,8 +1028,11 @@ impl AdminApiError {
             _ => None,
         };
         let status = match &error {
-            AuthError::InvalidCredentials | AuthError::SessionNotFound => StatusCode::UNAUTHORIZED,
+            AuthError::InvalidCredentials
+            | AuthError::SessionNotFound
+            | AuthError::RefreshReplayDetected => StatusCode::UNAUTHORIZED,
             AuthError::LoginRateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+            AuthError::TurnstileRequired => StatusCode::PRECONDITION_REQUIRED,
             AuthError::AdminAccessDenied | AuthError::BusinessAppAccessDenied => {
                 StatusCode::FORBIDDEN
             }
@@ -957,8 +1102,11 @@ mod tests {
         ServerState::load(data_dir).expect("server state")
     }
 
-    fn peer_addr() -> ConnectInfo<SocketAddr> {
-        ConnectInfo("127.0.0.1:42000".parse().expect("peer address"))
+    fn peer_addr() -> Extension<RequestContext> {
+        Extension(RequestContext {
+            client_ip: "127.0.0.1".parse().expect("peer address"),
+            forwarded_https: false,
+        })
     }
 
     fn authorization_headers(token: &str) -> HeaderMap {

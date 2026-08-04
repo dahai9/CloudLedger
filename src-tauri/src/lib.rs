@@ -5,6 +5,7 @@ use cloudledger_service::{
     AppDecideApprovalInput, AppLedgerService, AppMarkTransactionPaidInput, AppServiceError,
     CategoryDto, FinancialAnalysisDto, LedgerOverview, TransactionDto, TransactionMonthDto,
 };
+use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
 use uuid::Uuid;
 
@@ -13,9 +14,77 @@ struct AppState {
     storage_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SecureRefreshSession {
+    refresh_token: String,
+    installation_id: String,
+}
+
+#[derive(Default)]
+struct SecureSessionState {
+    #[cfg(not(target_os = "android"))]
+    desktop_session: Mutex<Option<SecureRefreshSession>>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const CREDENTIAL_SERVICE: &str = "com.cloudledger.app";
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const CREDENTIAL_USER: &str = "refresh-session-v1";
+
 #[tauri::command]
 fn health() -> &'static str {
     "ok"
+}
+
+#[tauri::command]
+fn secure_session_store(
+    _state: State<'_, SecureSessionState>,
+    _window: tauri::WebviewWindow,
+    refresh_token: String,
+    installation_id: String,
+) -> Result<(), String> {
+    if refresh_token.trim().is_empty() || installation_id.trim().is_empty() {
+        return Err("refresh token and installation id are required".to_string());
+    }
+    let session = SecureRefreshSession {
+        refresh_token,
+        installation_id,
+    };
+    #[cfg(target_os = "android")]
+    android_secure_session::store(&_window, &session)?;
+    #[cfg(not(target_os = "android"))]
+    {
+        desktop_secure_session::store(&_state, session)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn secure_session_load(
+    _state: State<'_, SecureSessionState>,
+    _window: tauri::WebviewWindow,
+) -> Result<Option<SecureRefreshSession>, String> {
+    #[cfg(target_os = "android")]
+    return android_secure_session::load(&_window);
+    #[cfg(not(target_os = "android"))]
+    {
+        desktop_secure_session::load(&_state)
+    }
+}
+
+#[tauri::command]
+fn secure_session_clear(
+    _state: State<'_, SecureSessionState>,
+    _window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    android_secure_session::clear(&_window)?;
+    #[cfg(not(target_os = "android"))]
+    {
+        desktop_secure_session::clear(&_state)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -156,10 +225,14 @@ pub fn run() {
                 ledger_service: Mutex::new(ledger_service),
                 storage_path,
             });
+            app.manage(SecureSessionState::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             health,
+            secure_session_store,
+            secure_session_load,
+            secure_session_clear,
             get_overview,
             get_financial_analysis,
             get_transactions_for_month,
@@ -175,4 +248,183 @@ pub fn run() {
 
 fn service_error(error: AppServiceError) -> String {
     error.to_string()
+}
+
+#[cfg(not(target_os = "android"))]
+mod desktop_secure_session {
+    use tauri::State;
+
+    use super::{SecureRefreshSession, SecureSessionState};
+
+    pub fn store(
+        state: &State<'_, SecureSessionState>,
+        session: SecureRefreshSession,
+    ) -> Result<(), String> {
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        {
+            let payload = serde_json::to_string(&session).map_err(|error| error.to_string())?;
+            if credential_entry()
+                .and_then(|entry| entry.set_password(&payload))
+                .is_ok()
+            {
+                *lock_memory(state)? = None;
+                return Ok(());
+            }
+        }
+        *lock_memory(state)? = Some(session);
+        Ok(())
+    }
+
+    pub fn load(
+        state: &State<'_, SecureSessionState>,
+    ) -> Result<Option<SecureRefreshSession>, String> {
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        if let Ok(entry) = credential_entry() {
+            if let Ok(payload) = entry.get_password() {
+                if let Ok(session) = serde_json::from_str(&payload) {
+                    return Ok(Some(session));
+                }
+                let _ = entry.delete_credential();
+            }
+        }
+        Ok(lock_memory(state)?.clone())
+    }
+
+    pub fn clear(state: &State<'_, SecureSessionState>) -> Result<(), String> {
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        if let Ok(entry) = credential_entry() {
+            let _ = entry.delete_credential();
+        }
+        *lock_memory(state)? = None;
+        Ok(())
+    }
+
+    fn lock_memory<'a>(
+        state: &'a State<'_, SecureSessionState>,
+    ) -> Result<std::sync::MutexGuard<'a, Option<SecureRefreshSession>>, String> {
+        state
+            .desktop_session
+            .lock()
+            .map_err(|_| "secure session lock poisoned".to_string())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn credential_entry() -> keyring::Result<keyring::Entry> {
+        keyring::Entry::new(super::CREDENTIAL_SERVICE, super::CREDENTIAL_USER)
+    }
+}
+
+#[cfg(target_os = "android")]
+mod android_secure_session {
+    use std::{sync::mpsc::sync_channel, time::Duration};
+
+    use jni::objects::{JClass, JObject, JString, JValue};
+
+    use super::SecureRefreshSession;
+
+    const CLASS: &str = "com.cloudledger.app.SecureSessionStore";
+    const JNI_TIMEOUT: Duration = Duration::from_secs(10);
+
+    pub fn store(
+        window: &tauri::WebviewWindow,
+        session: &SecureRefreshSession,
+    ) -> Result<(), String> {
+        let payload = serde_json::to_string(session).map_err(|error| error.to_string())?;
+        with_activity(window, move |env, activity| {
+            let payload = env.new_string(payload).map_err(|error| error.to_string())?;
+            let class = session_class(env, activity)?;
+            env.call_static_method(
+                class,
+                "store",
+                "(Landroid/content/Context;Ljava/lang/String;)V",
+                &[JValue::Object(activity), JValue::Object(&payload)],
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+    }
+
+    pub fn load(window: &tauri::WebviewWindow) -> Result<Option<SecureRefreshSession>, String> {
+        with_activity(window, |env, activity| {
+            let class = session_class(env, activity)?;
+            let value = env
+                .call_static_method(
+                    class,
+                    "load",
+                    "(Landroid/content/Context;)Ljava/lang/String;",
+                    &[JValue::Object(activity)],
+                )
+                .map_err(|error| error.to_string())?
+                .l()
+                .map_err(|error| error.to_string())?;
+            if value.is_null() {
+                return Ok(None);
+            }
+            let value = JString::from(value);
+            let payload: String = env
+                .get_string(&value)
+                .map_err(|error| error.to_string())?
+                .into();
+            serde_json::from_str(&payload)
+                .map(Some)
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    pub fn clear(window: &tauri::WebviewWindow) -> Result<(), String> {
+        with_activity(window, |env, activity| {
+            let class = session_class(env, activity)?;
+            env.call_static_method(
+                class,
+                "clear",
+                "(Landroid/content/Context;)V",
+                &[JValue::Object(activity)],
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+    }
+
+    fn session_class<'local>(
+        env: &mut jni::JNIEnv<'local>,
+        activity: &JObject<'_>,
+    ) -> Result<JClass<'local>, String> {
+        let loader = env
+            .call_method(activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+            .and_then(|value| value.l())
+            .map_err(|error| error.to_string())?;
+        let class_name = env.new_string(CLASS).map_err(|error| error.to_string())?;
+        let class = env
+            .call_method(
+                loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&class_name)],
+            )
+            .and_then(|value| value.l())
+            .map_err(|error| error.to_string())?;
+        Ok(JClass::from(class))
+    }
+
+    fn with_activity<T, F>(window: &tauri::WebviewWindow, operation: F) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut jni::JNIEnv<'_>, &JObject<'_>) -> Result<T, String> + Send + 'static,
+    {
+        let (sender, receiver) = sync_channel(1);
+        window
+            .with_webview(move |webview| {
+                webview.jni_handle().exec(move |env, activity, _webview| {
+                    let result = operation(env, activity);
+                    if result.is_err() && env.exception_check().unwrap_or(false) {
+                        let _ = env.exception_clear();
+                    }
+                    let _ = sender.send(result);
+                });
+            })
+            .map_err(|error| error.to_string())?;
+        receiver
+            .recv_timeout(JNI_TIMEOUT)
+            .map_err(|error| format!("Android secure session bridge failed: {error}"))?
+    }
 }

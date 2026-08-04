@@ -58,13 +58,14 @@ export interface UserSession {
 export interface AuthSession {
   user: UserAccount;
   accessToken: string;
-  refreshToken: string;
+  refreshToken?: string;
   installationId: string;
 }
 
 export interface LoginDraft {
   identifier: string;
   password: string;
+  turnstileToken?: string;
 }
 
 export interface UpdateProfileDraft {
