@@ -1,3 +1,3 @@
 window.__CLOUDLEDGER_CONFIG__ = {
-  apiBaseUrl: "",
+  apiBaseUrl: "https://subuncinated-deedee-bronchial.ngrok-free.dev",
 };
