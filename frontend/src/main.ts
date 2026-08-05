@@ -1,4 +1,6 @@
 import { cloudLedgerApi } from "./api/cloudLedger";
+import { createIcons, icons } from "lucide";
+import { offlineStore, type OfflineSnapshot } from "./offlineStore";
 import "./styles.css";
 import type {
   AnalysisMonths,
@@ -9,6 +11,7 @@ import type {
   FinancialAnalysis,
   LoginDraft,
   NewTransactionDraft,
+  OfflineTransaction,
   TransactionDirection,
   UpdateProfileDraft,
   UserAccount,
@@ -18,6 +21,14 @@ import type {
 type ViewMode = "activity" | "analysis" | "approval" | "audit";
 type TransactionFilter = "all" | "pending" | "approved" | "rejected";
 type AuthStatus = "checking" | "authenticated" | "anonymous";
+type SyncPhase = "idle" | "connecting" | "syncing" | "success" | "failed";
+
+interface SyncState {
+  phase: SyncPhase;
+  completed: number;
+  total: number;
+  syncedCount: number;
+}
 
 interface QuickEntryForm {
   direction: TransactionDirection;
@@ -49,6 +60,11 @@ interface AppState {
   analysisMonths: AnalysisMonths;
   analysisLoading: boolean;
   analysisError?: string;
+  cachedDashboards: Record<string, LedgerDashboard>;
+  outbox: OfflineTransaction[];
+  sync: SyncState;
+  reauthRequired: boolean;
+  recentlySyncedTransactionIds: Set<string>;
   activeLedgerId?: string;
   currentUser?: UserAccount;
   cloudStatus: UserSession["cloudStatus"];
@@ -60,6 +76,7 @@ interface AppState {
   activityMonth: string;
   categoryEditing: boolean;
   categoryName: string;
+  amountsVisible: boolean;
   form: QuickEntryForm;
   authForm: AuthForm;
   profileForm: ProfileForm;
@@ -86,11 +103,17 @@ const state: AppState = {
   loading: true,
   analysisMonths: 6,
   analysisLoading: false,
+  cachedDashboards: {},
+  outbox: [],
+  sync: { phase: "idle", completed: 0, total: 0, syncedCount: 0 },
+  reauthRequired: false,
+  recentlySyncedTransactionIds: new Set(),
   view: "activity",
   filter: "all",
   activityMonth: currentMonthKey(),
   categoryEditing: false,
   categoryName: "",
+  amountsVisible: false,
   form: {
     direction: "expense",
     amount: "",
@@ -121,8 +144,21 @@ const periodMonthFormatter = new Intl.DateTimeFormat("zh-CN", {
   month: "short",
 });
 const autoRefreshMs = 10_000;
+const pullRefreshThreshold = 88;
+const pullRefreshMaximum = 120;
 let autoRefreshInFlight = false;
 let turnstileScriptPromise: Promise<void> | undefined;
+let lastRenderedAuthStatus: AuthStatus | undefined;
+let lastRenderedView: ViewMode | undefined;
+let syncSettleTimer: number | undefined;
+let authoritativeCacheUserId: string | undefined;
+let lastSyncPresentationKey: string | undefined;
+let pullStartY = 0;
+let pullDistance = 0;
+let pullProgress = 0;
+let pullTracking = false;
+let pullArmed = false;
+let pullRefreshing = false;
 
 void loadInitialState();
 window.setInterval(() => {
@@ -135,6 +171,23 @@ window.addEventListener("focus", () => {
   if (state.authStatus === "authenticated") {
     void refreshRemoteState({ silent: true });
   }
+});
+
+window.addEventListener("online", () => {
+  if (state.authStatus === "authenticated") {
+    void refreshRemoteState({ silent: true, announceSync: true });
+  }
+});
+
+window.addEventListener("offline", () => {
+  if (state.authStatus !== "authenticated") return;
+  state.cloudStatus = {
+    state: "offline",
+    label: state.outbox.length > 0 ? `离线 · ${state.outbox.length} 笔未同步` : "离线可记账",
+    detail: "正在使用本地账本，恢复网络后会自动同步。",
+  };
+  state.sync = { phase: "idle", completed: 0, total: state.outbox.length, syncedCount: 0 };
+  updateSyncStatusRegion();
 });
 
 document.addEventListener("visibilitychange", () => {
@@ -163,34 +216,79 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
+document.addEventListener("touchstart", handlePullRefreshStart, { passive: true });
+document.addEventListener("touchmove", handlePullRefreshMove, { passive: false });
+document.addEventListener("touchend", handlePullRefreshEnd, { passive: true });
+document.addEventListener("touchcancel", cancelPullRefresh, { passive: true });
+
 async function loadInitialState() {
-  try {
-    state.loading = true;
+  state.loading = true;
+
+  // A cold start has no in-memory access token. Render the last private
+  // snapshot first, then refresh its session and cloud data in the background.
+  // After an explicit login, skip this path so another account's cache never
+  // flashes before the newly authenticated account loads.
+  if (!cloudLedgerApi.getStoredSession() && (await restoreOfflineState())) {
+    state.loading = false;
+    state.sync = navigator.onLine
+      ? { phase: "connecting", completed: 0, total: state.outbox.length, syncedCount: 0 }
+      : { phase: "idle", completed: 0, total: state.outbox.length, syncedCount: 0 };
     render();
+    void refreshRemoteState({ silent: true, allowPending: true, announceSync: true });
+    return;
+  }
+
+  render();
+  try {
     const session = await cloudLedgerApi.getUserSession();
+    await hydrateOfflineCacheForUser(session.currentUser.id);
+    const syncedTransactions = await syncOutbox(false);
     const ledgers = await cloudLedgerApi.listLedgers();
     const activeLedgerId = pickDefaultLedgerId(ledgers);
 
-    state.currentUser = session.currentUser;
-    state.cloudStatus = session.cloudStatus;
-    state.ledgers = ledgers;
-    state.activeLedgerId = activeLedgerId;
-    state.dashboard = activeLedgerId
+    const dashboard = activeLedgerId
       ? await cloudLedgerApi.getLedgerDashboard(activeLedgerId, state.activityMonth)
       : undefined;
-    state.activityMonth = state.dashboard?.selectedTransactionMonth ?? currentMonthKey();
+    applyRemoteState(session, ledgers, activeLedgerId, dashboard);
     state.authStatus = "authenticated";
+    state.reauthRequired = false;
+    if (syncedTransactions.length > 0) {
+      state.recentlySyncedTransactionIds = new Set(
+        syncedTransactions.map((transaction) => transaction.id),
+      );
+      state.sync = {
+        phase: "success",
+        completed: syncedTransactions.length,
+        total: syncedTransactions.length,
+        syncedCount: syncedTransactions.length,
+      };
+    } else {
+      state.sync = { phase: "idle", completed: 0, total: 0, syncedCount: 0 };
+    }
     syncProfileFormFromUser();
     resetFormForDashboard();
     state.error = undefined;
+    await saveOfflineSnapshot();
   } catch (error) {
-    if (cloudLedgerApi.isAuthRequired(error)) {
+    const restored = await restoreOfflineState();
+    if (restored) {
+      state.cloudStatus = {
+        state: "offline",
+        label: state.outbox.length > 0 ? `${state.outbox.length} 笔待同步` : "离线可记账",
+        detail: friendlyError(error, "网络不可用"),
+      };
+      state.sync = { phase: "failed", completed: 0, total: state.outbox.length, syncedCount: 0 };
+    } else if (cloudLedgerApi.isAuthRequired(error)) {
       state.authStatus = "anonymous";
       state.currentUser = undefined;
       state.ledgers = [];
       state.activeLedgerId = undefined;
       state.dashboard = undefined;
       state.analysis = undefined;
+      state.cachedDashboards = {};
+      state.outbox = [];
+      state.reauthRequired = false;
+      state.sync = { phase: "idle", completed: 0, total: 0, syncedCount: 0 };
       state.userMenuOpen = false;
       state.profileEditing = false;
       state.error = undefined;
@@ -200,6 +298,7 @@ async function loadInitialState() {
   } finally {
     state.loading = false;
     render();
+    if (state.sync.phase === "success") scheduleSyncSettle();
   }
 }
 
@@ -252,6 +351,7 @@ async function submitAuthForm() {
 }
 
 async function logout() {
+  const userId = state.currentUser?.id;
   try {
     state.loading = true;
     state.userMenuOpen = false;
@@ -261,18 +361,44 @@ async function logout() {
   } catch (error) {
     showToast(friendlyError(error, "退出失败"));
   } finally {
+    if (userId) {
+      await offlineStore.clear(userId).catch(() => undefined);
+    }
     state.authStatus = "anonymous";
     state.currentUser = undefined;
     state.ledgers = [];
     state.activeLedgerId = undefined;
     state.dashboard = undefined;
     state.analysis = undefined;
+    state.cachedDashboards = {};
+    state.outbox = [];
+    state.reauthRequired = false;
+    state.recentlySyncedTransactionIds.clear();
+    state.sync = { phase: "idle", completed: 0, total: 0, syncedCount: 0 };
+    authoritativeCacheUserId = undefined;
     state.loading = false;
     render();
   }
 }
 
 async function switchLedger(ledgerId: string) {
+  if (state.cloudStatus.state === "offline") {
+    const cached = cachedDashboard(ledgerId, currentMonthKey());
+    if (!cached) {
+      showToast("该账本尚未缓存，联网后可用");
+      return;
+    }
+    state.activeLedgerId = ledgerId;
+    state.dashboard = cached;
+    state.activityMonth = cached.selectedTransactionMonth;
+    state.analysis = undefined;
+    state.analysisError = undefined;
+    state.view = "activity";
+    state.filter = "all";
+    resetFormForDashboard();
+    render();
+    return;
+  }
   try {
     state.loading = true;
     state.activeLedgerId = ledgerId;
@@ -282,12 +408,14 @@ async function switchLedger(ledgerId: string) {
     render();
     state.dashboard = await cloudLedgerApi.getLedgerDashboard(ledgerId, state.activityMonth);
     state.activityMonth = state.dashboard.selectedTransactionMonth;
+    rememberDashboard(state.dashboard);
     state.analysis = undefined;
     state.analysisError = undefined;
     state.view = "activity";
     state.filter = "all";
     resetFormForDashboard();
     state.error = undefined;
+    await saveOfflineSnapshot();
   } catch (error) {
     state.error = friendlyError(error, "切换账本失败");
   } finally {
@@ -301,14 +429,28 @@ async function loadActivityMonth(month: string) {
   if (!ledgerId || month === state.activityMonth || state.pendingAction) {
     return;
   }
+  if (state.cloudStatus.state === "offline") {
+    const cached = cachedDashboard(ledgerId, month);
+    if (!cached) {
+      showToast("该月份尚未缓存，联网后可查看");
+      return;
+    }
+    state.activityMonth = cached.selectedTransactionMonth;
+    state.dashboard = cached;
+    resetFormForDashboard({ preserveDraft: true });
+    render();
+    return;
+  }
   try {
     state.pendingAction = "activity-month";
     state.activityMonth = month;
     render();
     state.dashboard = await cloudLedgerApi.getLedgerDashboard(ledgerId, month);
     state.activityMonth = state.dashboard.selectedTransactionMonth;
+    rememberDashboard(state.dashboard);
     resetFormForDashboard({ preserveDraft: true });
     state.error = undefined;
+    await saveOfflineSnapshot();
   } catch (error) {
     showToast(friendlyError(error, "加载月份流水失败"));
   } finally {
@@ -368,53 +510,314 @@ async function loadFinancialAnalysis(force: boolean) {
 }
 
 async function refreshRemoteState(
-  options: { silent: boolean; allowPending?: boolean } = { silent: true },
+  options: { silent: boolean; allowPending?: boolean; announceSync?: boolean } = { silent: true },
 ) {
   if (!state.activeLedgerId || autoRefreshInFlight || (state.pendingAction && !options.allowPending)) {
     return;
   }
 
+  const before = visibleStateFingerprint();
+  const expectedUserId = state.currentUser?.id;
+  const previousLedgerId = state.activeLedgerId;
+  const announceSync = options.announceSync === true;
   autoRefreshInFlight = true;
+  if (announceSync) {
+    state.cloudStatus = { state: "checking", label: "正在连接云端" };
+    state.sync = {
+      phase: "connecting",
+      completed: 0,
+      total: state.outbox.length,
+      syncedCount: 0,
+    };
+    updateSyncStatusRegion();
+  }
+
   try {
-    const previousLedgerId = state.activeLedgerId;
     const session = await cloudLedgerApi.getUserSession();
+    if (expectedUserId && session.currentUser.id !== expectedUserId) {
+      state.reauthRequired = true;
+      state.cloudStatus = { state: "offline", label: "登录账号不匹配" };
+      state.sync = { phase: "failed", completed: 0, total: state.outbox.length, syncedCount: 0 };
+      return;
+    }
+
+    await hydrateOfflineCacheForUser(session.currentUser.id);
+    const syncedTransactions = await syncOutbox(announceSync || state.outbox.length > 0);
     const ledgers = await cloudLedgerApi.listLedgers();
-    const activeLedgerId = ledgers.some((ledger) => ledger.id === previousLedgerId)
-      ? previousLedgerId
+    const currentLedgerId = state.activeLedgerId;
+    const activeLedgerId = ledgers.some((ledger) => ledger.id === currentLedgerId)
+      ? currentLedgerId
+      : ledgers.some((ledger) => ledger.id === previousLedgerId)
+        ? previousLedgerId
       : pickDefaultLedgerId(ledgers);
 
-    state.currentUser = session.currentUser;
-    state.cloudStatus = session.cloudStatus;
-    state.ledgers = ledgers;
-    state.activeLedgerId = activeLedgerId;
-    state.dashboard = activeLedgerId
+    const dashboard = activeLedgerId
       ? await cloudLedgerApi.getLedgerDashboard(activeLedgerId, state.activityMonth)
       : undefined;
-    state.activityMonth = state.dashboard?.selectedTransactionMonth ?? currentMonthKey();
+    if (expectedUserId && state.currentUser?.id !== expectedUserId) return;
+    applyRemoteState(session, ledgers, activeLedgerId, dashboard);
+    state.reauthRequired = false;
     state.error = undefined;
     syncProfileFormFromUser();
     resetFormForDashboard({ preserveDraft: true });
+    if (syncedTransactions.length > 0) {
+      state.recentlySyncedTransactionIds = new Set(
+        syncedTransactions.map((transaction) => transaction.id),
+      );
+      state.sync = {
+        phase: "success",
+        completed: syncedTransactions.length,
+        total: syncedTransactions.length,
+        syncedCount: syncedTransactions.length,
+      };
+    } else {
+      state.sync = { phase: "idle", completed: 0, total: 0, syncedCount: 0 };
+    }
+    await saveOfflineSnapshot();
   } catch (error) {
     if (cloudLedgerApi.isAuthRequired(error)) {
-      state.authStatus = "anonymous";
-      state.currentUser = undefined;
-      state.ledgers = [];
-      state.activeLedgerId = undefined;
-      state.dashboard = undefined;
-      state.analysis = undefined;
-      state.userMenuOpen = false;
-      state.profileEditing = false;
-      state.error = undefined;
+      if (state.dashboard && state.currentUser) {
+        state.reauthRequired = true;
+        state.cloudStatus = { state: "offline", label: "登录已过期" };
+        state.sync = {
+          phase: "failed",
+          completed: 0,
+          total: state.outbox.length,
+          syncedCount: 0,
+        };
+      } else {
+        state.authStatus = "anonymous";
+        state.currentUser = undefined;
+        state.ledgers = [];
+        state.activeLedgerId = undefined;
+        state.dashboard = undefined;
+        state.analysis = undefined;
+        state.cachedDashboards = {};
+        state.outbox = [];
+        state.userMenuOpen = false;
+        state.profileEditing = false;
+        state.error = undefined;
+      }
     } else {
-      state.cloudStatus = await cloudLedgerApi.checkCloudStatus();
+      state.cloudStatus = {
+        state: "offline",
+        label: state.outbox.length > 0 ? `${state.outbox.length} 笔待同步` : "离线可记账",
+        detail: friendlyError(error, "网络不可用"),
+      };
+      state.sync = {
+        phase: announceSync ? "failed" : "idle",
+        completed: 0,
+        total: state.outbox.length,
+        syncedCount: 0,
+      };
+      updateCloudStatusLabel();
       if (!options.silent) {
         state.error = friendlyError(error, "刷新失败");
       }
     }
   } finally {
     autoRefreshInFlight = false;
-    render();
+    if (before !== visibleStateFingerprint()) {
+      render();
+    } else {
+      updateSyncStatusRegion();
+    }
+    if (state.sync.phase === "success") scheduleSyncSettle();
   }
+}
+
+function applyRemoteState(
+  session: UserSession,
+  ledgers: Ledger[],
+  activeLedgerId: string | undefined,
+  dashboard: LedgerDashboard | undefined,
+) {
+  state.currentUser = session.currentUser;
+  state.cloudStatus = session.cloudStatus;
+  state.ledgers = ledgers;
+  state.activeLedgerId = activeLedgerId;
+  state.dashboard = dashboard;
+  state.activityMonth = dashboard?.selectedTransactionMonth ?? currentMonthKey();
+  if (dashboard) rememberDashboard(dashboard);
+  updateCloudStatusLabel();
+}
+
+function dashboardCacheKey(ledgerId: string, month: string) {
+  return `${ledgerId}:${month}`;
+}
+
+function rememberDashboard(dashboard: LedgerDashboard) {
+  state.cachedDashboards[dashboardCacheKey(dashboard.ledger.id, dashboard.selectedTransactionMonth)] =
+    dashboard;
+}
+
+function cachedDashboard(ledgerId: string, month: string) {
+  return (
+    state.cachedDashboards[dashboardCacheKey(ledgerId, month)] ??
+    Object.values(state.cachedDashboards).find(
+      (dashboard) => dashboard.ledger.id === ledgerId,
+    )
+  );
+}
+
+async function restoreOfflineState(): Promise<boolean> {
+  const snapshot = await offlineStore.loadLast().catch(() => undefined);
+  if (!snapshot || !snapshot.ledgers.length) {
+    return false;
+  }
+  const activeLedgerId = snapshot.activeLedgerId ?? pickDefaultLedgerId(snapshot.ledgers);
+  const dashboard = activeLedgerId
+    ? snapshot.dashboards[dashboardCacheKey(activeLedgerId, snapshot.activityMonth)] ??
+      Object.values(snapshot.dashboards).find((item) => item.ledger.id === activeLedgerId)
+    : undefined;
+  if (!dashboard) {
+    return false;
+  }
+
+  state.currentUser = snapshot.user;
+  state.ledgers = snapshot.ledgers;
+  state.cachedDashboards = snapshot.dashboards;
+  state.outbox = snapshot.outbox;
+  state.activeLedgerId = activeLedgerId;
+  state.dashboard = dashboard;
+  state.activityMonth = dashboard.selectedTransactionMonth;
+  state.analysis = undefined;
+  state.analysisError = undefined;
+  state.authStatus = "authenticated";
+  state.error = undefined;
+  state.cloudStatus = navigator.onLine
+    ? { state: "checking", label: "正在连接云端" }
+    : {
+        state: "offline",
+        label: "离线可记账",
+        detail: "正在使用本地账本，恢复网络后会自动同步。",
+      };
+  state.reauthRequired = false;
+  updateCloudStatusLabel();
+  syncProfileFormFromUser();
+  resetFormForDashboard({ preserveDraft: true });
+  return true;
+}
+
+async function hydrateOfflineCacheForUser(userId: string) {
+  if (authoritativeCacheUserId === userId) return;
+  const snapshot = await offlineStore.loadAuthoritative().catch(() => undefined);
+  authoritativeCacheUserId = userId;
+  if (!snapshot || snapshot.user.id !== userId) {
+    state.cachedDashboards = {};
+    state.outbox = [];
+    return;
+  }
+  state.cachedDashboards = snapshot.dashboards;
+  state.outbox = snapshot.outbox;
+  const dashboard = state.activeLedgerId
+    ? cachedDashboard(state.activeLedgerId, state.activityMonth)
+    : undefined;
+  if (dashboard) state.dashboard = dashboard;
+}
+
+function offlineSnapshot(): OfflineSnapshot | undefined {
+  if (!state.currentUser || !state.dashboard) {
+    return undefined;
+  }
+  return {
+    version: 1,
+    user: state.currentUser,
+    ledgers: state.ledgers,
+    dashboards: state.cachedDashboards,
+    activeLedgerId: state.activeLedgerId,
+    activityMonth: state.activityMonth,
+    outbox: state.outbox,
+  };
+}
+
+async function saveOfflineSnapshot() {
+  const snapshot = offlineSnapshot();
+  if (snapshot) {
+    await offlineStore.save(snapshot);
+  }
+}
+
+async function syncOutbox(announce: boolean) {
+  const queue = [...state.outbox];
+  const synced: LedgerDashboard["recentTransactions"] = [];
+  if (queue.length === 0) return synced;
+
+  state.sync = { phase: "syncing", completed: 0, total: queue.length, syncedCount: 0 };
+  if (announce) updateSyncStatusRegion();
+
+  for (const queued of queue) {
+    updateTransactionSyncBadge(queued.localId, "syncing");
+    const transaction = await cloudLedgerApi.createTransaction(
+      queued.draft,
+      queued.clientMutationId,
+    );
+    replaceLocalTransaction(queued.localId, transaction);
+    state.outbox = state.outbox.filter(
+      (item) => item.clientMutationId !== queued.clientMutationId,
+    );
+    synced.push(transaction);
+    state.sync.completed = synced.length;
+    updateCloudStatusLabel();
+    await saveOfflineSnapshot();
+    updateTransactionSyncBadge(queued.localId, "synced");
+    if (announce) updateSyncStatusRegion();
+  }
+  return synced;
+}
+
+function replaceLocalTransaction(
+  localId: string,
+  transaction: LedgerDashboard["recentTransactions"][number],
+) {
+  for (const [key, dashboard] of Object.entries(state.cachedDashboards)) {
+    if (!dashboard.recentTransactions.some((item) => item.id === localId)) continue;
+    state.cachedDashboards[key] = {
+      ...dashboard,
+      recentTransactions: dashboard.recentTransactions.map((item) =>
+        item.id === localId ? transaction : item,
+      ),
+    };
+  }
+  if (state.dashboard?.recentTransactions.some((item) => item.id === localId)) {
+    state.dashboard = {
+      ...state.dashboard,
+      recentTransactions: state.dashboard.recentTransactions.map((item) =>
+        item.id === localId ? transaction : item,
+      ),
+    };
+    rememberDashboard(state.dashboard);
+  }
+}
+
+function updateCloudStatusLabel() {
+  const pending = state.outbox.length;
+  if (state.cloudStatus.state === "offline") {
+    state.cloudStatus = {
+      ...state.cloudStatus,
+      label: pending > 0 ? `离线 · ${pending} 笔未同步` : "离线可记账",
+      detail: "正在使用本地账本，恢复网络后会自动同步。",
+    };
+  } else if (pending > 0) {
+    state.cloudStatus = {
+      ...state.cloudStatus,
+      label: `云端在线 · ${pending} 笔未同步`,
+    };
+  }
+}
+
+function visibleStateFingerprint() {
+  return JSON.stringify({
+    authStatus: state.authStatus,
+    currentUser: state.currentUser,
+    ledgers: state.ledgers,
+    dashboard: state.dashboard,
+    activeLedgerId: state.activeLedgerId,
+    activityMonth: state.activityMonth,
+    outbox: state.outbox.map((item) => item.clientMutationId),
+    error: state.error,
+    reauthRequired: state.reauthRequired,
+  });
 }
 
 function shouldAutoRefresh() {
@@ -473,6 +876,11 @@ function entryAccountsForDashboard(dashboard: LedgerDashboard) {
 function render() {
   const dashboard = state.dashboard;
   const ledger = dashboard?.ledger;
+  const sceneIsEntering =
+    lastRenderedAuthStatus === undefined ||
+    lastRenderedAuthStatus !== state.authStatus ||
+    (state.authStatus === "authenticated" && lastRenderedView !== state.view);
+  const sceneMotionClass = sceneIsEntering ? "is-entering" : "";
 
   app.innerHTML = `
     <main
@@ -481,18 +889,21 @@ function render() {
       data-current-user-id="${escapeHtml(state.currentUser?.id ?? "")}"
       data-active-ledger-id="${escapeHtml(state.activeLedgerId ?? "")}"
       data-cloud-state="${escapeHtml(state.cloudStatus.state)}"
+      data-active-view="${escapeHtml(state.view)}"
+      data-amount-visibility="${state.amountsVisible ? "visible" : "hidden"}"
     >
+      ${state.authStatus === "authenticated" && dashboard ? renderPullRefreshIndicator() : ""}
       ${state.authStatus === "authenticated" ? renderTopBar() : ""}
       ${
         state.authStatus === "anonymous"
-          ? renderLogin()
+          ? renderLogin(sceneMotionClass)
           : state.loading && !dashboard
-          ? renderLoading()
-          : state.error
-            ? renderError()
-            : dashboard && ledger
-              ? renderDashboard(dashboard)
-              : renderEmptyState()
+          ? renderLoading(sceneMotionClass)
+          : dashboard && ledger
+            ? renderDashboard(dashboard, sceneMotionClass)
+            : state.error
+              ? renderError(sceneMotionClass)
+              : renderEmptyState(sceneMotionClass)
       }
       ${dashboard && ledger ? renderBottomNav(dashboard) : ""}
       ${state.toast ? `<div class="toast" role="status">${escapeHtml(state.toast)}</div>` : ""}
@@ -500,6 +911,10 @@ function render() {
   `;
 
   bindEvents();
+  createIcons({
+    icons,
+    attrs: { width: "18", height: "18", "stroke-width": "2" },
+  });
   if (state.authStatus === "anonymous" && state.authForm.turnstileSiteKey) {
     void mountTurnstile().catch(() => {
       turnstileScriptPromise = undefined;
@@ -508,6 +923,159 @@ function render() {
       showToast("人机验证服务暂时不可用");
     });
   }
+  lastSyncPresentationKey = JSON.stringify(syncPresentation());
+  lastRenderedAuthStatus = state.authStatus;
+  lastRenderedView = state.view;
+}
+
+function renderPullRefreshIndicator() {
+  const visible = pullTracking || pullRefreshing;
+  const classNames = [
+    "pull-refresh-indicator",
+    visible ? "is-visible" : "",
+    pullTracking ? "is-pulling" : "",
+    pullArmed ? "is-armed" : "",
+    pullRefreshing ? "is-refreshing" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return `<div
+    class="${classNames}"
+    id="pullRefreshIndicator"
+    role="status"
+    aria-live="polite"
+    aria-label="${pullRefreshing ? "正在刷新账本" : ""}"
+    ${visible ? "" : 'aria-hidden="true"'}
+    style="--pull-angle:${Math.round(pullProgress * 360)}deg;--pull-offset:${Math.round(pullDistance)}px;--pull-rotation:${Math.round(pullProgress * 210)}deg;--pull-scale:${(0.86 + pullProgress * 0.14).toFixed(3)}"
+  >
+    <span class="pull-refresh-ring" aria-hidden="true">
+      <i class="pull-refresh-spinner" data-lucide="refresh-cw"></i>
+      <i class="pull-refresh-check" data-lucide="check"></i>
+    </span>
+  </div>`;
+}
+
+function handlePullRefreshStart(event: TouchEvent) {
+  if (
+    event.touches.length !== 1 ||
+    pullRefreshing ||
+    autoRefreshInFlight ||
+    Boolean(state.pendingAction) ||
+    state.authStatus !== "authenticated" ||
+    !state.dashboard ||
+    window.scrollY > 0 ||
+    isInteractivePullTarget(event.target)
+  ) {
+    return;
+  }
+  pullStartY = event.touches[0].clientY;
+  pullDistance = 0;
+  pullProgress = 0;
+  pullTracking = true;
+  pullArmed = false;
+}
+
+function handlePullRefreshMove(event: TouchEvent) {
+  if (!pullTracking || event.touches.length !== 1) return;
+  if (window.scrollY > 0) {
+    cancelPullRefresh();
+    return;
+  }
+
+  const rawDistance = event.touches[0].clientY - pullStartY;
+  if (rawDistance <= 0) {
+    updatePullRefreshIndicator(0);
+    return;
+  }
+
+  event.preventDefault();
+  const resistedDistance =
+    rawDistance <= pullRefreshThreshold
+      ? rawDistance
+      : pullRefreshThreshold + (rawDistance - pullRefreshThreshold) * 0.24;
+  pullProgress = Math.min(rawDistance / pullRefreshThreshold, 1);
+  pullDistance = Math.min(resistedDistance, pullRefreshMaximum);
+  pullArmed = pullProgress >= 1;
+  updatePullRefreshIndicator();
+}
+
+function handlePullRefreshEnd() {
+  if (!pullTracking) return;
+  pullTracking = false;
+  if (pullArmed) {
+    void triggerPullRefresh();
+  } else {
+    cancelPullRefresh();
+  }
+}
+
+function cancelPullRefresh() {
+  if (pullRefreshing) return;
+  pullTracking = false;
+  pullArmed = false;
+  pullProgress = 0;
+  pullDistance = 0;
+  updatePullRefreshIndicator();
+}
+
+function updatePullRefreshIndicator(forcedProgress?: number) {
+  if (forcedProgress !== undefined) {
+    pullProgress = forcedProgress;
+    pullDistance = 0;
+    pullArmed = false;
+  }
+  const current = app.querySelector<HTMLElement>("#pullRefreshIndicator");
+  if (!current) return;
+  current.classList.toggle("is-visible", pullTracking || pullRefreshing);
+  current.classList.toggle("is-pulling", pullTracking);
+  current.classList.toggle("is-armed", pullArmed);
+  current.classList.toggle("is-refreshing", pullRefreshing);
+  current.style.setProperty("--pull-angle", `${Math.round(pullProgress * 360)}deg`);
+  current.style.setProperty("--pull-offset", `${Math.round(pullDistance)}px`);
+  current.style.setProperty("--pull-rotation", `${Math.round(pullProgress * 210)}deg`);
+  current.style.setProperty("--pull-scale", (0.86 + pullProgress * 0.14).toFixed(3));
+  current.toggleAttribute("aria-hidden", !pullRefreshing);
+  current.setAttribute("aria-label", pullRefreshing ? "正在刷新账本" : "");
+}
+
+async function triggerPullRefresh() {
+  if (autoRefreshInFlight) {
+    cancelPullRefresh();
+    return;
+  }
+  pullRefreshing = true;
+  pullArmed = false;
+  pullProgress = 1;
+  pullDistance = pullRefreshThreshold;
+  updatePullRefreshIndicator();
+
+  try {
+    await refreshRemoteState({ silent: true, allowPending: true, announceSync: true });
+    if (state.cloudStatus.state === "online" && !state.reauthRequired) {
+      const current = app.querySelector<HTMLElement>("#pullRefreshIndicator");
+      current?.classList.add("is-success");
+      current?.setAttribute("aria-label", "账本刷新成功");
+      await waitForMotion(520);
+    }
+  } finally {
+    pullRefreshing = false;
+    pullProgress = 0;
+    pullDistance = 0;
+    const current = app.querySelector<HTMLElement>("#pullRefreshIndicator");
+    current?.classList.remove("is-success");
+    updatePullRefreshIndicator();
+  }
+}
+
+function isInteractivePullTarget(target: EventTarget | null) {
+  return (
+    target instanceof Element &&
+    Boolean(target.closest("button, input, select, textarea, [contenteditable='true'], .user-menu-panel"))
+  );
+}
+
+function waitForMotion(milliseconds: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
 function pickDefaultLedgerId(ledgers: Ledger[]) {
@@ -527,7 +1095,7 @@ function renderTopBar() {
         </div>
       </div>
       <div class="top-actions">
-        <span class="cloud-chip ${state.cloudStatus.state}">${escapeHtml(state.cloudStatus.label)}</span>
+        ${renderCloudStatusChip()}
         ${renderUserMenu()}
       </div>
     </header>
@@ -537,7 +1105,153 @@ function renderTopBar() {
         ${state.ledgers.map(renderLedgerSwitchButton).join("")}
       </div>
     </div>
+    ${renderSyncBanner()}
   `;
+}
+
+interface SyncPresentation {
+  tone: "checking" | "online" | "offline" | "syncing" | "success" | "failed";
+  icon: string;
+  chipLabel: string;
+  title: string;
+  detail: string;
+  visible: boolean;
+  progress?: number;
+}
+
+function syncPresentation(): SyncPresentation {
+  const pending = state.outbox.length;
+  if (state.reauthRequired) {
+    return {
+      tone: "failed",
+      icon: "log-in",
+      chipLabel: "需要登录",
+      title: "登录后继续同步",
+      detail: pending > 0 ? `${pending} 笔本地记录已安全保留` : "本地账本仍可查看和记账",
+      visible: true,
+    };
+  }
+  if (state.sync.phase === "connecting") {
+    return {
+      tone: "checking",
+      icon: "refresh-cw",
+      chipLabel: "正在连接",
+      title: "正在连接云端",
+      detail: pending > 0 ? `连接后将同步 ${pending} 笔本地记录` : "正在恢复安全会话",
+      visible: true,
+    };
+  }
+  if (state.sync.phase === "syncing") {
+    const total = Math.max(state.sync.total, 1);
+    return {
+      tone: "syncing",
+      icon: "refresh-cw",
+      chipLabel: `同步 ${state.sync.completed}/${state.sync.total}`,
+      title: `正在同步 ${state.sync.completed}/${state.sync.total}`,
+      detail: "账本可继续使用，记录将按顺序上传",
+      visible: true,
+      progress: state.sync.completed / total,
+    };
+  }
+  if (state.sync.phase === "success") {
+    return {
+      tone: "success",
+      icon: "circle-check",
+      chipLabel: "同步完成",
+      title: `${state.sync.syncedCount} 笔记录已同步`,
+      detail: "本地记录已安全保存到云端",
+      visible: true,
+      progress: 1,
+    };
+  }
+  if (state.sync.phase === "failed") {
+    return {
+      tone: "failed",
+      icon: "triangle-alert",
+      chipLabel: pending > 0 ? `${pending} 笔待同步` : "连接不稳定",
+      title: pending > 0 ? "同步暂未完成" : "云端暂时不可用",
+      detail: pending > 0 ? "记录已保存在本机，联网后会自动重试" : "账本仍可离线使用",
+      visible: true,
+    };
+  }
+  if (state.cloudStatus.state === "offline") {
+    return {
+      tone: "offline",
+      icon: "cloud-off",
+      chipLabel: pending > 0 ? `离线 · ${pending} 笔` : "离线记账",
+      title: pending > 0 ? `${pending} 笔记录等待同步` : "当前处于离线状态",
+      detail: "记录会先保存在本机，联网后自动同步",
+      visible: true,
+    };
+  }
+  return {
+    tone: "online",
+    icon: "cloud",
+    chipLabel: "云端在线",
+    title: "云端在线",
+    detail: "",
+    visible: false,
+  };
+}
+
+function renderCloudStatusChip() {
+  const presentation = syncPresentation();
+  return `<span class="cloud-chip ${presentation.tone}" id="cloudStatusChip">
+    <i data-lucide="${presentation.icon}" aria-hidden="true"></i>
+    <span>${escapeHtml(presentation.chipLabel)}</span>
+  </span>`;
+}
+
+function renderSyncBanner() {
+  const presentation = syncPresentation();
+  const progress = Math.max(0, Math.min(1, presentation.progress ?? 0));
+  return `<div
+    class="sync-banner ${presentation.tone} ${presentation.visible ? "is-visible" : "is-hidden"}"
+    id="syncBanner"
+    role="status"
+    aria-live="polite"
+    aria-atomic="true"
+    ${presentation.visible ? "" : 'aria-hidden="true"'}
+    style="--sync-progress:${progress}"
+  >
+    <span class="sync-banner-icon" aria-hidden="true"><i data-lucide="${presentation.icon}"></i></span>
+    <span class="sync-banner-copy">
+      <strong>${escapeHtml(presentation.title)}</strong>
+      <span>${escapeHtml(presentation.detail)}</span>
+    </span>
+    ${
+      state.reauthRequired
+        ? '<button class="sync-login-button" type="button" data-sync-action="login">重新登录</button>'
+        : ""
+    }
+    ${presentation.progress === undefined ? "" : '<span class="sync-progress" aria-hidden="true"><span></span></span>'}
+  </div>`;
+}
+
+function updateSyncStatusRegion() {
+  const presentationKey = JSON.stringify(syncPresentation());
+  if (presentationKey === lastSyncPresentationKey) return;
+  const chip = app.querySelector<HTMLElement>("#cloudStatusChip");
+  if (chip) chip.outerHTML = renderCloudStatusChip();
+  const banner = app.querySelector<HTMLElement>("#syncBanner");
+  if (banner) banner.outerHTML = renderSyncBanner();
+  createIcons({
+    icons,
+    attrs: { width: "18", height: "18", "stroke-width": "2" },
+  });
+  bindSyncStatusEvents();
+  lastSyncPresentationKey = presentationKey;
+}
+
+function scheduleSyncSettle() {
+  if (syncSettleTimer !== undefined) window.clearTimeout(syncSettleTimer);
+  syncSettleTimer = window.setTimeout(() => {
+    if (state.sync.phase !== "success") return;
+    state.sync = { phase: "idle", completed: 0, total: 0, syncedCount: 0 };
+    settleRecentlySyncedRows();
+    state.recentlySyncedTransactionIds.clear();
+    updateSyncStatusRegion();
+  }, 1600);
 }
 
 function renderUserMenu() {
@@ -610,9 +1324,9 @@ function renderUserMenu() {
   `;
 }
 
-function renderLogin() {
+function renderLogin(sceneMotionClass: string) {
   return `
-    <section class="login-panel" aria-label="账号登录">
+    <section class="login-panel view-stage ${sceneMotionClass}" aria-label="账号登录">
       <div class="login-brand">
         <span class="brand-mark" aria-hidden="true">CL</span>
         <div>
@@ -645,7 +1359,11 @@ function renderLogin() {
             ? "disabled"
             : ""
         }>
-          ${state.pendingAction === "auth" ? "处理中" : "登录"}
+          ${
+            state.pendingAction === "auth"
+              ? '<i class="button-spinner" data-lucide="loader-circle" aria-hidden="true"></i>正在登录'
+              : "登录"
+          }
         </button>
       </form>
     </section>
@@ -716,11 +1434,13 @@ function renderLedgerSwitchButton(ledger: Ledger) {
   `;
 }
 
-function renderDashboard(dashboard: LedgerDashboard) {
+function renderDashboard(dashboard: LedgerDashboard, sceneMotionClass: string) {
   return `
-    ${renderBalancePanel(dashboard)}
-    ${state.view === "analysis" ? "" : renderQuickEntry(dashboard)}
-    ${renderActiveView(dashboard)}
+    <section class="dashboard-stage view-stage ${sceneMotionClass}" data-view="${state.view}">
+      ${renderBalancePanel(dashboard)}
+      ${state.view === "analysis" ? "" : renderQuickEntry(dashboard)}
+      ${renderActiveView(dashboard)}
+    </section>
   `;
 }
 
@@ -738,10 +1458,22 @@ function renderBalancePanel(dashboard: LedgerDashboard) {
 
   return `
     <section class="balance-panel" aria-label="账本概览">
-      <div>
-        <span class="section-kicker">${ledgerKindLabel(ledger.kind)}</span>
-        <p class="balance-label">${escapeHtml(ledger.name)}</p>
-        <strong class="balance-value">${formatMoney(ledger.balanceCents, ledger.currency)}</strong>
+      <div class="balance-heading">
+        <div>
+          <span class="section-kicker">${ledgerKindLabel(ledger.kind)}</span>
+          <p class="balance-label">${escapeHtml(ledger.name)}</p>
+          <strong class="balance-value ${state.amountsVisible ? "is-visible" : "is-hidden"}">${formatMoney(ledger.balanceCents, ledger.currency)}</strong>
+        </div>
+        <button
+          class="amount-visibility-toggle"
+          id="amountVisibilityToggle"
+          type="button"
+          aria-label="${state.amountsVisible ? "隐藏金额" : "显示金额"}"
+          aria-pressed="${state.amountsVisible}"
+          title="${state.amountsVisible ? "隐藏金额" : "显示金额"}"
+        >
+          <i data-lucide="${state.amountsVisible ? "eye-off" : "eye"}" aria-hidden="true"></i>
+        </button>
       </div>
       <div class="balance-meta">
         ${organization}
@@ -1177,13 +1909,12 @@ function renderTransactionRow(
   dashboard: LedgerDashboard,
 ) {
   const currency = dashboard.ledger.currency;
-  const signedAmount = `${transaction.direction === "expense" ? "-" : "+"}${formatMoney(
-    transaction.amountCents,
-    currency,
-  )}`;
+  const signedAmount = formatSignedMoney(transaction.amountCents, currency, transaction.direction);
+  const unsynced = isUnsyncedTransaction(transaction.id);
+  const recentlySynced = state.recentlySyncedTransactionIds.has(transaction.id);
 
   return `
-    <article class="transaction-row">
+    <article class="transaction-row ${recentlySynced ? "is-just-synced" : ""}" data-transaction-id="${escapeHtml(transaction.id)}">
       <div class="row-main">
         <div>
           <h3>${escapeHtml(transaction.title)}</h3>
@@ -1195,9 +1926,15 @@ function renderTransactionRow(
       </div>
       <div class="row-meta">
         <span>${formatDate(transaction.occurredAt)}</span>
-        <span class="status-chip ${statusClass(transaction.approvalState)}">
-          ${transactionStateLabel(transaction)}
-        </span>
+        ${
+          unsynced
+            ? '<span class="status-chip is-unsynced">未同步</span>'
+            : recentlySynced
+              ? '<span class="status-chip is-synced"><i data-lucide="check" aria-hidden="true"></i>已同步</span>'
+            : `<span class="status-chip ${statusClass(transaction.approvalState)}">
+                ${transactionStateLabel(transaction)}
+              </span>`
+        }
       </div>
       ${renderTransactionActions(transaction, dashboard)}
     </article>
@@ -1208,6 +1945,9 @@ function renderTransactionActions(
   transaction: LedgerDashboard["recentTransactions"][number],
   dashboard: LedgerDashboard,
 ) {
+  if (isUnsyncedTransaction(transaction.id)) {
+    return "";
+  }
   const canMarkPaid =
     dashboard.ledger.role === "business_owner" && transaction.paymentState === "pending_payment";
   const canConfirmReceipt =
@@ -1229,6 +1969,38 @@ function renderTransactionActions(
         : ""
     }
   </div>`;
+}
+
+function isUnsyncedTransaction(transactionId: string) {
+  return state.outbox.some((item) => item.localId === transactionId);
+}
+
+function updateTransactionSyncBadge(localId: string, phase: "syncing" | "synced") {
+  for (const row of app.querySelectorAll<HTMLElement>("[data-transaction-id]")) {
+    if (row.dataset.transactionId !== localId) continue;
+    const badge = row.querySelector<HTMLElement>(".status-chip");
+    if (!badge) return;
+    badge.className = `status-chip is-${phase}`;
+    badge.textContent = phase === "syncing" ? "同步中" : "已同步";
+    if (phase === "synced") row.classList.add("is-just-synced");
+    return;
+  }
+}
+
+function settleRecentlySyncedRows() {
+  const dashboard = state.dashboard;
+  if (!dashboard) return;
+  for (const row of app.querySelectorAll<HTMLElement>("[data-transaction-id]")) {
+    const transaction = dashboard.recentTransactions.find(
+      (item) => item.id === row.dataset.transactionId,
+    );
+    if (!transaction || !state.recentlySyncedTransactionIds.has(transaction.id)) continue;
+    const badge = row.querySelector<HTMLElement>(".status-chip");
+    if (!badge) continue;
+    badge.className = `status-chip ${statusClass(transaction.approvalState)}`;
+    badge.textContent = transactionStateLabel(transaction);
+    row.classList.remove("is-just-synced");
+  }
 }
 
 function renderApprovalPanel(dashboard: LedgerDashboard) {
@@ -1255,7 +2027,7 @@ function renderApprovalPanel(dashboard: LedgerDashboard) {
 }
 
 function renderApprovalRow(item: LedgerDashboard["approvalQueue"][number], currency: string) {
-  const signedAmount = `${item.direction === "expense" ? "-" : "+"}${formatMoney(item.amountCents, currency)}`;
+  const signedAmount = formatSignedMoney(item.amountCents, currency, item.direction);
   const processing = state.pendingAction === item.transactionId;
   const disabled = state.loading ? "disabled" : "";
   const decisionControls = item.canDecide
@@ -1359,33 +2131,35 @@ function renderNavButton(view: ViewMode, label: string, count?: number) {
   `;
 }
 
-function renderLoading() {
+function renderLoading(sceneMotionClass: string) {
   return `
-    <section class="state-panel">
+    <section class="state-panel view-stage ${sceneMotionClass}">
       <div class="spinner" aria-hidden="true"></div>
       <p>正在加载账本</p>
     </section>
   `;
 }
 
-function renderError() {
+function renderError(sceneMotionClass: string) {
   return `
-    <section class="state-panel">
+    <section class="state-panel view-stage ${sceneMotionClass}">
       <p>${escapeHtml(state.error ?? "加载失败")}</p>
       <button class="primary-button" type="button" id="retryButton">重试</button>
     </section>
   `;
 }
 
-function renderEmptyState() {
+function renderEmptyState(sceneMotionClass: string) {
   return `
-    <section class="state-panel">
+    <section class="state-panel view-stage ${sceneMotionClass}">
       <p>暂无账本</p>
     </section>
   `;
 }
 
 function bindEvents() {
+  bindSyncStatusEvents();
+
   app.querySelector<HTMLFormElement>("#authForm")?.addEventListener("submit", (event) => {
     event.preventDefault();
     void submitAuthForm();
@@ -1436,6 +2210,11 @@ function bindEvents() {
 
   app.querySelector<HTMLButtonElement>("[data-user-menu-action='logout']")?.addEventListener("click", () => {
     void logout();
+  });
+
+  app.querySelector<HTMLButtonElement>("#amountVisibilityToggle")?.addEventListener("click", () => {
+    state.amountsVisible = !state.amountsVisible;
+    render();
   });
 
   app.querySelectorAll<HTMLButtonElement>("[data-ledger-id]").forEach((button) => {
@@ -1576,6 +2355,19 @@ function bindEvents() {
   });
 }
 
+function bindSyncStatusEvents() {
+  app.querySelector<HTMLButtonElement>("[data-sync-action='login']")?.addEventListener(
+    "click",
+    () => {
+      state.authStatus = "anonymous";
+      state.loading = false;
+      state.userMenuOpen = false;
+      state.profileEditing = false;
+      render();
+    },
+  );
+}
+
 function closeUserMenu() {
   state.userMenuOpen = false;
   state.profileEditing = false;
@@ -1707,9 +2499,11 @@ async function saveCategory() {
       dashboard.ledger.id,
       state.activityMonth,
     );
+    rememberDashboard(state.dashboard);
     state.form.categoryId = category.id;
     state.categoryEditing = false;
     state.categoryName = "";
+    await saveOfflineSnapshot();
     showToast(`已添加分类：${category.name}`);
   } catch (error) {
     showToast(friendlyError(error, "添加分类失败"));
@@ -1749,15 +2543,22 @@ async function submitQuickEntry() {
     memo: state.form.memo.trim() || undefined,
     submitForApproval: dashboard.ledger.kind === "organization" || state.form.submitForApproval,
   };
+  const clientMutationId = newClientMutationId();
 
   try {
-    state.loading = true;
     state.pendingAction = "create";
     render();
-    const transaction = await cloudLedgerApi.createTransaction(draft);
+    if (state.cloudStatus.state === "offline") {
+      await queueOfflineTransaction(draft, clientMutationId);
+      clearQuickEntryForm();
+      state.view = "activity";
+      showToast("已保存到本机，联网后自动同步");
+      return;
+    }
+
+    const transaction = await cloudLedgerApi.createTransaction(draft, clientMutationId);
     state.analysis = undefined;
-    state.form.amount = "";
-    state.form.memo = "";
+    clearQuickEntryForm();
     state.activityMonth = currentMonthKey();
     await refreshDashboard();
     state.view = "activity";
@@ -1769,12 +2570,104 @@ async function submitQuickEntry() {
           : "已保存流水",
     );
   } catch (error) {
-    showToast(friendlyError(error, "保存失败"));
+    if (isNetworkFailure(error)) {
+      try {
+        await queueOfflineTransaction(draft, clientMutationId);
+        clearQuickEntryForm();
+        state.view = "activity";
+        showToast("网络不可用，已保存到本机并等待同步");
+      } catch (storeError) {
+        showToast(friendlyError(storeError, "本地保存失败"));
+      }
+    } else {
+      showToast(friendlyError(error, "保存失败"));
+    }
   } finally {
-    state.loading = false;
     state.pendingAction = undefined;
     render();
   }
+}
+
+async function queueOfflineTransaction(draft: NewTransactionDraft, clientMutationId: string) {
+  const visibleDashboard = state.dashboard;
+  const user = state.currentUser;
+  if (!visibleDashboard || !user) {
+    throw new Error("本地账本尚未就绪");
+  }
+  const targetMonth = transactionMonthKey(draft.occurredAt);
+  const dashboard =
+    state.cachedDashboards[dashboardCacheKey(draft.ledgerId, targetMonth)] ??
+    (visibleDashboard.selectedTransactionMonth === targetMonth
+      ? visibleDashboard
+      : {
+          ...visibleDashboard,
+          selectedTransactionMonth: targetMonth,
+          recentTransactions: [],
+        });
+  const account = dashboard.accounts.find((item) => item.id === draft.accountId);
+  const category = dashboard.categories.find((item) => item.id === draft.categoryId);
+  if (!account || !category) {
+    throw new Error("本地账户或分类已失效，请联网后刷新账本");
+  }
+
+  const queued: OfflineTransaction = {
+    localId: `local-${clientMutationId}`,
+    clientMutationId,
+    draft,
+    createdAt: new Date().toISOString(),
+  };
+  const localTransaction = {
+    id: queued.localId,
+    ledgerId: draft.ledgerId,
+    occurredAt: draft.occurredAt,
+    title: draft.memo || category.name,
+    amountCents: draft.amountCents,
+    direction: draft.direction,
+    accountName: account.name,
+    categoryName: category.name,
+    approvalState: dashboard.ledger.kind === "organization" ? "pending" as const : "approved" as const,
+    paymentState: "not_applicable" as const,
+    actorName: user.displayName,
+    createdByUserId: user.id,
+    memo: draft.memo,
+    auditRequired: dashboard.ledger.kind === "organization",
+  };
+  const updatedDashboard: LedgerDashboard = {
+    ...dashboard,
+    recentTransactions: [localTransaction, ...dashboard.recentTransactions],
+    availableTransactionMonths: dashboard.availableTransactionMonths.includes(
+      transactionMonthKey(draft.occurredAt),
+    )
+      ? dashboard.availableTransactionMonths
+      : [transactionMonthKey(draft.occurredAt), ...dashboard.availableTransactionMonths],
+  };
+  state.dashboard = updatedDashboard;
+  state.activityMonth = targetMonth;
+  rememberDashboard(updatedDashboard);
+  state.outbox = [...state.outbox, queued];
+  state.analysis = undefined;
+  state.cloudStatus = {
+    state: "offline",
+    label: "离线可记账",
+    detail: "正在使用本地账本，恢复网络后会自动同步。",
+  };
+  state.sync = { phase: "idle", completed: 0, total: state.outbox.length, syncedCount: 0 };
+  updateCloudStatusLabel();
+  await saveOfflineSnapshot();
+}
+
+function clearQuickEntryForm() {
+  state.form.amount = "";
+  state.form.memo = "";
+}
+
+function isNetworkFailure(error: unknown) {
+  return error instanceof Error && error.message.includes("无法连接后端");
+}
+
+function newClientMutationId() {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return `00000000-0000-4000-8000-${Date.now().toString(16).padStart(12, "0").slice(-12)}`;
 }
 
 function showToast(message: string) {
@@ -1853,6 +2746,9 @@ function parseAmountToCents(value: string): number | undefined {
 }
 
 function formatMoney(cents: number, currency: string) {
+  if (!state.amountsVisible) {
+    return "****";
+  }
   const formatter =
     moneyFormatterCache.get(currency) ??
     new Intl.NumberFormat("zh-CN", {
@@ -1864,6 +2760,17 @@ function formatMoney(cents: number, currency: string) {
 
   moneyFormatterCache.set(currency, formatter);
   return formatter.format(cents / 100);
+}
+
+function formatSignedMoney(
+  cents: number,
+  currency: string,
+  direction: TransactionDirection,
+) {
+  if (!state.amountsVisible) {
+    return "****";
+  }
+  return `${direction === "expense" ? "-" : "+"}${formatMoney(cents, currency)}`;
 }
 
 function formatDate(value?: string) {

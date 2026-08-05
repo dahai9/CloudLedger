@@ -99,6 +99,8 @@ pub struct AppCreateTransactionInput {
     pub amount_minor: i64,
     pub currency: String,
     pub description: String,
+    #[serde(default)]
+    pub client_mutation_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1458,6 +1460,16 @@ impl AppLedgerService {
             return Err(AppServiceError::Unauthorized);
         }
 
+        if let Some(client_mutation_id) = input.client_mutation_id {
+            if let Some(existing) = self.transactions.values().find(|transaction| {
+                transaction.ledger_id == input.ledger_id
+                    && transaction.created_by == input.actor_user_id
+                    && transaction.client_mutation_id == Some(client_mutation_id)
+            }) {
+                return Ok(self.transaction_dto(existing));
+            }
+        }
+
         let account = self
             .accounts
             .get(&input.account_id)
@@ -1516,6 +1528,7 @@ impl AppLedgerService {
             input.description,
             input.actor_user_id,
         );
+        transaction.client_mutation_id = input.client_mutation_id;
 
         if ledger.kind == LedgerKind::OrganizationPublic {
             transaction.submitted_by = Some(input.actor_user_id);
@@ -2338,6 +2351,7 @@ mod tests {
                 amount_minor: 2_000,
                 currency: "CNY".to_string(),
                 description: "工具订阅".to_string(),
+                client_mutation_id: None,
             })
             .expect("create categorized transaction");
         assert_eq!(created.category_id.as_deref(), Some(category.id.as_str()));
@@ -2351,6 +2365,7 @@ mod tests {
             amount_minor: 2_000,
             currency: "CNY".to_string(),
             description: "错误分类".to_string(),
+            client_mutation_id: None,
         });
         assert!(matches!(
             wrong_direction,
@@ -2637,6 +2652,7 @@ mod tests {
             amount_minor: 1_200,
             currency: "CNY".to_string(),
             description: "越权支出".to_string(),
+            client_mutation_id: None,
         });
 
         assert!(matches!(result, Err(AppServiceError::Unauthorized)));
@@ -2687,6 +2703,7 @@ mod tests {
                 amount_minor: 12_800,
                 currency: "CNY".to_string(),
                 description: "快递费".to_string(),
+                client_mutation_id: None,
             })
             .expect("create public transaction");
 
@@ -2907,6 +2924,7 @@ mod tests {
                 amount_minor: 3_300,
                 currency: "CNY".to_string(),
                 description: "差旅费".to_string(),
+                client_mutation_id: None,
             })
             .expect("alice creates public transaction");
         assert_eq!(transaction.approval_state, "submitted");
@@ -2999,6 +3017,7 @@ mod tests {
             amount_minor: 1_000,
             currency: "CNY".to_string(),
             description: "转账".to_string(),
+            client_mutation_id: None,
         });
         let currency_mismatch = service.create_transaction(AppCreateTransactionInput {
             actor_user_id: service.current_user_id(),
@@ -3009,6 +3028,7 @@ mod tests {
             amount_minor: 1_000,
             currency: "USD".to_string(),
             description: "美元支出".to_string(),
+            client_mutation_id: None,
         });
 
         assert!(matches!(
@@ -3019,6 +3039,49 @@ mod tests {
             currency_mismatch,
             Err(AppServiceError::CurrencyMismatch)
         ));
+    }
+
+    #[test]
+    fn create_transaction_reuses_the_same_client_mutation_id() {
+        let mut service = AppLedgerService::seeded();
+        let overview = service.overview(service.current_user_id());
+        let ledger = overview
+            .ledgers
+            .iter()
+            .find(|ledger| ledger.kind == "personal")
+            .expect("seeded private ledger");
+        let account = overview
+            .accounts
+            .iter()
+            .find(|account| account.ledger_id == ledger.id && account.kind == "wechat")
+            .expect("seeded WeChat account");
+        let input = AppCreateTransactionInput {
+            actor_user_id: service.current_user_id(),
+            ledger_id: Uuid::parse_str(&ledger.id).expect("ledger uuid"),
+            account_id: Uuid::parse_str(&account.id).expect("account uuid"),
+            category_id: None,
+            kind: TransactionKind::Expense,
+            amount_minor: 1_800,
+            currency: "CNY".to_string(),
+            description: "离线重试".to_string(),
+            client_mutation_id: Some(Uuid::new_v4()),
+        };
+
+        let first = service
+            .create_transaction(input.clone())
+            .expect("first create succeeds");
+        let second = service.create_transaction(input).expect("retry succeeds");
+
+        assert_eq!(second.id, first.id);
+        assert_eq!(
+            service
+                .overview(service.current_user_id())
+                .transactions
+                .iter()
+                .filter(|transaction| transaction.description == "离线重试")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -3175,6 +3238,7 @@ mod tests {
                 amount_minor: 3_300,
                 currency: "CNY".to_string(),
                 description: "差旅费".to_string(),
+                client_mutation_id: None,
             })
             .expect("owner creates public transaction");
         assert_eq!(transaction.approval_state, "submitted");

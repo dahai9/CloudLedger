@@ -240,7 +240,7 @@ impl PostgresStore {
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
         let transactions = sqlx::query(
-            "SELECT id, ledger_id, account_id, category_id, kind, amount_minor, currency, occurred_at, description, approval_state, payment_state, created_by, submitted_by, approved_by, approved_at, paid_by, paid_at, received_by, received_at, version, created_at, updated_at, deleted_at FROM transactions ORDER BY id",
+            "SELECT id, client_mutation_id, ledger_id, account_id, category_id, kind, amount_minor, currency, occurred_at, description, approval_state, payment_state, created_by, submitted_by, approved_by, approved_at, paid_by, paid_at, received_by, received_at, version, created_at, updated_at, deleted_at FROM transactions ORDER BY id",
         )
         .fetch_all(&self.pool)
         .await?
@@ -248,6 +248,7 @@ impl PostgresStore {
         .map(|row| {
             Ok(cloudledger_core::Transaction {
                 id: row.try_get("id")?,
+                client_mutation_id: row.try_get("client_mutation_id")?,
                 ledger_id: row.try_get("ledger_id")?,
                 account_id: row.try_get("account_id")?,
                 category_id: row.try_get("category_id")?,
@@ -490,8 +491,9 @@ where
         for entry in &snapshot.transactions {
             sqlx::Executor::execute(
                 &mut **transaction,
-                sqlx::query("INSERT INTO transactions (id, ledger_id, account_id, category_id, kind, amount_minor, currency, occurred_at, description, approval_state, payment_state, created_by, submitted_by, approved_by, approved_at, paid_by, paid_at, received_by, received_at, version, created_at, updated_at, deleted_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)")
+                sqlx::query("INSERT INTO transactions (id, client_mutation_id, ledger_id, account_id, category_id, kind, amount_minor, currency, occurred_at, description, approval_state, payment_state, created_by, submitted_by, approved_by, approved_at, paid_by, paid_at, received_by, received_at, version, created_at, updated_at, deleted_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)")
                     .bind(entry.id)
+                    .bind(entry.client_mutation_id)
                     .bind(entry.ledger_id)
                     .bind(entry.account_id)
                     .bind(entry.category_id)
@@ -561,13 +563,22 @@ where
             sqlx::Executor::execute(
                 &mut **transaction,
                 sqlx::query(
-                    "INSERT INTO auth_installations (installation_id, user_id) VALUES ($1, $2) ON CONFLICT (installation_id) DO NOTHING",
+                    "INSERT INTO auth_installations (installation_id, user_id) VALUES ($1, $2) ON CONFLICT (installation_id) DO UPDATE SET user_id = EXCLUDED.user_id",
                 )
                 .bind(installation_id)
                 .bind(user_id),
             )
             .await?;
         }
+        let installation_ids = snapshot
+            .installations
+            .iter()
+            .map(|(installation_id, _)| installation_id)
+            .collect::<Vec<_>>();
+        sqlx::query("DELETE FROM auth_installations WHERE NOT (installation_id = ANY($1))")
+            .bind(installation_ids)
+            .execute(&mut **transaction)
+            .await?;
         for session in &snapshot.sessions {
             let installation_id =
                 (!session.installation_id.is_empty()).then_some(session.installation_id.as_str());

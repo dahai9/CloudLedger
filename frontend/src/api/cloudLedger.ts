@@ -43,7 +43,7 @@ export interface CloudLedgerApi {
     name: string,
     direction: Category["direction"],
   ): Promise<Category>;
-  createTransaction(draft: NewTransactionDraft): Promise<Transaction>;
+  createTransaction(draft: NewTransactionDraft, clientMutationId?: string): Promise<Transaction>;
   decideApproval(
     transactionId: string,
     decision: "approve" | "reject",
@@ -66,6 +66,19 @@ let overviewCache: LedgerOverview | undefined;
 const installationStorageKey = "cloudledger.installationId";
 const isTauriRuntime =
   "__TAURI_INTERNALS__" in window || window.location.hostname === "tauri.localhost";
+const isNgrokTunnel = (() => {
+  try {
+    const hostname = new URL(cloudBaseUrl).hostname;
+    return (
+      hostname.endsWith(".ngrok-free.dev") ||
+      hostname.endsWith(".ngrok.app") ||
+      hostname.endsWith(".ngrok.io")
+    );
+  } catch {
+    return false;
+  }
+})();
+let ngrokWarningBypass: Promise<boolean> | undefined;
 let memorySession: AuthSession | undefined;
 let sessionRestoreAttempted = false;
 
@@ -204,7 +217,7 @@ const serverApi: CloudLedgerApi = {
     return mapCategory(category);
   },
 
-  async createTransaction(draft) {
+  async createTransaction(draft, clientMutationId) {
     const overview = overviewCache ?? (await getOverview());
     const account = overview.accounts.find((item) => item.id === draft.accountId);
     const category = categoryFromDraft(draft, overview);
@@ -219,6 +232,7 @@ const serverApi: CloudLedgerApi = {
         amountMinor: draft.amountCents,
         currency: account?.currency ?? "CNY",
         description: draft.memo?.trim() || category?.name || ledger?.name || "未命名流水",
+        clientMutationId,
       },
     });
 
@@ -360,8 +374,11 @@ async function refreshStoredSession(session: AuthSession) {
   });
 
   if (!response.ok) {
-    await clearSession();
-    throw new AuthRequiredError();
+    if (response.status === 400 || response.status === 401 || response.status === 403) {
+      await clearSession();
+      throw new AuthRequiredError();
+    }
+    throw await responseError(response);
   }
 
   await storeSession(normalizeSession((await response.json()) as AuthSession));
@@ -373,42 +390,81 @@ async function responseError(response: Response) {
 }
 
 async function cloudFetch(path: string, init?: RequestInit) {
+  const controller = init?.signal ? undefined : new AbortController();
+  const timeout = controller ? window.setTimeout(() => controller.abort(), 5_000) : undefined;
   try {
+    const headers = new Headers(init?.headers);
+    if (await ngrokWarningBypassEnabled()) {
+      headers.set("ngrok-skip-browser-warning", "true");
+    }
     return await fetch(`${cloudBaseUrl}${path}`, {
       credentials: isTauriRuntime ? init?.credentials : "include",
       ...init,
+      headers,
+      signal: init?.signal ?? controller?.signal,
     });
   } catch (error) {
     const detail = error instanceof DOMException && error.name === "AbortError" ? "请求超时" : "网络请求失败";
     throw new Error(`无法连接后端 ${cloudBaseUrl}（${detail}）`, { cause: error });
+  } finally {
+    if (timeout !== undefined) window.clearTimeout(timeout);
   }
+}
+
+async function ngrokWarningBypassEnabled() {
+  if (!isNgrokTunnel) return false;
+  const probe =
+    ngrokWarningBypass ??
+    fetch(`${cloudBaseUrl}/auth/bootstrap`, {
+      method: "POST",
+      credentials: isTauriRuntime ? undefined : "include",
+    })
+      .then(async (response) => {
+        if (!response.ok) return false;
+        const bootstrap = (await response.json()) as { ngrokWarningBypassEnabled?: boolean };
+        return bootstrap.ngrokWarningBypassEnabled === true;
+      })
+      .catch(() => false);
+  ngrokWarningBypass = probe;
+  const enabled = await probe;
+  if (!enabled && ngrokWarningBypass === probe) {
+    ngrokWarningBypass = undefined;
+  }
+  return enabled;
 }
 
 async function restoreSession(): Promise<AuthSession | undefined> {
   if (memorySession || sessionRestoreAttempted) return memorySession;
   sessionRestoreAttempted = true;
-  if (isTauriRuntime) {
-    const secure = await invoke<{ refreshToken: string; installationId: string } | null>(
-      "secure_session_load",
-    );
-    if (secure) {
-      await refreshStoredSession({
-        accessToken: "",
-        refreshToken: secure.refreshToken,
-        installationId: secure.installationId,
-        user: { id: "", displayName: "" },
-      });
+  try {
+    if (isTauriRuntime) {
+      const secure = await invoke<{ refreshToken: string; installationId: string } | null>(
+        "secure_session_load",
+      );
+      if (secure) {
+        await refreshStoredSession({
+          accessToken: "",
+          refreshToken: secure.refreshToken,
+          installationId: secure.installationId,
+          user: { id: "", displayName: "" },
+        });
+      }
+    } else {
+      try {
+        await refreshStoredSession({
+          accessToken: "",
+          installationId: getInstallationId(),
+          user: { id: "", displayName: "" },
+        });
+      } catch (error) {
+        if (!(error instanceof AuthRequiredError)) throw error;
+      }
     }
-  } else {
-    try {
-      await refreshStoredSession({
-        accessToken: "",
-        installationId: getInstallationId(),
-        user: { id: "", displayName: "" },
-      });
-    } catch (error) {
-      if (!(error instanceof AuthRequiredError)) throw error;
+  } catch (error) {
+    if (!(error instanceof AuthRequiredError)) {
+      sessionRestoreAttempted = false;
     }
+    throw error;
   }
   return memorySession;
 }
@@ -416,6 +472,7 @@ async function restoreSession(): Promise<AuthSession | undefined> {
 async function storeSession(session: AuthSession) {
   const normalized = normalizeSession(session);
   memorySession = normalized;
+  sessionRestoreAttempted = true;
   if (isTauriRuntime && normalized.refreshToken) {
     await invoke("secure_session_store", {
       refreshToken: normalized.refreshToken,

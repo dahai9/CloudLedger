@@ -125,6 +125,13 @@ export interface NewTransactionDraft {
   submitForApproval: boolean;
 }
 
+export interface OfflineTransaction {
+  localId: string;
+  clientMutationId: string;
+  draft: NewTransactionDraft;
+  createdAt: string;
+}
+
 export interface ApprovalQueueItem {
   id: string;
   transactionId: string;

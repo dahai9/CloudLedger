@@ -546,9 +546,10 @@ impl AuthService {
         let access_token = token_digest(access_token);
         let session = self
             .sessions_by_access_token
-            .get_mut(&access_token)
+            .get(&access_token)
+            .cloned()
             .ok_or(AuthError::SessionNotFound)?;
-        session.revoked_at = Some(OffsetDateTime::now_utc());
+        self.revoke_installation_sessions(&session);
         Ok(())
     }
 
@@ -563,7 +564,7 @@ impl AuthService {
             .get(access_hash)
             .cloned()
             .ok_or(AuthError::SessionNotFound)?;
-        self.revoke_family(session.family_id);
+        self.revoke_installation_sessions(&session);
         Ok(session.user_id)
     }
 
@@ -822,6 +823,19 @@ impl AuthService {
         }
         self.installations_by_id
             .retain(|_, installed_user_id| *installed_user_id != user_id);
+    }
+
+    fn revoke_installation_sessions(&mut self, session: &StoredSession) {
+        let now = OffsetDateTime::now_utc();
+        for stored in self.sessions_by_access_token.values_mut() {
+            if stored.user_id == session.user_id
+                && stored.installation_id == session.installation_id
+                && stored.kind == session.kind
+            {
+                stored.revoked_at = Some(now);
+            }
+        }
+        self.installations_by_id.remove(&session.installation_id);
     }
 
     fn prune_expired_sessions(&mut self) {
@@ -1167,6 +1181,52 @@ mod tests {
             .unwrap_err(),
             AuthError::InstallationAlreadyBound
         );
+    }
+
+    #[test]
+    fn logout_releases_installation_for_another_user() {
+        let mut auth = AuthService::default();
+        let alice = auth
+            .register(RegisterInput {
+                user_id: None,
+                display_name: "Alice".to_string(),
+                email: Some("alice@example.com".to_string()),
+                phone: None,
+                password: "correct-password".to_string(),
+                installation_id: "phone-1".to_string(),
+            })
+            .unwrap();
+        let bob = auth
+            .register(RegisterInput {
+                user_id: None,
+                display_name: "Bob".to_string(),
+                email: Some("bob@example.com".to_string()),
+                phone: None,
+                password: "correct-password".to_string(),
+                installation_id: "phone-2".to_string(),
+            })
+            .unwrap();
+
+        auth.logout(&alice.access_token).unwrap();
+
+        assert!(auth.authenticate_access_token(&alice.access_token).is_err());
+        assert_eq!(
+            auth.refresh(RefreshInput {
+                refresh_token: alice.refresh_token,
+                installation_id: "phone-1".to_string(),
+            })
+            .unwrap_err(),
+            AuthError::RefreshReplayDetected
+        );
+        let switched = auth
+            .login(LoginInput {
+                email: Some("bob@example.com".to_string()),
+                phone: None,
+                password: "correct-password".to_string(),
+                installation_id: "phone-1".to_string(),
+            })
+            .unwrap();
+        assert_eq!(switched.user.id, bob.user.id);
     }
 
     #[test]

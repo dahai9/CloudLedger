@@ -215,6 +215,8 @@ pub enum PaymentState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     pub id: Uuid,
+    #[serde(default)]
+    pub client_mutation_id: Option<Uuid>,
     pub ledger_id: Uuid,
     pub account_id: Uuid,
     pub category_id: Option<Uuid>,
@@ -257,6 +259,7 @@ impl Transaction {
         let now = OffsetDateTime::now_utc();
         Self {
             id: Uuid::new_v4(),
+            client_mutation_id: None,
             ledger_id,
             account_id,
             category_id,

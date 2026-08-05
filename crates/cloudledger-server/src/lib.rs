@@ -20,7 +20,7 @@ use axum::{
             AUTHORIZATION, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, REFERRER_POLICY,
             X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
         },
-        HeaderValue, Method, StatusCode,
+        HeaderName, HeaderValue, Method, StatusCode,
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -52,6 +52,12 @@ pub struct ReadyResponse {
     pub public_ledger_authority: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthBootstrapResponse {
+    pub ngrok_warning_bypass_enabled: bool,
+}
+
 pub fn router(state: ServerState) -> Router {
     let cors = cors_layer(&state);
     let request_security = state.request_security.clone();
@@ -68,6 +74,7 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/auth/logout", post(auth_routes::legacy_upgrade))
         .route("/auth/security", get(auth_routes::auth_security))
+        .route("/auth/bootstrap", post(auth_bootstrap))
         .route("/auth/tauri/login", post(auth_routes::tauri_login))
         .route("/auth/tauri/refresh", post(auth_routes::tauri_refresh))
         .route("/auth/tauri/logout", post(auth_routes::tauri_logout))
@@ -96,7 +103,6 @@ pub fn router(state: ServerState) -> Router {
         )
         .with_state(state)
         .layer(DefaultBodyLimit::max(64 * 1024))
-        .layer(cors)
         .layer(middleware::from_fn_with_state(
             rate_limit_state,
             security_rate_limits,
@@ -106,6 +112,10 @@ pub fn router(state: ServerState) -> Router {
             request_security::resolve_request_context,
         ))
         .layer(TraceLayer::new_for_http())
+        // Keep CORS outermost so rate-limit and authentication failures remain
+        // observable to an allowed browser origin instead of looking like a
+        // transport failure.
+        .layer(cors)
 }
 
 async fn security_rate_limits(
@@ -163,10 +173,14 @@ fn cors_layer(state: &ServerState) -> CorsLayer {
         .iter()
         .map(|origin| HeaderValue::from_str(origin).expect("validated CORS origin"))
         .collect::<Vec<_>>();
+    let mut headers = vec![AUTHORIZATION, CONTENT_TYPE];
+    if state.ngrok_warning_bypass_enabled {
+        headers.push(HeaderName::from_static("ngrok-skip-browser-warning"));
+    }
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods([Method::GET, Method::POST, Method::PATCH])
-        .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+        .allow_headers(headers)
         .allow_credentials(true)
 }
 
@@ -204,6 +218,12 @@ async fn ready(State(state): State<ServerState>) -> Json<ReadyResponse> {
         server_id: state.server_id,
         sync_model: "cloud_authoritative_public_ledgers",
         public_ledger_authority: "server",
+    })
+}
+
+async fn auth_bootstrap(State(state): State<ServerState>) -> Json<AuthBootstrapResponse> {
+    Json(AuthBootstrapResponse {
+        ngrok_warning_bypass_enabled: state.ngrok_warning_bypass_enabled,
     })
 }
 
@@ -258,6 +278,25 @@ mod http_tests {
             .unwrap();
         let app = router(state);
 
+        let bootstrap = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/auth/bootstrap")
+                    .header(header::ORIGIN, "tauri://localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bootstrap.status(), StatusCode::OK);
+        let bootstrap_body = to_bytes(bootstrap.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bootstrap_body).unwrap(),
+            json!({"ngrokWarningBypassEnabled": true})
+        );
+
         let legacy = app
             .clone()
             .oneshot(request(Method::POST, "/auth/login", json!({})))
@@ -284,6 +323,10 @@ mod http_tests {
             .uri("/app/overview")
             .header(header::ORIGIN, "tauri://localhost")
             .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .header(
+                header::ACCESS_CONTROL_REQUEST_HEADERS,
+                "authorization,ngrok-skip-browser-warning",
+            )
             .body(Body::empty())
             .unwrap();
         let preflight = app.clone().oneshot(preflight).await.unwrap();
@@ -294,6 +337,11 @@ mod http_tests {
                 .and_then(|value| value.to_str().ok()),
             Some("tauri://localhost")
         );
+        assert!(preflight
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|headers| headers.contains("ngrok-skip-browser-warning")));
 
         let rejected_origin = Request::builder()
             .method(Method::OPTIONS)
@@ -322,6 +370,33 @@ mod http_tests {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
         assert!(!allowed_methods.contains("DELETE"));
+
+        for attempt in 1..=21 {
+            let mut invalid_bearer = request(Method::GET, "/auth/tauri/me", json!({}));
+            invalid_bearer
+                .headers_mut()
+                .insert(header::ORIGIN, HeaderValue::from_static("tauri://localhost"));
+            invalid_bearer.headers_mut().insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer invalid-access-token"),
+            );
+            let response = app.clone().oneshot(invalid_bearer).await.unwrap();
+            assert_eq!(
+                response.status(),
+                if attempt <= 20 {
+                    StatusCode::UNAUTHORIZED
+                } else {
+                    StatusCode::TOO_MANY_REQUESTS
+                }
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .and_then(|value| value.to_str().ok()),
+                Some("tauri://localhost")
+            );
+        }
 
         let oversized = app
             .clone()
@@ -386,6 +461,52 @@ mod http_tests {
         }
 
         drop(app);
+        fs::remove_dir_all(data_dir).expect("remove test data");
+    }
+
+    #[tokio::test]
+    async fn reverse_proxy_mode_disables_ngrok_warning_bypass() {
+        let data_dir = std::env::temp_dir().join(format!("cloudledger-http-{}", Uuid::new_v4()));
+        let mut state = ServerState::load(data_dir.clone()).expect("load test state");
+        state.ngrok_warning_bypass_enabled = false;
+        let app = router(state);
+
+        let bootstrap = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/auth/bootstrap")
+                    .header(header::ORIGIN, "tauri://localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bootstrap_body = to_bytes(bootstrap.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bootstrap_body).unwrap(),
+            json!({"ngrokWarningBypassEnabled": false})
+        );
+
+        let preflight = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/auth/tauri/me")
+            .header(header::ORIGIN, "tauri://localhost")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .header(
+                header::ACCESS_CONTROL_REQUEST_HEADERS,
+                "authorization,ngrok-skip-browser-warning",
+            )
+            .body(Body::empty())
+            .unwrap();
+        let preflight = app.oneshot(preflight).await.unwrap();
+        assert!(preflight
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .and_then(|value| value.to_str().ok())
+            .is_none_or(|headers| !headers.contains("ngrok-skip-browser-warning")));
+
         fs::remove_dir_all(data_dir).expect("remove test data");
     }
 }

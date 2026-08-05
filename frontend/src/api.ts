@@ -154,6 +154,7 @@ export interface CreateTransactionInput {
   amountMinor: number;
   currency: string;
   description: string;
+  clientMutationId?: string;
 }
 
 export interface CreateCategoryInput {

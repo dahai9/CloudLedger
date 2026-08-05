@@ -9,9 +9,13 @@ use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
 use uuid::Uuid;
 
+mod offline_store;
+use offline_store::OfflineStore;
+
 struct AppState {
     ledger_service: Mutex<AppLedgerService>,
     storage_path: PathBuf,
+    offline_store: OfflineStore,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +39,27 @@ const CREDENTIAL_USER: &str = "refresh-session-v1";
 #[tauri::command]
 fn health() -> &'static str {
     "ok"
+}
+
+#[tauri::command]
+fn offline_cache_load(state: State<'_, AppState>) -> Result<Option<serde_json::Value>, String> {
+    state.offline_store.load_last()
+}
+
+#[tauri::command]
+fn offline_cache_store(
+    state: State<'_, AppState>,
+    user_id: String,
+    document: serde_json::Value,
+) -> Result<(), String> {
+    Uuid::parse_str(&user_id).map_err(|_| "invalid offline cache user id".to_string())?;
+    state.offline_store.save(&user_id, &document)
+}
+
+#[tauri::command]
+fn offline_cache_clear(state: State<'_, AppState>, user_id: String) -> Result<(), String> {
+    Uuid::parse_str(&user_id).map_err(|_| "invalid offline cache user id".to_string())?;
+    state.offline_store.clear(&user_id)
 }
 
 #[tauri::command]
@@ -220,16 +245,22 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let storage_path = app.path().app_data_dir()?.join("ledger-state.json");
+            let offline_store = OfflineStore::open(app.path().app_data_dir()?.join("offline-cache.sqlite"))
+                .map_err(std::io::Error::other)?;
             let ledger_service = AppLedgerService::load_or_seed(&storage_path)?;
             app.manage(AppState {
                 ledger_service: Mutex::new(ledger_service),
                 storage_path,
+                offline_store,
             });
             app.manage(SecureSessionState::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             health,
+            offline_cache_load,
+            offline_cache_store,
+            offline_cache_clear,
             secure_session_store,
             secure_session_load,
             secure_session_clear,

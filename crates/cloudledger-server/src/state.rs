@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::audit::AuditSigner;
 use crate::auth::AuthService;
-use crate::config::BackendConfig;
+use crate::config::{BackendConfig, RunMode};
 use crate::login_protection::{LoginProtectionConfig, SharedLoginProtection};
 use crate::platform_auth::PlatformSessions;
 use crate::request_security::RequestSecurity;
@@ -37,6 +37,7 @@ pub struct ServerState {
     pub turnstile: Arc<TurnstileVerifier>,
     pub request_security: RequestSecurity,
     pub cors_allowed_origins: Arc<Vec<String>>,
+    pub ngrok_warning_bypass_enabled: bool,
     pub web_login_enabled: bool,
 }
 
@@ -48,6 +49,7 @@ struct StateInitialization {
     turnstile: TurnstileVerifier,
     request_security: RequestSecurity,
     cors_allowed_origins: Vec<String>,
+    ngrok_warning_bypass_enabled: bool,
     web_login_enabled: bool,
     ledger_service: AppLedgerService,
     auth_service: AuthService,
@@ -90,6 +92,7 @@ impl ServerState {
             turnstile: TurnstileVerifier::from_config(&config.security.turnstile)?,
             request_security: RequestSecurity::from_config(&config.security.network),
             cors_allowed_origins: config.security.network.cors_allowed_origins.clone(),
+            ngrok_warning_bypass_enabled: config.server.mode == RunMode::Development,
             web_login_enabled: config.server.web_login_enabled,
             ledger_service,
             auth_service,
@@ -120,6 +123,7 @@ impl ServerState {
             turnstile: TurnstileVerifier::from_config(&config.security.turnstile)?,
             request_security: RequestSecurity::from_config(&config.security.network),
             cors_allowed_origins: config.security.network.cors_allowed_origins.clone(),
+            ngrok_warning_bypass_enabled: config.server.mode == RunMode::Development,
             web_login_enabled: config.server.web_login_enabled,
             ledger_service,
             auth_service,
@@ -136,6 +140,7 @@ impl ServerState {
             turnstile,
             request_security,
             cors_allowed_origins,
+            ngrok_warning_bypass_enabled,
             web_login_enabled,
             ledger_service,
             auth_service,
@@ -161,6 +166,7 @@ impl ServerState {
             turnstile: Arc::new(turnstile),
             request_security,
             cors_allowed_origins: Arc::new(cors_allowed_origins),
+            ngrok_warning_bypass_enabled,
             web_login_enabled,
             data_dir,
         })
