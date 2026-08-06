@@ -29,6 +29,8 @@ pub enum SecurityRateKind {
     AnonymousProbe,
 }
 
+pub(crate) const INVALID_BEARER_LIMIT: u32 = 60;
+
 #[derive(Debug, Clone)]
 pub struct LoginProtectionConfig {
     turnstile_after_failures: u32,
@@ -443,9 +445,11 @@ impl SecurityRateKind {
 fn security_rate_policy(kind: SecurityRateKind) -> (u32, Duration, Duration) {
     match kind {
         SecurityRateKind::Refresh => (30, Duration::from_secs(60), Duration::from_secs(5 * 60)),
-        SecurityRateKind::InvalidBearer => {
-            (60, Duration::from_secs(60), Duration::from_secs(10 * 60))
-        }
+        SecurityRateKind::InvalidBearer => (
+            INVALID_BEARER_LIMIT,
+            Duration::from_secs(60),
+            Duration::from_secs(10 * 60),
+        ),
         SecurityRateKind::AnonymousProbe => {
             (120, Duration::from_secs(60), Duration::from_secs(10 * 60))
         }

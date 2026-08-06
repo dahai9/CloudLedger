@@ -241,6 +241,7 @@ mod http_tests {
 
     use super::*;
     use crate::auth::{AccountKind, AdminCreateUserInput};
+    use crate::login_protection::INVALID_BEARER_LIMIT;
 
     fn request(method: Method, uri: &str, body: serde_json::Value) -> Request<Body> {
         let mut request = Request::builder()
@@ -371,11 +372,12 @@ mod http_tests {
             .unwrap_or_default();
         assert!(!allowed_methods.contains("DELETE"));
 
-        for attempt in 1..=21 {
+        for attempt in 1..=INVALID_BEARER_LIMIT {
             let mut invalid_bearer = request(Method::GET, "/auth/tauri/me", json!({}));
-            invalid_bearer
-                .headers_mut()
-                .insert(header::ORIGIN, HeaderValue::from_static("tauri://localhost"));
+            invalid_bearer.headers_mut().insert(
+                header::ORIGIN,
+                HeaderValue::from_static("tauri://localhost"),
+            );
             invalid_bearer.headers_mut().insert(
                 header::AUTHORIZATION,
                 HeaderValue::from_static("Bearer invalid-access-token"),
@@ -383,7 +385,7 @@ mod http_tests {
             let response = app.clone().oneshot(invalid_bearer).await.unwrap();
             assert_eq!(
                 response.status(),
-                if attempt <= 20 {
+                if attempt < INVALID_BEARER_LIMIT {
                     StatusCode::UNAUTHORIZED
                 } else {
                     StatusCode::TOO_MANY_REQUESTS

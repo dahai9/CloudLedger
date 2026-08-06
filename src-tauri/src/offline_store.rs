@@ -35,7 +35,10 @@ impl OfflineStore {
     }
 
     pub fn load_last(&self) -> Result<Option<Value>, String> {
-        let connection = self.connection.lock().map_err(|_| "offline store lock poisoned")?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "offline store lock poisoned")?;
         let document = connection
             .query_row(
                 "SELECT cache.document
@@ -58,8 +61,13 @@ impl OfflineStore {
             return Err("offline cache exceeds 5 MiB".to_string());
         }
         let document = String::from_utf8(encoded).map_err(|error| error.to_string())?;
-        let mut connection = self.connection.lock().map_err(|_| "offline store lock poisoned")?;
-        let transaction = connection.transaction().map_err(|error| error.to_string())?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| "offline store lock poisoned")?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
         transaction
             .execute(
                 "INSERT INTO offline_cache (user_id, document, updated_at)
@@ -81,10 +89,18 @@ impl OfflineStore {
     }
 
     pub fn clear(&self, user_id: &str) -> Result<(), String> {
-        let mut connection = self.connection.lock().map_err(|_| "offline store lock poisoned")?;
-        let transaction = connection.transaction().map_err(|error| error.to_string())?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| "offline store lock poisoned")?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
         transaction
-            .execute("DELETE FROM offline_cache WHERE user_id = ?1", params![user_id])
+            .execute(
+                "DELETE FROM offline_cache WHERE user_id = ?1",
+                params![user_id],
+            )
             .map_err(|error| error.to_string())?;
         transaction
             .execute(

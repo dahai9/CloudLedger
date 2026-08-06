@@ -245,8 +245,9 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let storage_path = app.path().app_data_dir()?.join("ledger-state.json");
-            let offline_store = OfflineStore::open(app.path().app_data_dir()?.join("offline-cache.sqlite"))
-                .map_err(std::io::Error::other)?;
+            let offline_store =
+                OfflineStore::open(app.path().app_data_dir()?.join("offline-cache.sqlite"))
+                    .map_err(std::io::Error::other)?;
             let ledger_service = AppLedgerService::load_or_seed(&storage_path)?;
             app.manage(AppState {
                 ledger_service: Mutex::new(ledger_service),
