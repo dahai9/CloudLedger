@@ -1,0 +1,47 @@
+services:
+  cloudledger:
+    image: ${CLOUDLEDGER_SERVER_IMAGE:?Set CLOUDLEDGER_SERVER_IMAGE to a GHCR image tag}
+    restart: unless-stopped
+    command: ["--config", "/etc/cloudledger/server.toml"]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /etc/cloudledger/server.toml:/etc/cloudledger/server.toml
+      - cloudledger-data:/var/lib/cloudledger
+
+  postgres:
+    image: ${CLOUDLEDGER_POSTGRES_IMAGE:?Set CLOUDLEDGER_POSTGRES_IMAGE to a GHCR image tag}
+    network_mode: service:cloudledger
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: cloudledger
+      POSTGRES_USER: cloudledger_migration
+      POSTGRES_PASSWORD: ${CLOUDLEDGER_MIGRATION_DB_PASSWORD:?Set CLOUDLEDGER_MIGRATION_DB_PASSWORD}
+      CLOUDLEDGER_RUNTIME_DB_PASSWORD: ${CLOUDLEDGER_RUNTIME_DB_PASSWORD:?Set CLOUDLEDGER_RUNTIME_DB_PASSWORD}
+    command: ["postgres", "-c", "listen_addresses=127.0.0.1"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready --username=cloudledger_migration --dbname=cloudledger"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  caddy:
+    image: caddy:2.10.2-alpine
+    network_mode: service:cloudledger
+    restart: unless-stopped
+    environment:
+      CLOUDLEDGER_API_DOMAIN: ${CLOUDLEDGER_API_DOMAIN:?Set CLOUDLEDGER_API_DOMAIN}
+      CLOUDLEDGER_ADMIN_DOMAIN: ${CLOUDLEDGER_ADMIN_DOMAIN:?Set CLOUDLEDGER_ADMIN_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  cloudledger-data:
+  postgres-data:
+  caddy-data:
+  caddy-config:

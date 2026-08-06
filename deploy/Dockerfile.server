@@ -1,0 +1,25 @@
+FROM rust:1.88-bookworm AS build
+
+WORKDIR /src
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . .
+RUN cargo build --locked --release -p cloudledger-server
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libgcc-s1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 cloudledger \
+    && useradd --uid 10001 --gid cloudledger --home-dir /var/lib/cloudledger \
+      --create-home --shell /usr/sbin/nologin cloudledger
+
+COPY --from=build /src/target/release/cloudledger-server /usr/local/bin/cloudledger-server
+
+USER cloudledger
+EXPOSE 8787 8788
+ENTRYPOINT ["/usr/local/bin/cloudledger-server"]

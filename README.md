@@ -80,6 +80,10 @@ transactions, audit logs, users, installations, and sessions. SQLite remains
 the client-side local/offline cache boundary in `cloudledger-db`; the backend
 does not use SQLite as its primary database.
 
+For a complete Linux production deployment, including dependencies by
+distribution, PostgreSQL roles, Caddy, systemd, migration, and verification,
+see `docs/backend-deployment.md`.
+
 When PostgreSQL has no CloudLedger application metadata, startup imports
 existing `ledger-state.json` and `auth-state.json` files from `server.data_dir`
 in one database transaction. The legacy files are read-only migration sources

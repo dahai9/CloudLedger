@@ -1,0 +1,82 @@
+name: Backend CI
+
+on:
+  push:
+    tags: ["*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  verify-and-build:
+    name: Verify and build Rust backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v19
+
+      - name: Check formatting
+        run: nix develop path:. -c cargo fmt --all -- --check
+
+      - name: Lint
+        run: nix develop path:. -c cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: nix develop path:. -c cargo test --workspace --locked
+
+      - name: Build release server binary
+        run: nix develop path:. -c cargo build -p cloudledger-server --release --locked
+
+      - name: Upload server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudledger-server-linux-x86_64
+          path: target/release/cloudledger-server
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate server image metadata
+        id: server-image
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/cloudledger-server
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest
+
+      - name: Build and publish server image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.server
+          push: true
+          tags: ${{ steps.server-image.outputs.tags }}
+          labels: ${{ steps.server-image.outputs.labels }}
+
+      - name: Generate PostgreSQL image metadata
+        id: postgres-image
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/cloudledger-postgres
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest
+
+      - name: Build and publish PostgreSQL image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.postgres
+          push: true
+          tags: ${{ steps.postgres-image.outputs.tags }}
+          labels: ${{ steps.postgres-image.outputs.labels }}

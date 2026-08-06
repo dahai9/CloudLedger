@@ -44,6 +44,15 @@ android {
                     .plus(getDefaultProguardFile("proguard-android-optimize.txt"))
                     .toList().toTypedArray()
             )
+            val keyStorePath = System.getenv("ANDROID_KEYSTORE_PATH")
+            if (!keyStorePath.isNullOrBlank()) {
+                signingConfig = signingConfigs.create("release") {
+                    storeFile = file(keyStorePath)
+                    storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                    keyAlias = System.getenv("ANDROID_KEY_ALIAS")
+                    keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+                }
+            }
         }
     }
     kotlinOptions {
