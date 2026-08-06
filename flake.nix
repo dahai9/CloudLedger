@@ -3,7 +3,7 @@
 
   inputs = {
     nixpkgs.url = "tarball+https://channels.nixos.org/nixos-26.05/nixexprs.tar.xz";
-    rust-overlay.url = "tarball+https://github.com/oxalica/rust-overlay/archive/refs/heads/master.tar.gz";
+    rust-overlay.url = "github:oxalica/rust-overlay/c5cb13481d718fac906aa9cfd85f9b60e1a546cb";
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
   };
 
