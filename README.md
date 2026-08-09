@@ -57,9 +57,10 @@ The generated file contains these sections:
 - `[security.network]`: trusted proxy CIDRs and exact CORS origins.
 - `[security.audit]`: audit HMAC key ID and 32-byte signing/identifier keys.
 
-PostgreSQL is required before the backend starts. Production uses separate
-`cloudledger_migration` and `cloudledger_runtime` logins. Bootstrap them with
-`deploy/postgres_roles.sql`, put only the runtime URL in `database.url`, then run
+PostgreSQL is required before the backend starts. Production uses a dedicated
+`cloudledger_bootstrap` operator plus separate `cloudledger_migration` and
+`cloudledger_runtime` logins. Bootstrap them with `deploy/postgres_roles.sql`,
+put only the runtime URL in `database.url`, then run
 the one-time migration with the migration URL in
 `CLOUDLEDGER_MIGRATION_DATABASE_URL`:
 
@@ -80,9 +81,56 @@ transactions, audit logs, users, installations, and sessions. SQLite remains
 the client-side local/offline cache boundary in `cloudledger-db`; the backend
 does not use SQLite as its primary database.
 
-For a complete Linux production deployment, including dependencies by
-distribution, PostgreSQL roles, Caddy, systemd, migration, and verification,
-see `docs/backend-deployment.md`.
+## Production Operations
+
+CloudLedger v0.1.4 has one production-administrator entry point:
+
+```bash
+sudo ./deploy/cloudledger-ops.sh
+```
+
+Normal administration is performed only through its numeric, multi-level
+menus; `0` always returns to the previous menu or exits. The script prompts for
+and hides secrets, shows the impact of destructive actions, and requires an
+additional backup-number confirmation before a restore. Public subcommands are
+not supported. The hidden `--internal` tasks are implementation details used
+only by systemd for backup, health checks, restore drills, and Cloudflare
+firewall refreshes.
+
+The complete-install wizard stages versioned deployment assets under
+`/opt/cloudledger` and stores private operations settings in
+`/etc/cloudledger/ops.env`, backend settings in
+`/etc/cloudledger/server.toml`, and rclone settings in
+`/etc/cloudledger/rclone.conf`. It deploys four matching, explicit GHCR tags
+for the server, PostgreSQL, Caddy, and `network-anchor`, never `latest`.
+The shared `network-anchor` publishes HTTP only on
+`127.0.0.1:18080`, leaving any existing public port-80 service untouched; HTTPS
+uses host port `443` and is restricted by nftables to Cloudflare's published IP
+ranges. The firewall unit does not require or control `docker.service`, so its
+failure cannot stop unrelated Docker workloads. The admin host mapping is
+`127.0.0.1:8788:18788`; `network-anchor` relays container port `18788` to the
+backend's namespace-loopback `127.0.0.1:8788`, and administrators connect only
+through an SSH tunnel.
+
+Database migration runs through the dedicated Compose `migration` profile
+after PostgreSQL is healthy and before the long-running backend or Caddy starts.
+Backups use a real non-empty `pg_dump -Fc`. Both local and rclone objects remain
+hidden `.new` candidates until local validation and remote download comparison
+succeed, then become visible through an atomic rename. Restore accepts only a
+canonical regular file in the protected backup directory, binds the manifest ID
+and UTC creation time to that filename, and validates the
+exact nine-member archive, size limits, checksums, normalized `ops.env`, four
+matching GHCR tags from the currently trusted owner, a canonical `server.toml`,
+a matching Origin CA certificate/private-key pair with the required SAN, and the
+current version's trusted Compose and Caddy templates. Candidate Compose parsing
+removes all inherited `CLOUDLEDGER_*` variables. A weekly drill restores the
+latest verified backup into a temporary database and validates the target
+image's migration level, core tables, the audit chain, and successful temporary
+database cleanup. Deployment also probes the configured Turnstile secret
+directly against Cloudflare's `siteverify` endpoint before reporting success.
+
+For the complete host requirements, deployment order, timer units, backup
+contents, and verification gates, see `docs/backend-deployment.md`.
 
 When PostgreSQL has no CloudLedger application metadata, startup imports
 existing `ledger-state.json` and `auth-state.json` files from `server.data_dir`

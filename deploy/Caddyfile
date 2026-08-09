@@ -10,6 +10,7 @@
 }
 
 {$CLOUDLEDGER_API_DOMAIN} {
+	tls /etc/caddy/origin/origin-cert.pem /etc/caddy/origin/origin-key.pem
 	request_body {
 		max_size 64KB
 	}
@@ -19,7 +20,7 @@
 		Referrer-Policy "no-referrer"
 	}
 	reverse_proxy 127.0.0.1:8787 {
-		header_up X-Forwarded-For {http.request.remote.host}
+		header_up X-Forwarded-For {http.request.header.CF-Connecting-IP}
 		header_up X-Forwarded-Proto https
 		transport http {
 			dial_timeout 5s
@@ -28,21 +29,5 @@
 	}
 }
 
-{$CLOUDLEDGER_ADMIN_DOMAIN} {
-	request_body {
-		max_size 64KB
-	}
-	header {
-		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
-		X-Content-Type-Options "nosniff"
-		Referrer-Policy "no-referrer"
-	}
-	reverse_proxy 127.0.0.1:8788 {
-		header_up X-Forwarded-For {http.request.remote.host}
-		header_up X-Forwarded-Proto https
-		transport http {
-			dial_timeout 5s
-			response_header_timeout 30s
-		}
-	}
-}
+# The management listener is intentionally not proxied publicly. Docker
+# publishes it only on the host loopback address for SSH port forwarding.

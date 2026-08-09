@@ -18,6 +18,12 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v19
 
+      - name: Verify production operations toolbox
+        run: |
+          bash -n deploy/cloudledger-ops.sh deploy/tests/cloudledger-ops-test.sh deploy/tests/mock-command.sh deploy/tests/mock-read.bash deploy/docker/network-anchor.sh deploy/docker/postgres-init.sh
+          nix run nixpkgs#shellcheck -- -S warning deploy/cloudledger-ops.sh deploy/tests/cloudledger-ops-test.sh deploy/tests/mock-command.sh deploy/tests/mock-read.bash deploy/docker/network-anchor.sh deploy/docker/postgres-init.sh
+          bash deploy/tests/cloudledger-ops-test.sh
+
       - name: Check formatting
         run: nix develop path:. -c cargo fmt --all -- --check
 
@@ -80,3 +86,39 @@ jobs:
           push: true
           tags: ${{ steps.postgres-image.outputs.tags }}
           labels: ${{ steps.postgres-image.outputs.labels }}
+
+      - name: Generate Caddy image metadata
+        id: caddy-image
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/cloudledger-caddy
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest
+
+      - name: Build and publish Caddy image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.caddy
+          push: true
+          tags: ${{ steps.caddy-image.outputs.tags }}
+          labels: ${{ steps.caddy-image.outputs.labels }}
+
+      - name: Generate network anchor image metadata
+        id: anchor-image
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/cloudledger-network-anchor
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest
+
+      - name: Build and publish network anchor image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.anchor
+          push: true
+          tags: ${{ steps.anchor-image.outputs.tags }}
+          labels: ${{ steps.anchor-image.outputs.labels }}

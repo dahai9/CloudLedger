@@ -1,0 +1,7 @@
+[Unit]
+Description=CloudLedger health check
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/cloudledger/cloudledger-ops.sh --internal health

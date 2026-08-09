@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh CloudLedger Cloudflare-only origin firewall
+Wants=network-online.target
+After=nftables.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/cloudledger/cloudledger-ops.sh --internal firewall-refresh
+
+[Install]
+WantedBy=multi-user.target

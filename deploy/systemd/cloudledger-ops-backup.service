@@ -1,0 +1,10 @@
+[Unit]
+Description=CloudLedger encrypted backup
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/cloudledger/cloudledger-ops.sh --internal backup
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
