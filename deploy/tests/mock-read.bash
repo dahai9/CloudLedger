@@ -42,7 +42,7 @@ read() {
     *registry*|*Registry*) answer=${CLOUDLEDGER_TEST_REGISTRY:-ghcr.io} ;;
     *GitHub*用户名*|*GHCR*用户*|*镜像所有者*|*仓库所有者*) answer=${CLOUDLEDGER_TEST_GHCR_OWNER:-cloudledger} ;;
     *PAT*|*GitHub*令牌*|*GHCR*密码*) answer=${CLOUDLEDGER_TEST_GHCR_PAT:-test-ghcr-pat} ;;
-    *tag*|*Tag*|*版本*) answer=${CLOUDLEDGER_TEST_TAG:-v0.1.4} ;;
+    *tag*|*Tag*|*版本*) answer=${CLOUDLEDGER_TEST_TAG:-v0.1.5} ;;
     *API*域名*) answer=${CLOUDLEDGER_TEST_API_DOMAIN:-cloudledger-test.513921.xyz} ;;
     *管理端*域名*|*Admin*域名*) answer=${CLOUDLEDGER_TEST_ADMIN_DOMAIN:-127.0.0.1} ;;
     *site*key*|*Site*Key*|*站点密钥*) answer=${CLOUDLEDGER_TEST_TURNSTILE_SITE_KEY:-test-turnstile-site-key} ;;

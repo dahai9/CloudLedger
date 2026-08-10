@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly OPS_VERSION="v0.1.4"
+readonly OPS_VERSION="v0.1.5"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 readonly DEPLOY_DIR="${CLOUDLEDGER_DEPLOY_DIR:-/opt/cloudledger}"
@@ -38,6 +38,7 @@ readonly -a OPS_CONFIG_KEYS=(
   CLOUDLEDGER_RCLONE_REMOTE
   CLOUDLEDGER_DISK_WARN CLOUDLEDGER_DISK_CRITICAL CLOUDLEDGER_MEMORY_WARN
   CLOUDLEDGER_CLOUDFLARE_IPV4_URL CLOUDLEDGER_CLOUDFLARE_IPV6_URL CLOUDLEDGER_WEBHOOK_URL
+  CLOUDLEDGER_HTTP_HOST_PORT CLOUDLEDGER_HTTPS_HOST_PORT CLOUDLEDGER_ADMIN_TUNNEL_PORT
 )
 export RCLONE_CONFIG
 
@@ -52,6 +53,7 @@ ACTIVE_RESTORE_DB=''
 ACTIVE_RESTORE_ROLLBACK_DIR=''
 RESTORE_TRANSACTION_ACTIVE=0
 ACTIVE_UPGRADE_ENV_SNAPSHOT=''
+ACTIVE_UPGRADE_ASSET_SNAPSHOT=''
 UPGRADE_MIGRATION_STARTED=0
 ACTIVE_REMOTE_PENDING=''
 SENSITIVE_PATHS=()
@@ -122,7 +124,9 @@ cleanup_remote_pending() {
 }
 cleanup_all() {
   if (( RESTORE_TRANSACTION_ACTIVE == 1 )); then rollback_active_restore || true; fi
-  if [[ -n "$ACTIVE_UPGRADE_ENV_SNAPSHOT" ]]; then handle_active_upgrade_abort || true; fi
+  if [[ -n "$ACTIVE_UPGRADE_ENV_SNAPSHOT" || -n "$ACTIVE_UPGRADE_ASSET_SNAPSHOT" ]]; then
+    handle_active_upgrade_abort || true
+  fi
   cleanup_restore_database || true
   cleanup_remote_pending || true
   cleanup_sensitive_paths || true
@@ -280,6 +284,23 @@ set_env_value() {
   mv -f -- "$temp" "$OPS_ENV" || { remove_sensitive_path "$temp"; return 1; }
   unregister_sensitive_path "$temp"
   chmod 600 "$OPS_ENV" || return 1
+}
+
+remove_env_value() {
+  local key=$1 temp line
+  is_ops_config_key "$key" || return 1
+  [[ -r "$OPS_ENV" ]] || return 0
+  ensure_config_dir || return 1
+  temp=$(mktemp "$(dirname "$OPS_ENV")/.ops.env.XXXXXX") || return 1
+  register_sensitive_path "$temp"
+  chmod 600 "$temp" || { remove_sensitive_path "$temp"; return 1; }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "${line%%=*}" == "$key" ]] || printf '%s\n' "$line" >>"$temp" \
+      || { remove_sensitive_path "$temp"; return 1; }
+  done <"$OPS_ENV"
+  mv -f -- "$temp" "$OPS_ENV" || { remove_sensitive_path "$temp"; return 1; }
+  unregister_sensitive_path "$temp"
+  chmod 600 "$OPS_ENV"
 }
 
 decode_ops_env_value() {
@@ -546,6 +567,9 @@ stage_assets() {
   atomic_copy "$SCRIPT_DIR/Caddyfile" "$DEPLOY_DIR/Caddyfile" 0644 || return 1
   atomic_copy "$SCRIPT_DIR/postgres_roles.sql" "$DEPLOY_DIR/postgres_roles.sql" 0600 || return 1
   atomic_copy "${BASH_SOURCE[0]}" "$DEPLOY_DIR/cloudledger-ops.sh" 0755 || return 1
+  mkdir -p "$DEPLOY_DIR/legacy" || return 1
+  atomic_copy "$SCRIPT_DIR/legacy/compose-v0.1.3.yml" \
+    "$DEPLOY_DIR/legacy/compose-v0.1.3.yml" 0644 || return 1
   mkdir -p "$DEPLOY_DIR/systemd" || return 1
   for unit in "$SCRIPT_DIR"/systemd/cloudledger-ops-*; do
     [[ -f "$unit" ]] || continue
@@ -903,6 +927,9 @@ normalize_ops_env() {
 validate_deployment_config() {
   load_env || return 1
   local name owner image_owner temp
+  for name in CLOUDLEDGER_HTTP_HOST_PORT CLOUDLEDGER_HTTPS_HOST_PORT CLOUDLEDGER_ADMIN_TUNNEL_PORT; do
+    [[ -z "${!name:-}" ]] || { fail '当前配置仍包含旧版端口键，请通过升级向导执行受控接管。'; return 1; }
+  done
   for name in CLOUDLEDGER_GHCR_OWNER CLOUDLEDGER_SERVER_IMAGE CLOUDLEDGER_POSTGRES_IMAGE CLOUDLEDGER_CADDY_IMAGE \
     CLOUDLEDGER_ANCHOR_IMAGE CLOUDLEDGER_RELEASE_TAG CLOUDLEDGER_API_DOMAIN \
     CLOUDLEDGER_BOOTSTRAP_DB_PASSWORD CLOUDLEDGER_MIGRATION_DB_PASSWORD CLOUDLEDGER_RUNTIME_DB_PASSWORD \
@@ -1871,6 +1898,12 @@ validate_candidate_bundle() {
     || { fail '备份 Caddyfile 与当前运维工具版本不匹配。'; return 1; }
   normalize_ops_env_file "$root/compose.env" "$normalized" \
     || { fail '备份 compose.env 包含未知键、重复键或不安全语法。'; return 1; }
+  for key in CLOUDLEDGER_HTTP_HOST_PORT CLOUDLEDGER_HTTPS_HOST_PORT CLOUDLEDGER_ADMIN_TUNNEL_PORT; do
+    if ops_env_file_value "$normalized" "$key" value; then
+      fail '备份包含已废弃的 v0.1.3 端口配置。'
+      return 1
+    fi
+  done
   if ! ops_env_file_value "$normalized" CLOUDLEDGER_GHCR_OWNER owner \
     || [[ ! "$owner" =~ ^[a-z0-9_.-]+$ || "$owner" != "$trusted_owner" ]]; then
     fail "备份 GHCR owner 不匹配当前可信 owner: $trusted_owner"
@@ -2222,6 +2255,175 @@ internal_restore_test() {
   ok "临时数据库恢复演练通过：$restored_count 个 SQLx migration、核心业务表和审计链均已验证。"
 }
 
+legacy_deployment_detected() {
+  [[ -n "${CLOUDLEDGER_HTTP_HOST_PORT:-}" || -n "${CLOUDLEDGER_HTTPS_HOST_PORT:-}" \
+    || -n "${CLOUDLEDGER_ADMIN_TUNNEL_PORT:-}" ]]
+}
+
+server_config_value() {
+  local variable=$1 section=$2 key=$3
+  local -a values=()
+  mapfile -t values < <(awk -v section="[$section]" -v key="$key" '
+    /^\[/ { active = ($0 == section); next }
+    active && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+      line = $0
+      sub("^[[:space:]]*" key "[[:space:]]*=[[:space:]]*\"", "", line)
+      sub("\"[[:space:]]*$", "", line)
+      print line
+    }
+  ' "$SERVER_CONFIG")
+  [[ ${#values[@]} -eq 1 && "${values[0]}" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+  printf -v "$variable" '%s' "${values[0]}"
+}
+
+validate_legacy_deployment() {
+  local legacy_compose="$SCRIPT_DIR/legacy/compose-v0.1.3.yml" owner tag cert key
+  [[ -f "$legacy_compose" && -f "$SCRIPT_DIR/Caddyfile" ]] \
+    || { fail '缺少 v0.1.3 接管信任模板。'; return 1; }
+  cmp -s "$COMPOSE_FILE" "$legacy_compose" \
+    || { fail '旧 Compose 不等于受支持的 v0.1.3 模板，拒绝自动接管。'; return 1; }
+  cmp -s "$DEPLOY_DIR/Caddyfile" "$SCRIPT_DIR/Caddyfile" \
+    || { fail '旧 Caddyfile 不等于当前可信模板，拒绝自动接管。'; return 1; }
+  [[ "${CLOUDLEDGER_HTTP_HOST_PORT:-}" == 18080 \
+    && "${CLOUDLEDGER_HTTPS_HOST_PORT:-}" == 443 \
+    && "${CLOUDLEDGER_ADMIN_TUNNEL_PORT:-}" == 8788 ]] \
+    || { fail '旧部署端口不符合受支持的 v0.1.3 接管边界。'; return 1; }
+  [[ "${CLOUDLEDGER_SERVER_IMAGE:-}" == ghcr.io/*/cloudledger-server:* \
+    && "${CLOUDLEDGER_POSTGRES_IMAGE:-}" == ghcr.io/*/cloudledger-postgres:* ]] \
+    || { fail '旧部署的 server/PostgreSQL 镜像来源无效。'; return 1; }
+  owner=${CLOUDLEDGER_SERVER_IMAGE#ghcr.io/}; owner=${owner%%/*}
+  tag=${CLOUDLEDGER_SERVER_IMAGE##*:}
+  [[ "$owner" =~ ^[a-z0-9_.-]+$ && "$tag" == v0.1.3 ]] \
+    && valid_ghcr_image "$CLOUDLEDGER_POSTGRES_IMAGE" cloudledger-postgres "$tag" \
+    || { fail '仅支持接管 server/PostgreSQL 镜像同为 v0.1.3 的旧部署。'; return 1; }
+  cert=${CLOUDLEDGER_CADDY_ORIGIN_CERT_PATH:-}
+  key=${CLOUDLEDGER_CADDY_ORIGIN_KEY_PATH:-}
+  [[ -f "$cert" && ! -L "$cert" && -f "$key" && ! -L "$key" ]] \
+    || { fail '旧部署 Origin CA 文件缺失或不是普通文件。'; return 1; }
+  validate_certificate_pair "$cert" "$key" "$CLOUDLEDGER_API_DOMAIN" || return 1
+  ok "已识别可受控接管的 CloudLedger $tag 部署。"
+}
+
+create_legacy_upgrade_snapshot() {
+  local id temp archive cert key name
+  id=$(date -u +%Y%m%d-%H%M%S)-$$
+  temp=$(mktemp -d "$STATE_DIR/.legacy-upgrade-$id.XXXXXX") || return 1
+  register_sensitive_path "$temp"
+  chmod 700 "$temp" || { remove_sensitive_path "$temp"; return 1; }
+  cert=${CLOUDLEDGER_CADDY_ORIGIN_CERT_PATH:-}
+  key=${CLOUDLEDGER_CADDY_ORIGIN_KEY_PATH:-}
+  pg_dump_to_file "$temp/postgres.dump" || { remove_sensitive_path "$temp"; return 1; }
+  copy_backup_source "$SERVER_CONFIG" "$temp/server.toml" || { remove_sensitive_path "$temp"; return 1; }
+  copy_backup_source "$OPS_ENV" "$temp/ops.env" || { remove_sensitive_path "$temp"; return 1; }
+  copy_backup_source "$COMPOSE_FILE" "$temp/compose.yml" || { remove_sensitive_path "$temp"; return 1; }
+  copy_backup_source "$DEPLOY_DIR/Caddyfile" "$temp/Caddyfile" || { remove_sensitive_path "$temp"; return 1; }
+  copy_backup_source "$DEPLOY_DIR/cloudledger-ops.sh" "$temp/cloudledger-ops.sh" || { remove_sensitive_path "$temp"; return 1; }
+  copy_backup_source "$DEPLOY_DIR/postgres_roles.sql" "$temp/postgres_roles.sql" || { remove_sensitive_path "$temp"; return 1; }
+  copy_backup_source "$cert" "$temp/origin-cert.pem" || { remove_sensitive_path "$temp"; return 1; }
+  copy_backup_source "$key" "$temp/origin-key.pem" || { remove_sensitive_path "$temp"; return 1; }
+  if ! (cd "$temp" && sha256sum postgres.dump server.toml ops.env compose.yml Caddyfile \
+    cloudledger-ops.sh postgres_roles.sql origin-cert.pem origin-key.pem >SHA256SUMS \
+    && sha256sum -c SHA256SUMS >/dev/null); then
+    remove_sensitive_path "$temp"
+    return 1
+  fi
+  archive="$STATE_DIR/cloudledger-legacy-pre-upgrade-$id.tar"
+  tar -C "$temp" -cf "$archive.new" . || { rm -f -- "$archive.new"; remove_sensitive_path "$temp"; return 1; }
+  chmod 600 "$archive.new" || { rm -f -- "$archive.new"; remove_sensitive_path "$temp"; return 1; }
+  name=$(tar -tf "$archive.new" | wc -l)
+  [[ "$name" -eq 11 ]] || { rm -f -- "$archive.new"; remove_sensitive_path "$temp"; return 1; }
+  mv -f -- "$archive.new" "$archive" || { rm -f -- "$archive.new"; remove_sensitive_path "$temp"; return 1; }
+  remove_sensitive_path "$temp" || return 1
+  ok "旧版数据库与配置已保存为权限 0600 的接管快照: $archive"
+}
+
+snapshot_upgrade_assets() {
+  local variable=$1 target name source marker
+  target=$(mktemp -d "${TMPDIR:-/tmp}/cloudledger-upgrade-assets.XXXXXX") || return 1
+  register_sensitive_path "$target"
+  chmod 700 "$target" || { remove_sensitive_path "$target"; return 1; }
+  for name in compose.yml Caddyfile postgres_roles.sql cloudledger-ops.sh; do
+    copy_backup_source "$DEPLOY_DIR/$name" "$target/$name" \
+      || { remove_sensitive_path "$target"; return 1; }
+  done
+  copy_backup_source "$SERVER_CONFIG" "$target/server.toml" \
+    || { remove_sensitive_path "$target"; return 1; }
+  for name in origin-cert.pem origin-key.pem; do
+    source="$CERT_DIR/$name"
+    marker="$target/had-$name"
+    if [[ -e "$source" || -L "$source" ]]; then
+      [[ -f "$source" && ! -L "$source" ]] \
+        || { fail "固定 Origin CA 目标必须是普通文件: $source"; remove_sensitive_path "$target"; return 1; }
+      copy_backup_source "$source" "$target/$name" \
+        || { remove_sensitive_path "$target"; return 1; }
+      : >"$marker" || { remove_sensitive_path "$target"; return 1; }
+    fi
+  done
+  printf -v "$variable" '%s' "$target"
+}
+
+restore_upgrade_assets() {
+  local source=$1 name target mode
+  [[ -d "$source" ]] || return 1
+  atomic_copy "$source/compose.yml" "$DEPLOY_DIR/compose.yml" 0644 || return 1
+  atomic_copy "$source/Caddyfile" "$DEPLOY_DIR/Caddyfile" 0644 || return 1
+  atomic_copy "$source/postgres_roles.sql" "$DEPLOY_DIR/postgres_roles.sql" 0600 || return 1
+  atomic_copy "$source/cloudledger-ops.sh" "$DEPLOY_DIR/cloudledger-ops.sh" 0755 || return 1
+  atomic_copy "$source/server.toml" "$SERVER_CONFIG" 0600 || return 1
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then chown 10001:10001 "$SERVER_CONFIG" || return 1; fi
+  for name in origin-cert.pem origin-key.pem; do
+    target="$CERT_DIR/$name"
+    case "$name" in origin-cert.pem) mode=0644 ;; origin-key.pem) mode=0600 ;; esac
+    if [[ -f "$source/had-$name" ]]; then
+      atomic_copy "$source/$name" "$target" "$mode" || return 1
+    else
+      rm -f -- "$target" || return 1
+    fi
+  done
+}
+
+prepare_legacy_deployment_for_upgrade() {
+  local tag=$1 owner old_cert old_key admin_path admin_token audit_key_id audit_hmac identifier_hmac
+  local turnstile_site turnstile_secret
+  owner=${CLOUDLEDGER_SERVER_IMAGE#ghcr.io/}; owner=${owner%%/*}
+  old_cert=$CLOUDLEDGER_CADDY_ORIGIN_CERT_PATH
+  old_key=$CLOUDLEDGER_CADDY_ORIGIN_KEY_PATH
+  server_config_value admin_path admin path \
+    && server_config_value admin_token admin token \
+    && server_config_value audit_key_id security.audit key_id \
+    && server_config_value audit_hmac security.audit hmac_key \
+    && server_config_value identifier_hmac security.audit identifier_hmac_key \
+    && server_config_value turnstile_site security.turnstile site_key \
+    && server_config_value turnstile_secret security.turnstile secret_key \
+    || { fail '无法从旧 server.toml 唯一提取管理端、审计或 Turnstile 配置。'; return 1; }
+  [[ "$turnstile_site" == "$CLOUDLEDGER_TURNSTILE_SITE_KEY" \
+    && "$turnstile_secret" == "$CLOUDLEDGER_TURNSTILE_SECRET_KEY" ]] \
+    || { fail '旧 server.toml 与 ops.env 的 Turnstile 配置不一致。'; return 1; }
+  validate_server_config_values cloudledger "$CLOUDLEDGER_API_DOMAIN" "$CLOUDLEDGER_RUNTIME_DB_PASSWORD" \
+    "$admin_path" "$admin_token" "$turnstile_site" "$turnstile_secret" "$audit_key_id" "$audit_hmac" \
+    "$identifier_hmac" || return 1
+  install_cert_pair_locked "$old_cert" "$old_key" || return 1
+  set_env_value CLOUDLEDGER_GHCR_OWNER "$owner" || return 1
+  set_env_value CLOUDLEDGER_RELEASE_TAG "$tag" || return 1
+  set_env_value CLOUDLEDGER_SERVER_IMAGE "ghcr.io/$owner/cloudledger-server:$tag" || return 1
+  set_env_value CLOUDLEDGER_POSTGRES_IMAGE "ghcr.io/$owner/cloudledger-postgres:$tag" || return 1
+  set_env_value CLOUDLEDGER_CADDY_IMAGE "ghcr.io/$owner/cloudledger-caddy:$tag" || return 1
+  set_env_value CLOUDLEDGER_ANCHOR_IMAGE "ghcr.io/$owner/cloudledger-network-anchor:$tag" || return 1
+  set_env_value CLOUDLEDGER_ADMIN_PATH "$admin_path" || return 1
+  set_env_value CLOUDLEDGER_ADMIN_TOKEN "$admin_token" || return 1
+  set_env_value CLOUDLEDGER_AUDIT_KEY_ID "$audit_key_id" || return 1
+  set_env_value CLOUDLEDGER_AUDIT_HMAC_KEY "$audit_hmac" || return 1
+  set_env_value CLOUDLEDGER_AUDIT_IDENTIFIER_HMAC_KEY "$identifier_hmac" || return 1
+  remove_env_value CLOUDLEDGER_HTTP_HOST_PORT || return 1
+  remove_env_value CLOUDLEDGER_HTTPS_HOST_PORT || return 1
+  remove_env_value CLOUDLEDGER_ADMIN_TUNNEL_PORT || return 1
+  normalize_ops_env || return 1
+  render_server_config || return 1
+  stage_assets || return 1
+  validate_deployment_config || return 1
+  ok 'v0.1.3 配置已在回滚保护下规范化为当前四镜像部署模型。'
+}
+
 preserve_upgrade_snapshot() {
   local snapshot=$1 target
   ensure_dirs || return 1
@@ -2237,25 +2439,52 @@ preserve_upgrade_snapshot() {
   return 1
 }
 
+preserve_upgrade_asset_snapshot() {
+  local snapshot=$1 target
+  [[ -d "$snapshot" ]] || return 0
+  target="$STATE_DIR/upgrade-failed-old-assets-$(date -u +%Y%m%d-%H%M%S)-$$"
+  if mv -- "$snapshot" "$target"; then
+    chmod 700 "$target" 2>/dev/null || true
+    unregister_sensitive_path "$snapshot"
+    warn "迁移前部署资源快照已保留用于诊断: $target"
+    return 0
+  fi
+  unregister_sensitive_path "$snapshot"
+  warn "无法移动迁移前部署资源快照；已原地保留: $snapshot"
+  return 1
+}
+
 handle_active_upgrade_abort() {
-  local snapshot=$ACTIVE_UPGRADE_ENV_SNAPSHOT migration_started=$UPGRADE_MIGRATION_STARTED
-  [[ -n "$snapshot" ]] || return 0
+  local snapshot=$ACTIVE_UPGRADE_ENV_SNAPSHOT assets=$ACTIVE_UPGRADE_ASSET_SNAPSHOT
+  local migration_started=$UPGRADE_MIGRATION_STARTED failed=0
+  [[ -n "$snapshot" || -n "$assets" ]] || return 0
   ACTIVE_UPGRADE_ENV_SNAPSHOT=''
+  ACTIVE_UPGRADE_ASSET_SNAPSHOT=''
   UPGRADE_MIGRATION_STARTED=0
   trap '' HUP INT TERM
   if (( migration_started == 0 )); then
+    if [[ -n "$assets" ]] && ! restore_upgrade_assets "$assets"; then failed=1; fi
     if [[ -s "$snapshot" ]] && mv -f -- "$snapshot" "$OPS_ENV"; then
       unregister_sensitive_path "$snapshot"
-      warn '迁移尚未开始，已恢复旧镜像配置。'
+    else
+      unregister_sensitive_path "$snapshot"
+      failed=1
+    fi
+    if (( failed == 0 )); then
+      [[ -z "$assets" ]] || remove_sensitive_path "$assets" || failed=1
+    fi
+    if (( failed == 0 )); then
+      warn '迁移尚未开始，已恢复旧镜像配置和部署资源。'
       compose up -d network-anchor postgres cloudledger caddy >/dev/null 2>&1 \
         || warn '旧镜像配置已恢复，但旧服务自动启动失败。'
     else
-      unregister_sensitive_path "$snapshot"
-      fail "迁移前升级中断且旧配置自动恢复失败；请保护快照: $snapshot"
+      [[ -z "$assets" ]] || preserve_upgrade_asset_snapshot "$assets" || true
+      fail "迁移前升级中断且旧配置或部署资源自动恢复失败；请保护快照: $snapshot"
     fi
   else
     fail '迁移已经开始；禁止自动恢复旧镜像配置。'
     preserve_upgrade_snapshot "$snapshot" || true
+    [[ -z "$assets" ]] || preserve_upgrade_asset_snapshot "$assets" || true
   fi
   install_cleanup_traps
 }
@@ -2276,47 +2505,74 @@ upgrade_locked() {
   health_url '升级后 /ready' "$(api_base_url)/ready" || return 20
   verify_turnstile || return 20
   internal_firewall_refresh || return 20
+  install_systemd_units || return 20
+  enable_base_timers || return 20
 }
 
 upgrade_transaction() {
-  local tag=$1 new_server new_postgres new_caddy new_anchor snapshot rc
-  local old_server old_postgres old_caddy old_anchor
+  local tag=$1 new_server new_postgres new_caddy new_anchor snapshot asset_snapshot rc legacy=0 owner
+  local old_server old_postgres old_caddy old_anchor image
   load_env || return 1
-  validate_deployment_config || return 1
+  if legacy_deployment_detected; then
+    legacy=1
+    validate_legacy_deployment || return 1
+  else
+    validate_deployment_config || return 1
+  fi
   old_server=${CLOUDLEDGER_SERVER_IMAGE:-}
   old_postgres=${CLOUDLEDGER_POSTGRES_IMAGE:-}
   old_caddy=${CLOUDLEDGER_CADDY_IMAGE:-}
   old_anchor=${CLOUDLEDGER_ANCHOR_IMAGE:-}
-  for image in "$old_server" "$old_postgres" "$old_caddy" "$old_anchor"; do
-    [[ -n "$image" && "$image" == *:* ]] || { fail '当前镜像配置不完整，无法计算升级 tag。'; return 1; }
-  done
-  new_server="${old_server%:*}:$tag"
-  new_postgres="${old_postgres%:*}:$tag"
-  new_caddy="${old_caddy%:*}:$tag"
-  new_anchor="${old_anchor%:*}:$tag"
+  if (( legacy == 1 )); then
+    owner=${old_server#ghcr.io/}; owner=${owner%%/*}
+    new_server="ghcr.io/$owner/cloudledger-server:$tag"
+    new_postgres="ghcr.io/$owner/cloudledger-postgres:$tag"
+    new_caddy="ghcr.io/$owner/cloudledger-caddy:$tag"
+    new_anchor="ghcr.io/$owner/cloudledger-network-anchor:$tag"
+  else
+    for image in "$old_server" "$old_postgres" "$old_caddy" "$old_anchor"; do
+      [[ -n "$image" && "$image" == *:* ]] \
+        || { fail '当前镜像配置不完整，无法计算升级 tag。'; return 1; }
+    done
+    new_server="${old_server%:*}:$tag"
+    new_postgres="${old_postgres%:*}:$tag"
+    new_caddy="${old_caddy%:*}:$tag"
+    new_anchor="${old_anchor%:*}:$tag"
+  fi
   log '检查四个目标 GHCR 镜像 manifest...'
   for image in "$new_server" "$new_postgres" "$new_caddy" "$new_anchor"; do
     docker manifest inspect "$image" >/dev/null \
       || { fail "目标镜像不存在或当前 GHCR 凭据无权读取: $image"; return 1; }
   done
   require_remote_backup_configuration || return 1
-  make_backup || return 1
   snapshot=$(mktemp "${TMPDIR:-/tmp}/cloudledger-upgrade-env.XXXXXX")
   register_sensitive_path "$snapshot"
   chmod 600 "$snapshot" || { remove_sensitive_path "$snapshot"; return 1; }
   cp -- "$OPS_ENV" "$snapshot" || { remove_sensitive_path "$snapshot"; return 1; }
+  snapshot_upgrade_assets asset_snapshot || { remove_sensitive_path "$snapshot"; return 1; }
   ACTIVE_UPGRADE_ENV_SNAPSHOT=$snapshot
+  ACTIVE_UPGRADE_ASSET_SNAPSHOT=$asset_snapshot
   UPGRADE_MIGRATION_STARTED=0
-  set_env_value CLOUDLEDGER_SERVER_IMAGE "$new_server" \
-    && set_env_value CLOUDLEDGER_POSTGRES_IMAGE "$new_postgres" \
-    && set_env_value CLOUDLEDGER_CADDY_IMAGE "$new_caddy" \
-    && set_env_value CLOUDLEDGER_ANCHOR_IMAGE "$new_anchor" \
-    && set_env_value CLOUDLEDGER_RELEASE_TAG "$tag" \
-    || { handle_active_upgrade_abort; return 1; }
+  if (( legacy == 1 )); then
+    create_legacy_upgrade_snapshot \
+      && prepare_legacy_deployment_for_upgrade "$tag" \
+      && make_backup \
+      || { handle_active_upgrade_abort; return 1; }
+  else
+    make_backup \
+      && set_env_value CLOUDLEDGER_SERVER_IMAGE "$new_server" \
+      && set_env_value CLOUDLEDGER_POSTGRES_IMAGE "$new_postgres" \
+      && set_env_value CLOUDLEDGER_CADDY_IMAGE "$new_caddy" \
+      && set_env_value CLOUDLEDGER_ANCHOR_IMAGE "$new_anchor" \
+      && set_env_value CLOUDLEDGER_RELEASE_TAG "$tag" \
+      || { handle_active_upgrade_abort; return 1; }
+  fi
   if upgrade_locked; then
     ACTIVE_UPGRADE_ENV_SNAPSHOT=''
+    ACTIVE_UPGRADE_ASSET_SNAPSHOT=''
     UPGRADE_MIGRATION_STARTED=0
     remove_sensitive_path "$snapshot" || return 1
+    remove_sensitive_path "$asset_snapshot" || return 1
     printf '%s %s success\n' "$(date -u +%FT%TZ)" "$tag" >>"$STATE_DIR/upgrade.log"
     ok '升级完成，/health、/ready、Caddy 和审计链均已验证。'
     return 0

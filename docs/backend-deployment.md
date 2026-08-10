@@ -1,13 +1,13 @@
 # CloudLedger Backend Deployment
 
-This guide deploys CloudLedger v0.1.4 on a systemd Linux host with Docker,
+This guide deploys CloudLedger v0.1.5 on a systemd Linux host with Docker,
 PostgreSQL, Caddy, Cloudflare, and encrypted OneDrive backups. PostgreSQL is the
 authoritative store. The API reaches the Internet only through Cloudflare HTTPS,
 and the admin listener remains private on the host loopback interface.
 
 ## Interactive Operations Toolbox
 
-Run the operations script from the checked-out, explicit v0.1.4 tag. It is the
+Run the operations script from the checked-out, explicit v0.1.5 tag. It is the
 single supported interface for production administrators:
 
 ```bash
@@ -129,7 +129,7 @@ tools are installed from the distribution repository without replacing or
 restarting an existing Docker daemon. When adding the official Compose plugin
 to an existing Docker installation, the wizard shows the running containers and
 requires confirmation. Do not substitute a host PostgreSQL or host Caddy
-for the Compose services in a v0.1.4 production deployment; their lifecycle,
+for the Compose services in a v0.1.5 production deployment; their lifecycle,
 health gates, and shared network namespace are managed by the toolbox.
 
 ### Developer-only source-build reference
@@ -380,7 +380,7 @@ For the security model, role restrictions, and rollback rules, see
 
 Each pushed Git tag runs the backend workflow and publishes the deployment
 images to GitHub Container Registry (GHCR). Always select a specific immutable
-tag such as `v0.1.4` through “首次安装与部署 → 选择要部署的 CloudLedger
+tag such as `v0.1.5` through “首次安装与部署 → 选择要部署的 CloudLedger
 版本” or the numeric upgrade wizard. `latest` is rejected for production.
 
 The workflow uses `deploy/Dockerfile.server`, `deploy/Dockerfile.postgres`,
@@ -453,3 +453,16 @@ restore the prior image tag automatically. Failure after a successful migration
 must not blindly start an older binary; recovery requires the database,
 `server.toml`, Compose configuration, and Origin CA files from the matching
 verified backup.
+
+The v0.1.5 upgrade wizard also has one deliberately narrow adoption path for the
+known v0.1.3 production layout. It requires the exact trusted legacy Compose and
+Caddy templates, matching v0.1.3 server/PostgreSQL GHCR tags, the fixed legacy
+port values, and a valid Origin CA pair. Before changing any deployment file it
+creates a root-only local emergency snapshot. It then imports the canonical
+admin, audit, and Turnstile values from `server.toml`, stages the four-image
+layout, and creates a new-format backup whose encrypted rclone upload is
+downloaded and verified. A configured rclone crypt remote is therefore required;
+the wizard will not bypass this gate. Any failure or signal before migration
+restores `ops.env`, Compose, Caddy, the installed script and role SQL,
+`server.toml`, and the fixed certificate targets. Once migration starts, it
+preserves the old assets for diagnosis and refuses an automatic downgrade.

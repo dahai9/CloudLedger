@@ -303,7 +303,7 @@ case $name in
         ;;
       *api.github.com*/releases*)
         record 'github:releases'
-        response='[{"tag_name":"v0.1.4"}]'
+        response='[{"tag_name":"v0.1.5"}]'
         ;;
       */auth/security)
         record 'turnstile:status'

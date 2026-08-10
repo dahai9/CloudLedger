@@ -119,7 +119,7 @@ setup_case() {
   export CLOUDLEDGER_TEST_RM_FAILED_PATH_FILE="$CASE_ROOT/rm-failed-paths"
   export CLOUDLEDGER_TEST_API_DOMAIN='cloudledger-test.513921.xyz'
   export CLOUDLEDGER_TEST_GHCR_OWNER='cloudledger'
-  export CLOUDLEDGER_TEST_TAG='v0.1.4'
+  export CLOUDLEDGER_TEST_TAG='v0.1.5'
   export CLOUDLEDGER_TEST_GHCR_PAT='ops-test-ghcr-pat-do-not-log'
   export CLOUDLEDGER_TEST_TURNSTILE_SITE_KEY='ops-test-turnstile-site'
   export CLOUDLEDGER_TEST_TURNSTILE_SECRET='ops-test-turnstile-secret-do-not-log'
@@ -163,9 +163,13 @@ seed_rclone_config() {
 
 seed_backup_fixture() {
   local remote=${1:-no}
+  # This fixture intentionally models the immediately previous release so the
+  # upgrade tests exercise v0.1.4 -> v0.1.5 and its rollback boundary.
   cp -- "$ROOT/deploy/docker-compose.yml" "$CLOUDLEDGER_DEPLOY_DIR/compose.yml"
   cp -- "$ROOT/deploy/Caddyfile" "$CLOUDLEDGER_DEPLOY_DIR/Caddyfile"
   cp -- "$ROOT/deploy/postgres_roles.sql" "$CLOUDLEDGER_DEPLOY_DIR/postgres_roles.sql"
+  cp -- "$OPS" "$CLOUDLEDGER_DEPLOY_DIR/cloudledger-ops.sh"
+  chmod 755 "$CLOUDLEDGER_DEPLOY_DIR/cloudledger-ops.sh"
   cp -- "$FIXTURE_DIR/origin-cert.pem" "$CLOUDLEDGER_CERT_DIR/origin-cert.pem"
   cp -- "$FIXTURE_DIR/origin-key.pem" "$CLOUDLEDGER_CERT_DIR/origin-key.pem"
   printf '%s\n' \
@@ -241,6 +245,35 @@ seed_backup_fixture() {
   } >"$CLOUDLEDGER_OPS_ENV"
   chmod 600 "$CLOUDLEDGER_OPS_ENV" "$CLOUDLEDGER_SERVER_CONFIG" "$CLOUDLEDGER_CERT_DIR/origin-key.pem"
   seed_rclone_config
+}
+
+seed_legacy_upgrade_fixture() {
+  seed_backup_fixture yes
+  cp -- "$ROOT/deploy/legacy/compose-v0.1.3.yml" "$CLOUDLEDGER_DEPLOY_DIR/compose.yml"
+  mv -- "$CLOUDLEDGER_CERT_DIR/origin-cert.pem" "$CLOUDLEDGER_CERT_DIR/cloudledger-test-origin.crt"
+  mv -- "$CLOUDLEDGER_CERT_DIR/origin-key.pem" "$CLOUDLEDGER_CERT_DIR/cloudledger-test-origin.key"
+  sed -i \
+    -e '/^CLOUDLEDGER_GHCR_OWNER=/d' \
+    -e '/^CLOUDLEDGER_CADDY_IMAGE=/d' \
+    -e '/^CLOUDLEDGER_ANCHOR_IMAGE=/d' \
+    -e '/^CLOUDLEDGER_RELEASE_TAG=/d' \
+    -e '/^CLOUDLEDGER_HTTP_PUBLISH=/d' \
+    -e '/^CLOUDLEDGER_HTTPS_PUBLISH=/d' \
+    -e '/^CLOUDLEDGER_ADMIN_PATH=/d' \
+    -e '/^CLOUDLEDGER_ADMIN_TOKEN=/d' \
+    -e '/^CLOUDLEDGER_AUDIT_KEY_ID=/d' \
+    -e '/^CLOUDLEDGER_AUDIT_HMAC_KEY=/d' \
+    -e '/^CLOUDLEDGER_AUDIT_IDENTIFIER_HMAC_KEY=/d' \
+    -e 's#^CLOUDLEDGER_SERVER_IMAGE=.*#CLOUDLEDGER_SERVER_IMAGE=ghcr.io/cloudledger/cloudledger-server:v0.1.3#' \
+    -e 's#^CLOUDLEDGER_POSTGRES_IMAGE=.*#CLOUDLEDGER_POSTGRES_IMAGE=ghcr.io/cloudledger/cloudledger-postgres:v0.1.3#' \
+    -e "s#^CLOUDLEDGER_CADDY_ORIGIN_CERT_PATH=.*#CLOUDLEDGER_CADDY_ORIGIN_CERT_PATH=$CLOUDLEDGER_CERT_DIR/cloudledger-test-origin.crt#" \
+    -e "s#^CLOUDLEDGER_CADDY_ORIGIN_KEY_PATH=.*#CLOUDLEDGER_CADDY_ORIGIN_KEY_PATH=$CLOUDLEDGER_CERT_DIR/cloudledger-test-origin.key#" \
+    "$CLOUDLEDGER_OPS_ENV"
+  printf '%s\n' \
+    'CLOUDLEDGER_HTTP_HOST_PORT=18080' \
+    'CLOUDLEDGER_HTTPS_HOST_PORT=443' \
+    'CLOUDLEDGER_ADMIN_TUNNEL_PORT=8788' \
+    >>"$CLOUDLEDGER_OPS_ENV"
 }
 
 latest_archive() {
@@ -359,10 +392,10 @@ test_complete_wizard() {
   assert_file_mode 600 "$CLOUDLEDGER_SERVER_CONFIG"
   assert_file_mode 600 "$CLOUDLEDGER_CERT_DIR/origin-key.pem"
   assert_file_mode 600 "$CLOUDLEDGER_RCLONE_CONFIG"
-  assert_contains 'CLOUDLEDGER_SERVER_IMAGE=ghcr.io/cloudledger/cloudledger-server:v0.1.4' "$CLOUDLEDGER_OPS_ENV"
-  assert_contains 'CLOUDLEDGER_POSTGRES_IMAGE=ghcr.io/cloudledger/cloudledger-postgres:v0.1.4' "$CLOUDLEDGER_OPS_ENV"
-  assert_contains 'CLOUDLEDGER_CADDY_IMAGE=ghcr.io/cloudledger/cloudledger-caddy:v0.1.4' "$CLOUDLEDGER_OPS_ENV"
-  assert_contains 'CLOUDLEDGER_ANCHOR_IMAGE=ghcr.io/cloudledger/cloudledger-network-anchor:v0.1.4' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'CLOUDLEDGER_SERVER_IMAGE=ghcr.io/cloudledger/cloudledger-server:v0.1.5' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'CLOUDLEDGER_POSTGRES_IMAGE=ghcr.io/cloudledger/cloudledger-postgres:v0.1.5' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'CLOUDLEDGER_CADDY_IMAGE=ghcr.io/cloudledger/cloudledger-caddy:v0.1.5' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'CLOUDLEDGER_ANCHOR_IMAGE=ghcr.io/cloudledger/cloudledger-network-anchor:v0.1.5' "$CLOUDLEDGER_OPS_ENV"
   assert_contains 'CLOUDLEDGER_HTTP_PUBLISH=127.0.0.1:18080:80' "$CLOUDLEDGER_OPS_ENV"
   assert_contains 'CLOUDLEDGER_HTTPS_PUBLISH=443:443' "$CLOUDLEDGER_OPS_ENV"
   assert_contains 'public_api_url = "https://cloudledger-test.513921.xyz"' "$CLOUDLEDGER_SERVER_CONFIG"
@@ -923,6 +956,86 @@ test_upgrade_failure_boundaries() {
   assert_contains '禁止盲目降级' "$CASE_ROOT/upgrade.out"
 }
 
+test_legacy_upgrade_adoption() {
+  local legacy_snapshot secret_name secret_value server_before
+  setup_case legacy-upgrade-reject-wrong-tag
+  seed_legacy_upgrade_fixture
+  sed -i 's/:v0\.1\.3$/:v0.1.4/' "$CLOUDLEDGER_OPS_ENV"
+  printf '3\n3\nv0.1.5\nYES\n0\n0\n' | "$OPS" >"$CASE_ROOT/upgrade.out" 2>&1
+  assert_contains '仅支持接管 server/PostgreSQL 镜像同为 v0.1.3 的旧部署' "$CASE_ROOT/upgrade.out"
+  assert_contains 'CLOUDLEDGER_HTTP_HOST_PORT=18080' "$CLOUDLEDGER_OPS_ENV"
+  assert_not_contains 'docker:manifest-inspect' "$CLOUDLEDGER_TEST_TRACE"
+
+  setup_case legacy-upgrade-success
+  seed_legacy_upgrade_fixture
+  printf '3\n3\nv0.1.5\nYES\n0\n0\n' | "$OPS" >"$CASE_ROOT/upgrade.out" 2>&1
+  assert_contains '已识别可受控接管的 CloudLedger v0.1.3 部署' "$CASE_ROOT/upgrade.out"
+  assert_contains '配置已在回滚保护下规范化' "$CASE_ROOT/upgrade.out"
+  assert_contains '升级完成' "$CASE_ROOT/upgrade.out"
+  assert_not_contains 'awk:' "$CASE_ROOT/upgrade.out"
+  assert_contains 'CLOUDLEDGER_GHCR_OWNER=cloudledger' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'CLOUDLEDGER_RELEASE_TAG=v0.1.5' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'CLOUDLEDGER_CADDY_IMAGE=ghcr.io/cloudledger/cloudledger-caddy:v0.1.5' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'CLOUDLEDGER_ANCHOR_IMAGE=ghcr.io/cloudledger/cloudledger-network-anchor:v0.1.5' "$CLOUDLEDGER_OPS_ENV"
+  assert_not_contains 'CLOUDLEDGER_HTTP_HOST_PORT=' "$CLOUDLEDGER_OPS_ENV"
+  assert_not_contains 'CLOUDLEDGER_HTTPS_HOST_PORT=' "$CLOUDLEDGER_OPS_ENV"
+  assert_not_contains 'CLOUDLEDGER_ADMIN_TUNNEL_PORT=' "$CLOUDLEDGER_OPS_ENV"
+  cmp -s "$CLOUDLEDGER_DEPLOY_DIR/compose.yml" "$ROOT/deploy/docker-compose.yml" \
+    || fail_test 'legacy adoption did not stage the trusted current Compose file'
+  legacy_snapshot=$(find "$CLOUDLEDGER_OPS_STATE_DIR" -maxdepth 1 -type f \
+    -name 'cloudledger-legacy-pre-upgrade-*.tar' -print | head -n1)
+  [[ -s "$legacy_snapshot" ]] || fail_test 'legacy adoption did not preserve the pre-upgrade snapshot'
+  assert_file_mode 600 "$legacy_snapshot"
+  [[ $(count_final_backups) -eq 1 ]] || fail_test 'legacy adoption did not publish one new-format backup'
+  assert_trace_order "$CLOUDLEDGER_TEST_TRACE" \
+    'backup:docker-pg-dump' 'backup:docker-pg-dump' 'rclone:upload' 'rclone:download' \
+    'rclone:publish' 'compose:pull' 'compose:migration' 'compose:audit' 'compose:up:backend' \
+    'http:local-health' 'http:local-ready' 'compose:up:caddy' 'firewall:apply' 'systemd:daemon-reload'
+  for secret_name in CLOUDLEDGER_BOOTSTRAP_DB_PASSWORD CLOUDLEDGER_MIGRATION_DB_PASSWORD \
+    CLOUDLEDGER_RUNTIME_DB_PASSWORD CLOUDLEDGER_ADMIN_TOKEN CLOUDLEDGER_AUDIT_HMAC_KEY \
+    CLOUDLEDGER_AUDIT_IDENTIFIER_HMAC_KEY CLOUDLEDGER_TURNSTILE_SECRET_KEY; do
+    secret_value=$(bash -c 'source "$1"; printf "%s" "${!2}"' _ "$CLOUDLEDGER_OPS_ENV" "$secret_name")
+    assert_secret_not_logged "$secret_value" "$CASE_ROOT/upgrade.out" "$CLOUDLEDGER_TEST_TRACE"
+  done
+
+  setup_case legacy-upgrade-rollback
+  seed_legacy_upgrade_fixture
+  server_before="$CASE_ROOT/server-before.toml"
+  cp -- "$CLOUDLEDGER_SERVER_CONFIG" "$server_before"
+  printf '%s\n' legacy-fixed-cert-before-upgrade >"$CLOUDLEDGER_CERT_DIR/origin-cert.pem"
+  printf '%s\n' legacy-fixed-key-before-upgrade >"$CLOUDLEDGER_CERT_DIR/origin-key.pem"
+  export CLOUDLEDGER_TEST_COMPOSE_FAIL_AT=pull
+  printf '3\n3\nv0.1.5\nYES\n0\n0\n' | "$OPS" >"$CASE_ROOT/upgrade.out" 2>&1
+  assert_contains '迁移尚未开始，已恢复旧镜像配置和部署资源' "$CASE_ROOT/upgrade.out"
+  assert_contains 'CLOUDLEDGER_HTTP_HOST_PORT=18080' "$CLOUDLEDGER_OPS_ENV"
+  assert_not_contains 'CLOUDLEDGER_GHCR_OWNER=' "$CLOUDLEDGER_OPS_ENV"
+  cmp -s "$CLOUDLEDGER_DEPLOY_DIR/compose.yml" "$ROOT/deploy/legacy/compose-v0.1.3.yml" \
+    || fail_test 'legacy pre-migration rollback did not restore the old Compose file'
+  cmp -s "$CLOUDLEDGER_SERVER_CONFIG" "$server_before" \
+    || fail_test 'legacy pre-migration rollback did not restore server.toml byte-for-byte'
+  assert_contains 'legacy-fixed-cert-before-upgrade' "$CLOUDLEDGER_CERT_DIR/origin-cert.pem"
+  assert_contains 'legacy-fixed-key-before-upgrade' "$CLOUDLEDGER_CERT_DIR/origin-key.pem"
+
+  setup_case legacy-upgrade-signal
+  seed_legacy_upgrade_fixture
+  server_before="$CASE_ROOT/server-before.toml"
+  cp -- "$CLOUDLEDGER_SERVER_CONFIG" "$server_before"
+  printf '%s\n' legacy-installed-ops >"$CLOUDLEDGER_DEPLOY_DIR/cloudledger-ops.sh"
+  chmod 755 "$CLOUDLEDGER_DEPLOY_DIR/cloudledger-ops.sh"
+  printf '%s\n' legacy-installed-roles >"$CLOUDLEDGER_DEPLOY_DIR/postgres_roles.sql"
+  export CLOUDLEDGER_TEST_SIGNAL_ON_COMPOSE=pull
+  printf '3\n3\nv0.1.5\nYES\n0\n0\n' | "$OPS" >"$CASE_ROOT/upgrade.out" 2>&1
+  assert_contains '迁移尚未开始，已恢复旧镜像配置和部署资源' "$CASE_ROOT/upgrade.out"
+  assert_contains '已返回当前菜单' "$CASE_ROOT/upgrade.out"
+  assert_contains 'CLOUDLEDGER_SERVER_IMAGE=ghcr.io/cloudledger/cloudledger-server:v0.1.3' "$CLOUDLEDGER_OPS_ENV"
+  cmp -s "$CLOUDLEDGER_DEPLOY_DIR/compose.yml" "$ROOT/deploy/legacy/compose-v0.1.3.yml" \
+    || fail_test 'legacy signal rollback did not restore the old Compose file'
+  cmp -s "$CLOUDLEDGER_SERVER_CONFIG" "$server_before" \
+    || fail_test 'legacy signal rollback did not restore server.toml byte-for-byte'
+  assert_contains 'legacy-installed-ops' "$CLOUDLEDGER_DEPLOY_DIR/cloudledger-ops.sh"
+  assert_contains 'legacy-installed-roles' "$CLOUDLEDGER_DEPLOY_DIR/postgres_roles.sql"
+}
+
 test_restore_signal_rollback() {
   local archive name restore_count
   setup_case restore-signal
@@ -1060,6 +1173,7 @@ main() {
   run_selected rclone-redaction test_rclone_display_redaction
   run_selected upgrade-order test_upgrade_transaction_order
   run_selected upgrade-boundaries test_upgrade_failure_boundaries
+  run_selected legacy-upgrade test_legacy_upgrade_adoption
   run_selected restore-signal test_restore_signal_rollback
   run_selected upgrade-signals test_upgrade_signal_boundaries
   run_selected safety-primitives test_fail_closed_safety_primitives

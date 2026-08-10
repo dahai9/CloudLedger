@@ -83,7 +83,7 @@ does not use SQLite as its primary database.
 
 ## Production Operations
 
-CloudLedger v0.1.4 has one production-administrator entry point:
+CloudLedger v0.1.5 has one production-administrator entry point:
 
 ```bash
 sudo ./deploy/cloudledger-ops.sh
