@@ -17,6 +17,7 @@ export interface LedgerDto {
   scopeLabel: string;
   organizationId?: string;
   role: string;
+  canViewBalances: boolean;
 }
 
 export interface AccountDto {
@@ -24,7 +25,7 @@ export interface AccountDto {
   ledgerId: string;
   name: string;
   kind: string;
-  balanceMinor: number;
+  balanceMinor: number | null;
   currency: string;
 }
 
@@ -146,6 +147,55 @@ export interface AnalysisExpenseDto {
   paidAt: string;
 }
 
+export interface FinancialMonthDetailDto {
+  ledgerId: string;
+  month: string;
+  currency: string;
+  incomeMinor: number;
+  expenseMinor: number;
+  netCashFlowMinor: number;
+  transactionCount: number;
+  categories: AnalysisCategoryDto[];
+  memberExpenses: MemberExpenseDto[];
+  transactions: AnalysisTransactionDto[];
+}
+
+export interface FinancialMemberDetailDto {
+  ledgerId: string;
+  currency: string;
+  months: number;
+  periodStart: string;
+  periodEnd: string;
+  memberId: string;
+  displayName: string;
+  expenseMinor: number;
+  transactionCount: number;
+  transactions: AnalysisTransactionDto[];
+}
+
+export interface AnalysisCategoryDto {
+  categoryId?: string;
+  categoryName: string;
+  kind: "income" | "expense";
+  amountMinor: number;
+  transactionCount: number;
+}
+
+export interface AnalysisTransactionDto {
+  transactionId: string;
+  description: string;
+  kind: "income" | "expense";
+  categoryId?: string;
+  categoryName: string;
+  accountId: string;
+  accountName: string;
+  submittedByUserId: string;
+  submittedBy: string;
+  amountMinor: number;
+  effectiveAt: string;
+  paymentState: PaymentState;
+}
+
 export interface CreateTransactionInput {
   ledgerId: string;
   accountId: string;
@@ -182,6 +232,25 @@ export async function loadFinancialAnalysis(
   months: number,
 ): Promise<FinancialAnalysisDto> {
   return invoke<FinancialAnalysisDto>("get_financial_analysis", { ledgerId, months });
+}
+
+export async function loadFinancialMonthDetail(
+  ledgerId: string,
+  month: string,
+): Promise<FinancialMonthDetailDto> {
+  return invoke<FinancialMonthDetailDto>("get_financial_month_detail", { ledgerId, month });
+}
+
+export async function loadFinancialMemberDetail(
+  ledgerId: string,
+  months: number,
+  memberId: string,
+): Promise<FinancialMemberDetailDto> {
+  return invoke<FinancialMemberDetailDto>("get_financial_member_detail", {
+    ledgerId,
+    months,
+    memberId,
+  });
 }
 
 export async function createTransaction(

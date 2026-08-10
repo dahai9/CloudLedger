@@ -252,6 +252,7 @@ pub struct LedgerDto {
     pub scope_label: String,
     pub organization_id: Option<String>,
     pub role: String,
+    pub can_view_balances: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,7 +262,7 @@ pub struct AccountDto {
     pub ledger_id: String,
     pub name: String,
     pub kind: String,
-    pub balance_minor: i64,
+    pub balance_minor: Option<i64>,
     pub currency: String,
 }
 
@@ -378,6 +379,63 @@ pub struct AnalysisExpenseDto {
     pub submitted_by: String,
     pub amount_minor: i64,
     pub paid_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FinancialMonthDetailDto {
+    pub ledger_id: String,
+    pub month: String,
+    pub currency: String,
+    pub income_minor: i64,
+    pub expense_minor: i64,
+    pub net_cash_flow_minor: i64,
+    pub transaction_count: usize,
+    pub categories: Vec<AnalysisCategoryDto>,
+    pub member_expenses: Vec<MemberExpenseDto>,
+    pub transactions: Vec<AnalysisTransactionDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisCategoryDto {
+    pub category_id: Option<String>,
+    pub category_name: String,
+    pub kind: String,
+    pub amount_minor: i64,
+    pub transaction_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisTransactionDto {
+    pub transaction_id: String,
+    pub description: String,
+    pub kind: String,
+    pub category_id: Option<String>,
+    pub category_name: String,
+    pub account_id: String,
+    pub account_name: String,
+    pub submitted_by_user_id: String,
+    pub submitted_by: String,
+    pub amount_minor: i64,
+    pub effective_at: String,
+    pub payment_state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FinancialMemberDetailDto {
+    pub ledger_id: String,
+    pub currency: String,
+    pub months: u8,
+    pub period_start: String,
+    pub period_end: String,
+    pub member_id: String,
+    pub display_name: String,
+    pub expense_minor: i64,
+    pub transaction_count: usize,
+    pub transactions: Vec<AnalysisTransactionDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -761,7 +819,7 @@ impl AppLedgerService {
             .accounts
             .values()
             .filter(|account| visible_ledger_ids.contains(&account.ledger_id))
-            .map(|account| self.account_dto(account))
+            .map(|account| self.account_dto(actor_user_id, account))
             .collect();
 
         let categories = self
@@ -776,6 +834,7 @@ impl AppLedgerService {
             .transactions
             .values()
             .filter(|transaction| visible_ledger_ids.contains(&transaction.ledger_id))
+            .filter(|transaction| self.transaction_visible_to_actor(actor_user_id, transaction))
             .filter(|transaction| {
                 month_key(transaction.occurred_at) == current_month
                     || transaction.approval_state == ApprovalState::Submitted
@@ -834,6 +893,7 @@ impl AppLedgerService {
                         && self.ledgers.get(&audit.ledger_id).is_some_and(|ledger| {
                             self.authorized(actor_user_id, ledger, Action::ViewAuditLog)
                         })
+                        && self.audit_visible_to_actor(actor_user_id, audit)
                 })
                 .map(|audit| self.audit_dto(audit))
                 .collect(),
@@ -867,16 +927,15 @@ impl AppLedgerService {
             return Err(AppServiceError::InvalidTransactionMonth);
         }
 
-        let mut available_months = self
+        let available_months = self
             .transactions
             .values()
             .filter(|transaction| {
                 transaction.ledger_id == ledger_id && transaction.deleted_at.is_none()
             })
+            .filter(|transaction| self.transaction_visible_to_actor(actor_user_id, transaction))
             .map(|transaction| month_key(transaction.occurred_at))
             .collect::<BTreeSet<_>>();
-        available_months.insert(current_month);
-        available_months.insert(selected_month.clone());
         let available_months = available_months.into_iter().rev().collect::<Vec<_>>();
 
         let mut transactions = self
@@ -887,6 +946,7 @@ impl AppLedgerService {
                     && transaction.deleted_at.is_none()
                     && month_key(transaction.occurred_at) == selected_month
             })
+            .filter(|transaction| self.transaction_visible_to_actor(actor_user_id, transaction))
             .map(|transaction| self.transaction_dto(transaction))
             .collect::<Vec<_>>();
         transactions.sort_by(|left, right| {
@@ -967,14 +1027,11 @@ impl AppLedgerService {
             .accounts
             .values()
             .filter(|account| account.ledger_id == ledger_id && account.deleted_at.is_none())
-            .map(|account| {
-                let account = self.account_dto(account);
-                AnalysisAccountDto {
-                    id: account.id,
-                    name: account.name,
-                    kind: account.kind,
-                    balance_minor: account.balance_minor,
-                }
+            .map(|account| AnalysisAccountDto {
+                id: account.id.to_string(),
+                name: account.name.clone(),
+                kind: format!("{:?}", account.kind).to_lowercase(),
+                balance_minor: self.account_balance_minor(account),
             })
             .collect::<Vec<_>>();
         accounts.sort_by(|left, right| {
@@ -1021,7 +1078,7 @@ impl AppLedgerService {
             count: 0,
             amount_minor: 0,
         };
-        let mut member_expenses = BTreeMap::<Uuid, (i64, usize)>::new();
+        let mut member_expenses = self.business_members_for_ledger(ledger);
         let mut largest_expenses = Vec::new();
 
         for transaction in self.transactions.values().filter(|transaction| {
@@ -1092,27 +1149,7 @@ impl AppLedgerService {
         for point in &mut trend {
             point.net_cash_flow_minor = point.income_minor - point.expense_minor;
         }
-        let mut member_expenses = member_expenses
-            .into_iter()
-            .map(
-                |(user_id, (expense_minor, transaction_count))| MemberExpenseDto {
-                    user_id: user_id.to_string(),
-                    display_name: self
-                        .users
-                        .get(&user_id)
-                        .map(|user| user.display_name.clone())
-                        .unwrap_or_else(|| user_id.to_string()),
-                    expense_minor,
-                    transaction_count,
-                },
-            )
-            .collect::<Vec<_>>();
-        member_expenses.sort_by(|left, right| {
-            right
-                .expense_minor
-                .cmp(&left.expense_minor)
-                .then_with(|| left.display_name.cmp(&right.display_name))
-        });
+        let member_expenses = self.member_expense_dtos(member_expenses);
         largest_expenses.sort_by(|left, right| {
             right
                 .amount_minor
@@ -1143,6 +1180,185 @@ impl AppLedgerService {
             member_expenses,
             largest_expenses,
             generated_at: format_time(now),
+        })
+    }
+
+    pub fn financial_month_detail(
+        &self,
+        actor_user_id: Uuid,
+        ledger_id: Uuid,
+        month: &str,
+    ) -> Result<FinancialMonthDetailDto, AppServiceError> {
+        let ledger = self.analytics_ledger(actor_user_id, ledger_id)?;
+        let (year, calendar_month) =
+            parse_month_key(month).ok_or(AppServiceError::InvalidTransactionMonth)?;
+        let period_start = Date::from_calendar_date(year, calendar_month, 1)
+            .expect("validated month has a start")
+            .with_time(Time::MIDNIGHT)
+            .assume_utc();
+        let period_end = shift_month_start(period_start, 1);
+        let currency = self.ledger_currency(ledger_id);
+        let mut income_minor = 0;
+        let mut expense_minor = 0;
+        let mut categories =
+            BTreeMap::<(String, String, String), (Option<String>, i64, usize)>::new();
+        let mut member_expenses = self.business_members_for_ledger(ledger);
+        let mut transactions = Vec::new();
+
+        for transaction in self.transactions.values().filter(|transaction| {
+            transaction.ledger_id == ledger_id && transaction.deleted_at.is_none()
+        }) {
+            let Some(effective_at) = transaction_cash_effective_at(transaction) else {
+                continue;
+            };
+            if effective_at < period_start || effective_at >= period_end {
+                continue;
+            }
+
+            let kind = match transaction.kind {
+                TransactionKind::Income => {
+                    income_minor += transaction.amount.amount_minor;
+                    "income"
+                }
+                TransactionKind::Expense => {
+                    expense_minor += transaction.amount.amount_minor;
+                    let member = member_expenses.entry(transaction.created_by).or_default();
+                    member.0 += transaction.amount.amount_minor;
+                    member.1 += 1;
+                    "expense"
+                }
+                TransactionKind::Transfer => continue,
+            };
+            let category = transaction
+                .category_id
+                .and_then(|category_id| self.categories.get(&category_id));
+            let category_id = category.map(|category| category.id.to_string());
+            let category_name = category
+                .map(|category| category.name.clone())
+                .unwrap_or_else(|| "未分类".to_string());
+            let category_key = (
+                category_id.clone().unwrap_or_default(),
+                category_name.clone(),
+                kind.to_string(),
+            );
+            let category_total = categories
+                .entry(category_key)
+                .or_insert((category_id, 0, 0));
+            category_total.1 += transaction.amount.amount_minor;
+            category_total.2 += 1;
+            transactions.push(self.analysis_transaction_dto(transaction, effective_at));
+        }
+
+        let mut categories = categories
+            .into_iter()
+            .map(
+                |(
+                    (_category_key, category_name, kind),
+                    (category_id, amount_minor, transaction_count),
+                )| AnalysisCategoryDto {
+                    category_id,
+                    category_name,
+                    kind,
+                    amount_minor,
+                    transaction_count,
+                },
+            )
+            .collect::<Vec<_>>();
+        categories.sort_by(|left, right| {
+            right
+                .amount_minor
+                .cmp(&left.amount_minor)
+                .then_with(|| left.category_name.cmp(&right.category_name))
+        });
+        let member_expenses = self.member_expense_dtos(member_expenses);
+        transactions.sort_by(|left, right| {
+            right
+                .effective_at
+                .cmp(&left.effective_at)
+                .then_with(|| right.transaction_id.cmp(&left.transaction_id))
+        });
+
+        Ok(FinancialMonthDetailDto {
+            ledger_id: ledger_id.to_string(),
+            month: month.to_string(),
+            currency,
+            income_minor,
+            expense_minor,
+            net_cash_flow_minor: income_minor - expense_minor,
+            transaction_count: transactions.len(),
+            categories,
+            member_expenses,
+            transactions,
+        })
+    }
+
+    pub fn financial_member_detail(
+        &self,
+        actor_user_id: Uuid,
+        ledger_id: Uuid,
+        months: u8,
+        member_id: Uuid,
+    ) -> Result<FinancialMemberDetailDto, AppServiceError> {
+        if !matches!(months, 3 | 6 | 12) {
+            return Err(AppServiceError::InvalidAnalysisRange);
+        }
+        let ledger = self.analytics_ledger(actor_user_id, ledger_id)?;
+        let organization_id = ledger
+            .organization_id
+            .ok_or(AppServiceError::OrganizationNotFound)?;
+        let membership = self
+            .memberships
+            .iter()
+            .find(|membership| {
+                membership.organization_id == organization_id
+                    && membership.user_id == member_id
+                    && is_business_member_role(membership.role)
+            })
+            .ok_or(AppServiceError::MembershipNotFound)?;
+        let display_name = self
+            .users
+            .get(&membership.user_id)
+            .map(|user| user.display_name.clone())
+            .unwrap_or_else(|| membership.user_id.to_string());
+        let now = OffsetDateTime::now_utc();
+        let period_start = shift_month_start(month_start(now), -(i32::from(months) - 1));
+        let mut transactions = self
+            .transactions
+            .values()
+            .filter(|transaction| {
+                transaction.ledger_id == ledger_id
+                    && transaction.created_by == member_id
+                    && transaction.kind == TransactionKind::Expense
+                    && transaction.deleted_at.is_none()
+            })
+            .filter_map(|transaction| {
+                let effective_at = transaction_cash_effective_at(transaction)?;
+                (effective_at >= period_start && effective_at <= now)
+                    .then(|| self.analysis_transaction_dto(transaction, effective_at))
+            })
+            .collect::<Vec<_>>();
+        transactions.sort_by(|left, right| {
+            right
+                .effective_at
+                .cmp(&left.effective_at)
+                .then_with(|| right.transaction_id.cmp(&left.transaction_id))
+        });
+        let expense_minor = transactions
+            .iter()
+            .map(|transaction| transaction.amount_minor)
+            .sum();
+
+        Ok(FinancialMemberDetailDto {
+            ledger_id: ledger_id.to_string(),
+            currency: self.ledger_currency(ledger_id),
+            months,
+            period_start: format_time(period_start),
+            period_end: format_time(now),
+            member_id: member_id.to_string(),
+            display_name,
+            expense_minor,
+            transaction_count: transactions.len(),
+            transactions,
         })
     }
 
@@ -1756,7 +1972,7 @@ impl AppLedgerService {
         Ok(self.transaction_dto(&updated))
     }
 
-    fn account_dto(&self, account: &FinancialAccount) -> AccountDto {
+    fn account_balance_minor(&self, account: &FinancialAccount) -> i64 {
         let transaction_delta: i64 = self
             .transactions
             .values()
@@ -1772,12 +1988,21 @@ impl AppLedgerService {
             })
             .sum();
 
+        account.opening_balance.amount_minor + transaction_delta
+    }
+
+    fn account_dto(&self, actor_user_id: Uuid, account: &FinancialAccount) -> AccountDto {
+        let can_view_balance = self
+            .ledgers
+            .get(&account.ledger_id)
+            .is_some_and(|ledger| self.can_view_balances(actor_user_id, ledger));
+
         AccountDto {
             id: account.id.to_string(),
             ledger_id: account.ledger_id.to_string(),
             name: account.name.clone(),
             kind: format!("{:?}", account.kind).to_lowercase(),
-            balance_minor: account.opening_balance.amount_minor + transaction_delta,
+            balance_minor: can_view_balance.then(|| self.account_balance_minor(account)),
             currency: account.opening_balance.currency.clone(),
         }
     }
@@ -1802,6 +2027,154 @@ impl AppLedgerService {
             },
             organization_id: ledger.organization_id.map(|id| id.to_string()),
             role: self.ledger_role(actor_user_id, ledger),
+            can_view_balances: self.can_view_balances(actor_user_id, ledger),
+        }
+    }
+
+    fn can_view_balances(&self, actor_user_id: Uuid, ledger: &Ledger) -> bool {
+        match ledger.kind {
+            LedgerKind::Personal => ledger.owner_user_id == Some(actor_user_id),
+            LedgerKind::OrganizationPublic => {
+                ledger.organization_id.is_some_and(|organization_id| {
+                    matches!(
+                        self.membership_role(actor_user_id, organization_id),
+                        Some(MembershipRole::BusinessOwner | MembershipRole::Approver)
+                    )
+                })
+            }
+        }
+    }
+
+    fn transaction_visible_to_actor(&self, actor_user_id: Uuid, transaction: &Transaction) -> bool {
+        let Some(ledger) = self.ledgers.get(&transaction.ledger_id) else {
+            return false;
+        };
+        if !self.authorized(actor_user_id, ledger, Action::ViewLedger) {
+            return false;
+        }
+        match ledger.kind {
+            LedgerKind::Personal => ledger.owner_user_id == Some(actor_user_id),
+            LedgerKind::OrganizationPublic if self.can_view_balances(actor_user_id, ledger) => true,
+            LedgerKind::OrganizationPublic => transaction.created_by == actor_user_id,
+        }
+    }
+
+    fn audit_visible_to_actor(&self, actor_user_id: Uuid, audit: &AuditLog) -> bool {
+        let Some(ledger) = self.ledgers.get(&audit.ledger_id) else {
+            return false;
+        };
+        if self.can_view_balances(actor_user_id, ledger) || ledger.kind == LedgerKind::Personal {
+            return true;
+        }
+        audit.resource_type == "transaction"
+            && self
+                .transactions
+                .get(&audit.resource_id)
+                .is_some_and(|transaction| {
+                    self.transaction_visible_to_actor(actor_user_id, transaction)
+                })
+    }
+
+    fn analytics_ledger(
+        &self,
+        actor_user_id: Uuid,
+        ledger_id: Uuid,
+    ) -> Result<&Ledger, AppServiceError> {
+        let ledger = self
+            .ledgers
+            .get(&ledger_id)
+            .ok_or(AppServiceError::LedgerNotFound)?;
+        if !self.authorized(actor_user_id, ledger, Action::ViewFinancialAnalytics) {
+            return Err(AppServiceError::Unauthorized);
+        }
+        Ok(ledger)
+    }
+
+    fn ledger_currency(&self, ledger_id: Uuid) -> String {
+        self.accounts
+            .values()
+            .find(|account| account.ledger_id == ledger_id && account.deleted_at.is_none())
+            .map(|account| account.opening_balance.currency.clone())
+            .unwrap_or_else(|| "CNY".to_string())
+    }
+
+    fn business_members_for_ledger(&self, ledger: &Ledger) -> BTreeMap<Uuid, (i64, usize)> {
+        let Some(organization_id) = ledger.organization_id else {
+            return BTreeMap::new();
+        };
+        self.memberships
+            .iter()
+            .filter(|membership| {
+                membership.organization_id == organization_id
+                    && is_business_member_role(membership.role)
+            })
+            .map(|membership| (membership.user_id, (0, 0)))
+            .collect()
+    }
+
+    fn member_expense_dtos(
+        &self,
+        member_expenses: BTreeMap<Uuid, (i64, usize)>,
+    ) -> Vec<MemberExpenseDto> {
+        let mut member_expenses = member_expenses
+            .into_iter()
+            .map(
+                |(user_id, (expense_minor, transaction_count))| MemberExpenseDto {
+                    user_id: user_id.to_string(),
+                    display_name: self
+                        .users
+                        .get(&user_id)
+                        .map(|user| user.display_name.clone())
+                        .unwrap_or_else(|| user_id.to_string()),
+                    expense_minor,
+                    transaction_count,
+                },
+            )
+            .collect::<Vec<_>>();
+        member_expenses.sort_by(|left, right| {
+            right
+                .expense_minor
+                .cmp(&left.expense_minor)
+                .then_with(|| left.display_name.cmp(&right.display_name))
+        });
+        member_expenses
+    }
+
+    fn analysis_transaction_dto(
+        &self,
+        transaction: &Transaction,
+        effective_at: OffsetDateTime,
+    ) -> AnalysisTransactionDto {
+        let category = transaction
+            .category_id
+            .and_then(|category_id| self.categories.get(&category_id));
+        let account = self.accounts.get(&transaction.account_id);
+        AnalysisTransactionDto {
+            transaction_id: transaction.id.to_string(),
+            description: transaction.description.clone(),
+            kind: match transaction.kind {
+                TransactionKind::Income => "income",
+                TransactionKind::Expense => "expense",
+                TransactionKind::Transfer => "transfer",
+            }
+            .to_string(),
+            category_id: category.map(|category| category.id.to_string()),
+            category_name: category
+                .map(|category| category.name.clone())
+                .unwrap_or_else(|| "未分类".to_string()),
+            account_id: transaction.account_id.to_string(),
+            account_name: account
+                .map(|account| account.name.clone())
+                .unwrap_or_else(|| transaction.account_id.to_string()),
+            submitted_by_user_id: transaction.created_by.to_string(),
+            submitted_by: self
+                .users
+                .get(&transaction.created_by)
+                .map(|user| user.display_name.clone())
+                .unwrap_or_else(|| transaction.created_by.to_string()),
+            amount_minor: transaction.amount.amount_minor,
+            effective_at: format_time(effective_at),
+            payment_state: payment_state_name(transaction.payment_state).to_string(),
         }
     }
 
@@ -2162,6 +2535,17 @@ fn membership_role_name(role: MembershipRole) -> &'static str {
         MembershipRole::Member => "member",
         MembershipRole::Viewer => "viewer",
     }
+}
+
+fn is_business_member_role(role: MembershipRole) -> bool {
+    matches!(
+        role,
+        MembershipRole::BusinessOwner
+            | MembershipRole::Employee
+            | MembershipRole::Accountant
+            | MembershipRole::Approver
+            | MembershipRole::Member
+    )
 }
 
 fn payment_state_name(state: PaymentState) -> &'static str {
@@ -2747,7 +3131,7 @@ mod tests {
             .expect("seeded pending transaction");
 
         assert_eq!(pending.created_by, "Bob");
-        assert_eq!(public_account.balance_minor, 5_000_000);
+        assert_eq!(public_account.balance_minor, Some(5_000_000));
 
         let approved = service
             .decide_approval(AppDecideApprovalInput {
@@ -2766,7 +3150,7 @@ mod tests {
 
         assert_eq!(approved.approval_state, "approved");
         assert_eq!(approved.payment_state, "pending_payment");
-        assert_eq!(public_account.balance_minor, 5_000_000);
+        assert_eq!(public_account.balance_minor, Some(5_000_000));
         assert_eq!(overview.pending_approval_count, 0);
         assert_eq!(overview.pending_payment_count, 1);
 
@@ -2793,7 +3177,7 @@ mod tests {
             .expect("seeded public account");
         assert_eq!(paid.payment_state, "paid_pending_receipt");
         assert!(paid.paid_at.is_some());
-        assert_eq!(public_account.balance_minor, 4_914_000);
+        assert_eq!(public_account.balance_minor, Some(4_914_000));
         assert_eq!(overview.pending_payment_count, 0);
         assert_eq!(overview.pending_receipt_count, 1);
 
@@ -2821,7 +3205,7 @@ mod tests {
             .expect("seeded public account");
         assert_eq!(received.payment_state, "received");
         assert!(received.received_at.is_some());
-        assert_eq!(public_account.balance_minor, 4_914_000);
+        assert_eq!(public_account.balance_minor, None);
         assert_eq!(overview.pending_receipt_count, 0);
         assert!(overview
             .audit_logs
@@ -2856,7 +3240,7 @@ mod tests {
             .find(|transaction| transaction.approval_state == "submitted")
             .expect("seeded pending transaction");
 
-        assert_eq!(public_account.balance_minor, 5_000_000);
+        assert_eq!(public_account.balance_minor, Some(5_000_000));
 
         let rejected = service
             .decide_approval(AppDecideApprovalInput {
@@ -2874,7 +3258,7 @@ mod tests {
             .expect("seeded public account");
 
         assert_eq!(rejected.approval_state, "rejected");
-        assert_eq!(public_account.balance_minor, 5_000_000);
+        assert_eq!(public_account.balance_minor, Some(5_000_000));
         assert_eq!(overview.pending_approval_count, 0);
         assert!(overview
             .audit_logs
@@ -2970,7 +3354,340 @@ mod tests {
             .ledgers
             .iter()
             .any(|ledger| ledger.kind == "organization_public"));
+        assert!(overview
+            .ledgers
+            .iter()
+            .filter(|ledger| ledger.kind == "organization_public")
+            .all(|ledger| !ledger.can_view_balances));
+        assert!(overview
+            .accounts
+            .iter()
+            .filter(|account| {
+                overview.ledgers.iter().any(|ledger| {
+                    ledger.id == account.ledger_id && ledger.kind == "organization_public"
+                })
+            })
+            .all(|account| account.balance_minor.is_none()));
         assert!(!overview.audit_logs.is_empty());
+    }
+
+    #[test]
+    fn employee_public_rows_are_isolated_but_own_workflow_audit_remains_visible() {
+        let mut service = AppLedgerService::seeded();
+        let owner_id = service.current_user_id();
+        let bob_id = service
+            .users()
+            .into_iter()
+            .find(|user| user.display_name == "Bob")
+            .and_then(|user| Uuid::parse_str(&user.id).ok())
+            .expect("seeded employee");
+        let organization_id = service
+            .organizations
+            .keys()
+            .next()
+            .copied()
+            .expect("organization");
+        let public_ledger_id = service
+            .ledgers
+            .values()
+            .find(|ledger| ledger.kind == LedgerKind::OrganizationPublic)
+            .map(|ledger| ledger.id)
+            .expect("public ledger");
+        let public_account_id = service
+            .accounts
+            .values()
+            .find(|account| account.ledger_id == public_ledger_id)
+            .map(|account| account.id)
+            .expect("public account");
+        let charlie = service
+            .add_organization_member(AppAddOrganizationMemberInput {
+                organization_id,
+                display_name: "Charlie".to_string(),
+                email: Some("charlie-employee@example.com".to_string()),
+                phone: None,
+                role: MembershipRole::Employee,
+            })
+            .expect("add second employee");
+        let charlie_id = Uuid::parse_str(&charlie.user_id).expect("charlie id");
+        let charlie_transaction = service
+            .create_transaction(AppCreateTransactionInput {
+                actor_user_id: charlie_id,
+                ledger_id: public_ledger_id,
+                account_id: public_account_id,
+                category_id: None,
+                kind: TransactionKind::Expense,
+                amount_minor: 987_654,
+                currency: "CNY".to_string(),
+                description: "Charlie 私有申请标记".to_string(),
+                client_mutation_id: None,
+            })
+            .expect("create Charlie request");
+        let charlie_transaction_id =
+            Uuid::parse_str(&charlie_transaction.id).expect("transaction id");
+        let previous_month = shift_month_start(month_start(OffsetDateTime::now_utc()), -1);
+        service
+            .transactions
+            .get_mut(&charlie_transaction_id)
+            .expect("Charlie transaction")
+            .occurred_at = previous_month;
+
+        let bob_overview = service.overview(bob_id);
+        assert!(!bob_overview
+            .transactions
+            .iter()
+            .any(|transaction| transaction.id == charlie_transaction.id));
+        assert!(!bob_overview
+            .transactions
+            .iter()
+            .any(|transaction| transaction.amount_minor == 987_654));
+        assert!(!bob_overview
+            .audit_logs
+            .iter()
+            .any(|audit| audit.resource_id == charlie_transaction.id));
+        assert_eq!(bob_overview.pending_approval_count, 1);
+        assert!(bob_overview
+            .accounts
+            .iter()
+            .filter(|account| account.ledger_id == public_ledger_id.to_string())
+            .all(|account| account.balance_minor.is_none()));
+
+        let bob_months = service
+            .transactions_for_month(bob_id, public_ledger_id, None)
+            .expect("Bob month list");
+        assert!(!bob_months
+            .available_months
+            .contains(&month_key(previous_month)));
+        assert!(!bob_months
+            .transactions
+            .iter()
+            .any(|transaction| transaction.id == charlie_transaction.id));
+
+        let bob_transaction_id = bob_overview
+            .transactions
+            .iter()
+            .find(|transaction| transaction.created_by_user_id == bob_id.to_string())
+            .and_then(|transaction| Uuid::parse_str(&transaction.id).ok())
+            .expect("Bob request");
+        service
+            .decide_approval(AppDecideApprovalInput {
+                actor_user_id: owner_id,
+                transaction_id: bob_transaction_id,
+                decision: ApprovalDecision::Approve,
+                decision_note: None,
+            })
+            .expect("approve Bob request");
+        service
+            .mark_transaction_paid(AppMarkTransactionPaidInput {
+                actor_user_id: owner_id,
+                transaction_id: bob_transaction_id,
+            })
+            .expect("pay Bob request");
+
+        let bob_after_payment = service.overview(bob_id);
+        for action in ["transaction.approved", "transaction.paid"] {
+            assert!(bob_after_payment.audit_logs.iter().any(|audit| {
+                audit.resource_id == bob_transaction_id.to_string() && audit.action == action
+            }));
+        }
+        assert!(!bob_after_payment
+            .audit_logs
+            .iter()
+            .any(|audit| audit.resource_id == charlie_transaction.id));
+        assert_eq!(bob_after_payment.pending_approval_count, 0);
+        assert_eq!(bob_after_payment.pending_receipt_count, 1);
+
+        let owner_overview = service.overview(owner_id);
+        assert!(owner_overview
+            .transactions
+            .iter()
+            .any(|transaction| transaction.id == charlie_transaction.id));
+        assert!(owner_overview
+            .accounts
+            .iter()
+            .filter(|account| account.ledger_id == public_ledger_id.to_string())
+            .all(|account| account.balance_minor.is_some()));
+    }
+
+    #[test]
+    fn analytics_details_include_zero_business_members_and_only_actual_cash_flows() {
+        let mut service = AppLedgerService::seeded();
+        let owner_id = service.current_user_id();
+        let bob_id = service
+            .users()
+            .into_iter()
+            .find(|user| user.display_name == "Bob")
+            .and_then(|user| Uuid::parse_str(&user.id).ok())
+            .expect("Bob");
+        let organization_id = service
+            .organizations
+            .keys()
+            .next()
+            .copied()
+            .expect("organization");
+        let public_ledger_id = service
+            .ledgers
+            .values()
+            .find(|ledger| ledger.kind == LedgerKind::OrganizationPublic)
+            .map(|ledger| ledger.id)
+            .expect("public ledger");
+        let zero_member = service
+            .add_organization_member(AppAddOrganizationMemberInput {
+                organization_id,
+                display_name: "Zero Expense".to_string(),
+                email: Some("zero@example.com".to_string()),
+                phone: None,
+                role: MembershipRole::Employee,
+            })
+            .expect("zero member");
+        let admin = User::new("Backend Admin", Some("admin@example.com".to_string()), None);
+        let admin_id = admin.id;
+        service.users.insert(admin_id, admin);
+        service.memberships.push(Membership::new(
+            organization_id,
+            admin_id,
+            MembershipRole::Admin,
+        ));
+        let pending_transaction_id = service
+            .transactions
+            .values()
+            .find(|transaction| {
+                transaction.created_by == bob_id
+                    && transaction.ledger_id == public_ledger_id
+                    && transaction.approval_state == ApprovalState::Submitted
+            })
+            .map(|transaction| transaction.id)
+            .expect("Bob pending request");
+        let previous_month = shift_month_start(month_start(OffsetDateTime::now_utc()), -1);
+        service
+            .transactions
+            .get_mut(&pending_transaction_id)
+            .expect("Bob pending transaction")
+            .occurred_at = previous_month;
+
+        let before_payment = service
+            .financial_month_detail(
+                owner_id,
+                public_ledger_id,
+                &month_key(OffsetDateTime::now_utc()),
+            )
+            .expect("month before payment");
+        assert_eq!(before_payment.expense_minor, 0);
+        assert!(before_payment.transactions.is_empty());
+
+        service
+            .decide_approval(AppDecideApprovalInput {
+                actor_user_id: owner_id,
+                transaction_id: pending_transaction_id,
+                decision: ApprovalDecision::Approve,
+                decision_note: None,
+            })
+            .expect("approve request");
+        let approved_not_paid = service
+            .financial_month_detail(
+                owner_id,
+                public_ledger_id,
+                &month_key(OffsetDateTime::now_utc()),
+            )
+            .expect("month after approval");
+        assert_eq!(approved_not_paid.expense_minor, 0);
+
+        service
+            .mark_transaction_paid(AppMarkTransactionPaidInput {
+                actor_user_id: owner_id,
+                transaction_id: pending_transaction_id,
+            })
+            .expect("pay request");
+        let public_account_id = service
+            .accounts
+            .values()
+            .find(|account| account.ledger_id == public_ledger_id)
+            .map(|account| account.id)
+            .expect("public account");
+        let income = service
+            .create_transaction(AppCreateTransactionInput {
+                actor_user_id: owner_id,
+                ledger_id: public_ledger_id,
+                account_id: public_account_id,
+                category_id: None,
+                kind: TransactionKind::Income,
+                amount_minor: 125_000,
+                currency: "CNY".to_string(),
+                description: "本月批准的收入".to_string(),
+                client_mutation_id: None,
+            })
+            .expect("create approved income");
+        let income_id = Uuid::parse_str(&income.id).expect("income id");
+        service
+            .transactions
+            .get_mut(&income_id)
+            .expect("income transaction")
+            .occurred_at = previous_month;
+        let month = month_key(OffsetDateTime::now_utc());
+        let month_detail = service
+            .financial_month_detail(owner_id, public_ledger_id, &month)
+            .expect("month detail");
+        assert_eq!(month_detail.expense_minor, 86_000);
+        assert_eq!(month_detail.income_minor, 125_000);
+        assert_eq!(month_detail.transaction_count, 2);
+        assert_eq!(
+            month_detail
+                .transactions
+                .iter()
+                .find(|transaction| transaction.transaction_id == pending_transaction_id.to_string())
+                .expect("paid expense")
+                .effective_at,
+            service.transactions[&pending_transaction_id]
+                .paid_at
+                .map(format_time)
+                .expect("paid time")
+        );
+        assert_eq!(
+            month_detail
+                .transactions
+                .iter()
+                .find(|transaction| transaction.transaction_id == income.id)
+                .expect("approved income")
+                .effective_at,
+            service.transactions[&income_id]
+                .approved_at
+                .map(format_time)
+                .expect("approved time")
+        );
+
+        let analysis = service
+            .financial_analysis(owner_id, public_ledger_id, 3)
+            .expect("summary");
+        assert!(analysis.member_expenses.iter().any(|member| {
+            member.user_id == zero_member.user_id
+                && member.expense_minor == 0
+                && member.transaction_count == 0
+        }));
+        assert!(!analysis
+            .member_expenses
+            .iter()
+            .any(|member| member.user_id == admin_id.to_string()));
+        let member_detail = service
+            .financial_member_detail(owner_id, public_ledger_id, 3, bob_id)
+            .expect("Bob detail");
+        assert_eq!(member_detail.expense_minor, 86_000);
+        assert_eq!(member_detail.transaction_count, 1);
+        assert_eq!(
+            analysis
+                .member_expenses
+                .iter()
+                .find(|member| member.user_id == bob_id.to_string())
+                .expect("Bob summary")
+                .expense_minor,
+            member_detail.expense_minor
+        );
+        assert!(matches!(
+            service.financial_month_detail(bob_id, public_ledger_id, &month),
+            Err(AppServiceError::Unauthorized)
+        ));
+        assert!(matches!(
+            service.financial_member_detail(bob_id, public_ledger_id, 3, bob_id),
+            Err(AppServiceError::Unauthorized)
+        ));
     }
 
     #[test]

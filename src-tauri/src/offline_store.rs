@@ -4,6 +4,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
 const MAX_DOCUMENT_BYTES: usize = 5 * 1024 * 1024;
+const CACHE_SCHEMA_VERSION: &str = "2";
 
 pub struct OfflineStore {
     connection: Mutex<Connection>,
@@ -11,7 +12,7 @@ pub struct OfflineStore {
 
 impl OfflineStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
-        let connection = Connection::open(path).map_err(|error| error.to_string())?;
+        let mut connection = Connection::open(path).map_err(|error| error.to_string())?;
         connection
             .execute_batch(
                 "
@@ -29,6 +30,32 @@ impl OfflineStore {
                 ",
             )
             .map_err(|error| error.to_string())?;
+        let cache_schema_version = connection
+            .query_row(
+                "SELECT value FROM offline_metadata WHERE key = 'cache_schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if cache_schema_version.as_deref() != Some(CACHE_SCHEMA_VERSION) {
+            let transaction = connection
+                .transaction()
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute("DELETE FROM offline_cache", [])
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute("DELETE FROM offline_metadata", [])
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "INSERT INTO offline_metadata (key, value) VALUES ('cache_schema_version', ?1)",
+                    [CACHE_SCHEMA_VERSION],
+                )
+                .map_err(|error| error.to_string())?;
+            transaction.commit().map_err(|error| error.to_string())?;
+        }
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -110,5 +137,52 @@ impl OfflineStore {
             )
             .map_err(|error| error.to_string())?;
         transaction.commit().map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opening_version_two_store_clears_legacy_cache() {
+        let path = std::env::temp_dir().join(format!(
+            "cloudledger-offline-cache-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let connection = Connection::open(&path).expect("open legacy store");
+            connection
+                .execute_batch(
+                    "
+                    CREATE TABLE offline_cache (
+                        user_id TEXT PRIMARY KEY NOT NULL,
+                        document TEXT NOT NULL,
+                        updated_at INTEGER NOT NULL
+                    );
+                    CREATE TABLE offline_metadata (
+                        key TEXT PRIMARY KEY NOT NULL,
+                        value TEXT NOT NULL
+                    );
+                    INSERT INTO offline_cache (user_id, document, updated_at)
+                    VALUES ('legacy-user', '{\"version\":1}', unixepoch());
+                    INSERT INTO offline_metadata (key, value)
+                    VALUES ('active_user_id', 'legacy-user');
+                    ",
+                )
+                .expect("seed legacy cache");
+        }
+
+        let store = OfflineStore::open(&path).expect("upgrade cache");
+        assert!(store.load_last().expect("load cache").is_none());
+        store
+            .save("current-user", &serde_json::json!({"version": 2}))
+            .expect("save current cache");
+        assert_eq!(
+            store.load_last().expect("load current cache"),
+            Some(serde_json::json!({"version": 2}))
+        );
+        drop(store);
+        std::fs::remove_file(path).expect("remove cache");
     }
 }

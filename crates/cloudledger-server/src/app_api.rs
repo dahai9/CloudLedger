@@ -6,7 +6,8 @@ use axum::{
 use cloudledger_service::{
     AppConfirmTransactionReceiptInput, AppCreateCategoryInput, AppCreateTransactionInput,
     AppDecideApprovalInput, AppMarkTransactionPaidInput, CategoryDto, FinancialAnalysisDto,
-    LedgerOverview, TransactionDto, TransactionMonthDto,
+    FinancialMemberDetailDto, FinancialMonthDetailDto, LedgerOverview, TransactionDto,
+    TransactionMonthDto,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -26,6 +27,22 @@ pub struct FinancialAnalysisQuery {
 pub struct TransactionMonthQuery {
     pub ledger_id: Uuid,
     pub month: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FinancialMonthDetailQuery {
+    pub ledger_id: Uuid,
+    pub month: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FinancialMemberDetailQuery {
+    pub ledger_id: Uuid,
+    #[serde(default = "default_analysis_months")]
+    pub months: u8,
+    pub member_id: Uuid,
 }
 
 fn default_analysis_months() -> u8 {
@@ -57,6 +74,45 @@ pub async fn financial_analysis(
     Ok(Json(
         service
             .financial_analysis(session.user.id, query.ledger_id, query.months)
+            .map_err(ApiError::from_service)?,
+    ))
+}
+
+pub async fn financial_month_detail(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<FinancialMonthDetailQuery>,
+) -> Result<Json<FinancialMonthDetailDto>, ApiError> {
+    let session = auth_routes::authenticate(&state, &headers)?;
+    let service = state
+        .ledger_service
+        .lock()
+        .map_err(|_| ApiError::internal("ledger service lock poisoned"))?;
+    Ok(Json(
+        service
+            .financial_month_detail(session.user.id, query.ledger_id, &query.month)
+            .map_err(ApiError::from_service)?,
+    ))
+}
+
+pub async fn financial_member_detail(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<FinancialMemberDetailQuery>,
+) -> Result<Json<FinancialMemberDetailDto>, ApiError> {
+    let session = auth_routes::authenticate(&state, &headers)?;
+    let service = state
+        .ledger_service
+        .lock()
+        .map_err(|_| ApiError::internal("ledger service lock poisoned"))?;
+    Ok(Json(
+        service
+            .financial_member_detail(
+                session.user.id,
+                query.ledger_id,
+                query.months,
+                query.member_id,
+            )
             .map_err(ApiError::from_service)?,
     ))
 }

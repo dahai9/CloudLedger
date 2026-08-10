@@ -9,6 +9,8 @@ import type {
   Ledger,
   LedgerDashboard,
   FinancialAnalysis,
+  FinancialMemberDetail,
+  FinancialMonthDetail,
   LoginDraft,
   NewTransactionDraft,
   OfflineTransaction,
@@ -19,6 +21,9 @@ import type {
 } from "./types";
 
 type ViewMode = "activity" | "analysis" | "approval" | "audit";
+type AnalysisDetailTarget =
+  | { kind: "month"; month: string }
+  | { kind: "member"; memberId: string };
 type TransactionFilter = "all" | "pending" | "approved" | "rejected";
 type AuthStatus = "checking" | "authenticated" | "anonymous";
 type SyncPhase = "idle" | "connecting" | "syncing" | "success" | "failed";
@@ -60,6 +65,11 @@ interface AppState {
   analysisMonths: AnalysisMonths;
   analysisLoading: boolean;
   analysisError?: string;
+  analysisDetailTarget?: AnalysisDetailTarget;
+  analysisMonthDetail?: FinancialMonthDetail;
+  analysisMemberDetail?: FinancialMemberDetail;
+  analysisDetailLoading: boolean;
+  analysisDetailError?: string;
   cachedDashboards: Record<string, LedgerDashboard>;
   outbox: OfflineTransaction[];
   sync: SyncState;
@@ -103,6 +113,7 @@ const state: AppState = {
   loading: true,
   analysisMonths: 6,
   analysisLoading: false,
+  analysisDetailLoading: false,
   cachedDashboards: {},
   outbox: [],
   sync: { phase: "idle", completed: 0, total: 0, syncedCount: 0 },
@@ -370,6 +381,7 @@ async function logout() {
     state.activeLedgerId = undefined;
     state.dashboard = undefined;
     state.analysis = undefined;
+    resetAnalysisDetail();
     state.cachedDashboards = {};
     state.outbox = [];
     state.reauthRequired = false;
@@ -393,6 +405,7 @@ async function switchLedger(ledgerId: string) {
     state.activityMonth = cached.selectedTransactionMonth;
     state.analysis = undefined;
     state.analysisError = undefined;
+    resetAnalysisDetail();
     state.view = "activity";
     state.filter = "all";
     resetFormForDashboard();
@@ -411,6 +424,7 @@ async function switchLedger(ledgerId: string) {
     rememberDashboard(state.dashboard);
     state.analysis = undefined;
     state.analysisError = undefined;
+    resetAnalysisDetail();
     state.view = "activity";
     state.filter = "all";
     resetFormForDashboard();
@@ -507,6 +521,80 @@ async function loadFinancialAnalysis(force: boolean) {
     state.analysisLoading = false;
     render();
   }
+}
+
+async function loadAnalysisDetail(target: AnalysisDetailTarget, force = false) {
+  const dashboard = state.dashboard;
+  if (
+    !dashboard ||
+    dashboard.ledger.kind !== "organization" ||
+    dashboard.ledger.role !== "business_owner" ||
+    state.analysisDetailLoading
+  ) {
+    return;
+  }
+  const sameTarget = analysisTargetsEqual(state.analysisDetailTarget, target);
+  if (!force && sameTarget && (state.analysisMonthDetail || state.analysisMemberDetail)) return;
+
+  state.analysisDetailTarget = target;
+  state.analysisMonthDetail = undefined;
+  state.analysisMemberDetail = undefined;
+  state.analysisDetailError = undefined;
+  state.analysisDetailLoading = true;
+  render();
+  const ledgerId = dashboard.ledger.id;
+  const months = state.analysisMonths;
+  try {
+    if (target.kind === "month") {
+      const detail = await cloudLedgerApi.getFinancialMonthDetail(ledgerId, target.month);
+      if (state.activeLedgerId === ledgerId && analysisTargetsEqual(state.analysisDetailTarget, target)) {
+        state.analysisMonthDetail = detail;
+      }
+    } else {
+      const detail = await cloudLedgerApi.getFinancialMemberDetail(
+        ledgerId,
+        months,
+        target.memberId,
+      );
+      if (
+        state.activeLedgerId === ledgerId &&
+        state.analysisMonths === months &&
+        analysisTargetsEqual(state.analysisDetailTarget, target)
+      ) {
+        state.analysisMemberDetail = detail;
+      }
+    }
+  } catch (error) {
+    if (state.activeLedgerId === ledgerId && analysisTargetsEqual(state.analysisDetailTarget, target)) {
+      state.analysisDetailError = friendlyError(error, "加载分析详情失败");
+    }
+  } finally {
+    state.analysisDetailLoading = false;
+    render();
+  }
+}
+
+function closeAnalysisDetail() {
+  resetAnalysisDetail();
+  render();
+}
+
+function resetAnalysisDetail() {
+  state.analysisDetailTarget = undefined;
+  state.analysisMonthDetail = undefined;
+  state.analysisMemberDetail = undefined;
+  state.analysisDetailError = undefined;
+  state.analysisDetailLoading = false;
+}
+
+function analysisTargetsEqual(
+  left: AnalysisDetailTarget | undefined,
+  right: AnalysisDetailTarget | undefined,
+) {
+  if (!left || !right || left.kind !== right.kind) return left === right;
+  return left.kind === "month"
+    ? left.month === (right as Extract<AnalysisDetailTarget, { kind: "month" }>).month
+    : left.memberId === (right as Extract<AnalysisDetailTarget, { kind: "member" }>).memberId;
 }
 
 async function refreshRemoteState(
@@ -721,7 +809,7 @@ function offlineSnapshot(): OfflineSnapshot | undefined {
     return undefined;
   }
   return {
-    version: 1,
+    version: 2,
     user: state.currentUser,
     ledgers: state.ledgers,
     dashboards: state.cachedDashboards,
@@ -1446,6 +1534,7 @@ function renderDashboard(dashboard: LedgerDashboard, sceneMotionClass: string) {
 
 function renderBalancePanel(dashboard: LedgerDashboard) {
   const { ledger } = dashboard;
+  const canViewBalances = ledger.canViewBalances;
   const pendingPaymentCount = dashboard.recentTransactions.filter(
     (transaction) => transaction.paymentState === "pending_payment",
   ).length;
@@ -1461,10 +1550,10 @@ function renderBalancePanel(dashboard: LedgerDashboard) {
       <div class="balance-heading">
         <div>
           <span class="section-kicker">${ledgerKindLabel(ledger.kind)}</span>
-          <p class="balance-label">${escapeHtml(ledger.name)}</p>
-          <strong class="balance-value ${state.amountsVisible ? "is-visible" : "is-hidden"}">${formatMoney(ledger.balanceCents, ledger.currency)}</strong>
+          <p class="balance-label">${escapeHtml(canViewBalances ? ledger.name : "我的公账申请")}</p>
+          ${canViewBalances ? `<strong class="balance-value ${state.amountsVisible ? "is-visible" : "is-hidden"}">${formatMoney(ledger.balanceCents ?? 0, ledger.currency)}</strong>` : ""}
         </div>
-        <button
+        ${canViewBalances ? `<button
           class="amount-visibility-toggle"
           id="amountVisibilityToggle"
           type="button"
@@ -1473,7 +1562,7 @@ function renderBalancePanel(dashboard: LedgerDashboard) {
           title="${state.amountsVisible ? "隐藏金额" : "显示金额"}"
         >
           <i data-lucide="${state.amountsVisible ? "eye-off" : "eye"}" aria-hidden="true"></i>
-        </button>
+        </button>` : ""}
       </div>
       <div class="balance-meta">
         ${organization}
@@ -1676,6 +1765,10 @@ function renderAnalysisPanel(dashboard: LedgerDashboard) {
     return "";
   }
 
+  if (state.analysisDetailTarget) {
+    return renderAnalysisDetailPanel();
+  }
+
   const currency = analysis.currency;
   const cashFlowDelta = analysis.netCashFlowCents - analysis.previousNetCashFlowCents;
   const projectedBalance = analysis.currentBalanceCents - analysis.pendingPayment.amountCents;
@@ -1729,17 +1822,17 @@ function renderAnalysisPanel(dashboard: LedgerDashboard) {
           <h3>月度收支趋势</h3>
           <div class="chart-legend"><span class="income-dot">收入</span><span class="expense-dot">支出</span></div>
         </div>
-        <div class="cashflow-chart" role="img" aria-label="${analysis.months}个月收入和支出柱状图">
+        <div class="cashflow-chart" role="group" aria-label="${analysis.months}个月收入和支出，选择月份查看详情">
           ${analysis.trend
             .map(
               (point) => `
-                <div class="chart-period" title="${escapeHtml(point.label)} 收入 ${escapeHtml(formatMoney(point.incomeCents, currency))}，支出 ${escapeHtml(formatMoney(point.expenseCents, currency))}">
+                <button class="chart-period" type="button" data-analysis-month="${escapeHtml(point.key)}" title="查看 ${escapeHtml(point.label)} 明细：收入 ${escapeHtml(formatMoney(point.incomeCents, currency))}，支出 ${escapeHtml(formatMoney(point.expenseCents, currency))}">
                   <div class="bar-pair">
                     <span class="chart-bar income" style="--bar-height:${barHeight(point.incomeCents, maxTrendValue)}%"></span>
                     <span class="chart-bar expense" style="--bar-height:${barHeight(point.expenseCents, maxTrendValue)}%"></span>
                   </div>
                   <span>${escapeHtml(point.label)}</span>
-                </div>
+                </button>
               `,
             )
             .join("")}
@@ -1774,11 +1867,11 @@ function renderAnalysisPanel(dashboard: LedgerDashboard) {
               ? analysis.memberExpenses
                   .map(
                     (member) => `
-                      <div class="member-spend-row">
+                      <button class="member-spend-row" type="button" data-analysis-member="${escapeHtml(member.userId)}" title="查看 ${escapeHtml(member.displayName)} 已打款明细">
                         <div><strong>${escapeHtml(member.displayName)}</strong><span>${member.transactionCount} 笔</span></div>
                         <div class="member-spend-track"><span style="--spend-width:${Math.max(4, (member.expenseCents / maxMemberExpense) * 100)}%"></span></div>
                         <strong>${formatMoney(member.expenseCents, currency)}</strong>
-                      </div>
+                      </button>
                     `,
                   )
                   .join("")
@@ -1807,6 +1900,149 @@ function renderAnalysisPanel(dashboard: LedgerDashboard) {
   `;
 }
 
+function renderAnalysisDetailPanel() {
+  const target = state.analysisDetailTarget;
+  if (!target) return "";
+  const title =
+    target.kind === "month"
+      ? `${escapeHtml(target.month)} 月度详情`
+      : escapeHtml(
+          state.analysisMemberDetail?.displayName ??
+            state.analysis?.memberExpenses.find((member) => member.userId === target.memberId)
+              ?.displayName ??
+            "成员明细",
+        );
+  const heading = `
+    <div class="analysis-heading analysis-detail-heading">
+      <div>
+        <span class="section-kicker">Detail</span>
+        <h2>${title}</h2>
+        <p>${target.kind === "month" ? "按现金实际发生时间统计" : `最近 ${state.analysisMonths} 个月已打款项目`}</p>
+      </div>
+      <button class="ghost-button analysis-back-button" id="closeAnalysisDetailButton" type="button">
+        <i data-lucide="arrow-left" aria-hidden="true"></i>返回汇总
+      </button>
+    </div>
+  `;
+
+  if (state.analysisDetailLoading) {
+    return `<section class="analysis-view" aria-label="财务分析详情">${heading}<div class="analysis-state"><div class="spinner" aria-hidden="true"></div><p>正在加载明细</p></div></section>`;
+  }
+  if (state.analysisDetailError) {
+    return `
+      <section class="analysis-view" aria-label="财务分析详情">
+        ${heading}
+        <div class="analysis-state">
+          <p>${escapeHtml(state.analysisDetailError)}</p>
+          <button class="primary-button" id="retryAnalysisDetailButton" type="button">重新加载</button>
+        </div>
+      </section>
+    `;
+  }
+  if (target.kind === "month" && state.analysisMonthDetail) {
+    return renderMonthAnalysisDetail(heading, state.analysisMonthDetail);
+  }
+  if (target.kind === "member" && state.analysisMemberDetail) {
+    return renderMemberAnalysisDetail(heading, state.analysisMemberDetail);
+  }
+  return `<section class="analysis-view" aria-label="财务分析详情">${heading}<div class="analysis-state"><p>暂无详情数据</p></div></section>`;
+}
+
+function renderMonthAnalysisDetail(heading: string, detail: FinancialMonthDetail) {
+  const activeMembers = detail.memberExpenses.filter((member) => member.expenseCents > 0);
+  return `
+    <section class="analysis-view" aria-label="${escapeHtml(detail.month)} 月度详情">
+      ${heading}
+      <div class="analysis-metrics">
+        ${renderAnalysisMetric("月收入", detail.incomeCents, detail.currency, "实际批准入账")}
+        ${renderAnalysisMetric("月支出", detail.expenseCents, detail.currency, "实际完成打款")}
+        ${renderAnalysisMetric("净现金流", detail.netCashFlowCents, detail.currency, "收入减支出", detail.netCashFlowCents >= 0 ? "positive" : "negative")}
+        ${renderAnalysisMetric("实际笔数", detail.transactionCount, "", "当月现金流")}
+      </div>
+      <section class="analysis-section" aria-label="分类构成">
+        <div class="analysis-section-heading"><h3>分类构成</h3><span>${detail.categories.length} 个分类</span></div>
+        <div class="analysis-list">
+          ${
+            detail.categories.length > 0
+              ? detail.categories
+                  .map(
+                    (category) => `<div class="analysis-list-row"><div><strong>${escapeHtml(category.categoryName)}</strong><span>${category.direction === "income" ? "收入" : "支出"} · ${category.transactionCount} 笔</span></div><strong class="${category.direction === "income" ? "amount-in" : "amount-out"}">${formatMoney(category.amountCents, detail.currency)}</strong></div>`,
+                  )
+                  .join("")
+              : `<p class="empty-copy">本月暂无实际收支</p>`
+          }
+        </div>
+      </section>
+      <section class="analysis-section" aria-label="成员支出">
+        <div class="analysis-section-heading"><h3>成员支出</h3><span>已打款</span></div>
+        <div class="analysis-list">
+          ${
+            activeMembers.length > 0
+              ? activeMembers
+                  .map(
+                    (member) => `<div class="analysis-list-row"><div><strong>${escapeHtml(member.displayName)}</strong><span>${member.transactionCount} 笔</span></div><strong class="amount-out">${formatMoney(member.expenseCents, detail.currency)}</strong></div>`,
+                  )
+                  .join("")
+              : `<p class="empty-copy">本月暂无成员已打款支出</p>`
+          }
+        </div>
+      </section>
+      ${renderActualTransactionSection(detail.transactions, detail.currency, "逐笔实际收支")}
+    </section>
+  `;
+}
+
+function renderMemberAnalysisDetail(heading: string, detail: FinancialMemberDetail) {
+  return `
+    <section class="analysis-view" aria-label="${escapeHtml(detail.displayName)} 已打款项目">
+      ${heading}
+      <div class="analysis-metrics analysis-member-metrics">
+        ${renderAnalysisMetric("已打款支出", detail.expenseCents, detail.currency, `${detail.transactionCount} 笔项目`)}
+        ${renderAnalysisMetric("分析周期", detail.months, "", `${formatPeriodMonth(detail.periodStart)} 至 ${formatPeriodMonth(detail.periodEnd)}`)}
+      </div>
+      ${renderActualTransactionSection(detail.transactions, detail.currency, "已打款项目")}
+    </section>
+  `;
+}
+
+function renderActualTransactionSection(
+  transactions: FinancialMonthDetail["transactions"],
+  currency: string,
+  title: string,
+) {
+  return `
+    <section class="analysis-section" aria-label="${escapeHtml(title)}">
+      <div class="analysis-section-heading"><h3>${escapeHtml(title)}</h3><span>${transactions.length} 笔</span></div>
+      <div class="analysis-list analysis-transaction-list">
+        ${
+          transactions.length > 0
+            ? transactions
+                .map(
+                  (transaction) => `
+                    <div class="analysis-list-row analysis-transaction-row">
+                      <div>
+                        <strong>${escapeHtml(transaction.description)}</strong>
+                        <span>${escapeHtml(transaction.categoryName)} · ${escapeHtml(transaction.accountName)}</span>
+                        <span>${escapeHtml(transaction.submittedBy)} · ${formatDate(transaction.effectiveAt)} · ${analysisPaymentStateLabel(transaction.paymentState)}</span>
+                      </div>
+                      <strong class="${transaction.direction === "income" ? "amount-in" : "amount-out"}">${transaction.direction === "income" ? "+" : "-"}${formatMoney(transaction.amountCents, currency)}</strong>
+                    </div>
+                  `,
+                )
+                .join("")
+            : `<p class="empty-copy">所选范围暂无实际收支</p>`
+        }
+      </div>
+    </section>
+  `;
+}
+
+function analysisPaymentStateLabel(paymentState: FinancialMonthDetail["transactions"][number]["paymentState"]) {
+  if (paymentState === "paid_pending_receipt") return "待确认收款";
+  if (paymentState === "received") return "已确认收款";
+  return "已入账";
+}
+
 function renderAnalysisRangeButton(months: AnalysisMonths) {
   const active = state.analysisMonths === months;
   return `<button class="filter-tab ${active ? "is-active" : ""}" type="button" data-analysis-months="${months}" aria-pressed="${active}" ${state.analysisLoading ? "disabled" : ""}>${months} 个月</button>`;
@@ -1819,7 +2055,8 @@ function renderAnalysisMetric(
   detail: string,
   tone = "",
 ) {
-  return `<article class="analysis-metric ${tone}"><span>${label}</span><strong>${formatMoney(value, currency)}</strong><p>${escapeHtml(detail)}</p></article>`;
+  const formattedValue = currency ? formatMoney(value, currency) : formatCompactNumber(value);
+  return `<article class="analysis-metric ${tone}"><span>${label}</span><strong>${formattedValue}</strong><p>${escapeHtml(detail)}</p></article>`;
 }
 
 function renderExposureRow(
@@ -1869,12 +2106,16 @@ function renderTransactionList(dashboard: LedgerDashboard) {
       </div>
       <div class="activity-month-bar">
         <label for="activityMonthSelect">月份</label>
-        <select id="activityMonthSelect">
-          ${dashboard.availableTransactionMonths
-            .map(
-              (month) => `<option value="${escapeHtml(month)}" ${month === dashboard.selectedTransactionMonth ? "selected" : ""}>${escapeHtml(formatMonthLabel(month))}</option>`,
-            )
-            .join("")}
+        <select id="activityMonthSelect" ${dashboard.availableTransactionMonths.length === 0 ? "disabled" : ""}>
+          ${
+            dashboard.availableTransactionMonths.length > 0
+              ? dashboard.availableTransactionMonths
+                  .map(
+                    (month) => `<option value="${escapeHtml(month)}" ${month === dashboard.selectedTransactionMonth ? "selected" : ""}>${escapeHtml(formatMonthLabel(month))}</option>`,
+                  )
+                  .join("")
+              : `<option value="">暂无可用月份</option>`
+          }
         </select>
         <span>${filtered.length} / ${dashboard.recentTransactions.length} 笔</span>
       </div>
@@ -2321,6 +2562,7 @@ function bindEvents() {
       if (months === 3 || months === 6 || months === 12) {
         state.analysisMonths = months;
         state.analysis = undefined;
+        resetAnalysisDetail();
         void loadFinancialAnalysis(true);
       }
     });
@@ -2328,6 +2570,28 @@ function bindEvents() {
 
   app.querySelector<HTMLButtonElement>("#retryAnalysisButton")?.addEventListener("click", () => {
     void loadFinancialAnalysis(true);
+  });
+
+  app.querySelectorAll<HTMLButtonElement>("[data-analysis-month]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const month = button.dataset.analysisMonth;
+      if (month) void loadAnalysisDetail({ kind: "month", month });
+    });
+  });
+
+  app.querySelectorAll<HTMLButtonElement>("[data-analysis-member]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const memberId = button.dataset.analysisMember;
+      if (memberId) void loadAnalysisDetail({ kind: "member", memberId });
+    });
+  });
+
+  app.querySelector<HTMLButtonElement>("#closeAnalysisDetailButton")?.addEventListener("click", () => {
+    closeAnalysisDetail();
+  });
+
+  app.querySelector<HTMLButtonElement>("#retryAnalysisDetailButton")?.addEventListener("click", () => {
+    if (state.analysisDetailTarget) void loadAnalysisDetail(state.analysisDetailTarget, true);
   });
 
   app.querySelectorAll<HTMLButtonElement>("[data-approval-decision]").forEach((button) => {

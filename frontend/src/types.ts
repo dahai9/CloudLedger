@@ -31,7 +31,8 @@ export interface Ledger {
   currency: "CNY" | "USD" | "EUR" | string;
   role: MemberRole;
   organizationName?: string;
-  balanceCents: number;
+  canViewBalances: boolean;
+  balanceCents: number | null;
   pendingCount: number;
   auditUnreadCount: number;
   lastSyncedAt?: string;
@@ -85,7 +86,7 @@ export interface FinancialAccount {
     | "company"
     | "receivable"
     | "payable";
-  balanceCents: number;
+  balanceCents: number | null;
 }
 
 export interface Category {
@@ -224,4 +225,53 @@ export interface AnalysisExpense {
   submittedBy: string;
   amountCents: number;
   paidAt: string;
+}
+
+export interface FinancialMonthDetail {
+  ledgerId: string;
+  month: string;
+  currency: string;
+  incomeCents: number;
+  expenseCents: number;
+  netCashFlowCents: number;
+  transactionCount: number;
+  categories: AnalysisCategory[];
+  memberExpenses: MemberExpense[];
+  transactions: AnalysisTransaction[];
+}
+
+export interface FinancialMemberDetail {
+  ledgerId: string;
+  currency: string;
+  months: AnalysisMonths;
+  periodStart: string;
+  periodEnd: string;
+  memberId: string;
+  displayName: string;
+  expenseCents: number;
+  transactionCount: number;
+  transactions: AnalysisTransaction[];
+}
+
+export interface AnalysisCategory {
+  categoryId?: string;
+  categoryName: string;
+  direction: TransactionDirection;
+  amountCents: number;
+  transactionCount: number;
+}
+
+export interface AnalysisTransaction {
+  transactionId: string;
+  description: string;
+  direction: TransactionDirection;
+  categoryId?: string;
+  categoryName: string;
+  accountId: string;
+  accountName: string;
+  submittedByUserId: string;
+  submittedBy: string;
+  amountCents: number;
+  effectiveAt: string;
+  paymentState: PaymentState;
 }

@@ -1481,9 +1481,19 @@ button:not(:disabled):active {
   grid-template-rows: 142px 18px;
   align-items: end;
   gap: 4px;
+  padding: 0;
+  cursor: pointer;
+  background: transparent;
   color: var(--muted);
   font-size: 10px;
   text-align: center;
+}
+
+.chart-period:hover,
+.chart-period:focus-visible {
+  color: var(--ink);
+  outline: 2px solid rgb(47 111 159 / 28%);
+  outline-offset: 2px;
 }
 
 .bar-pair {
@@ -1597,7 +1607,20 @@ button:not(:disabled):active {
   align-items: center;
   gap: 10px;
   min-height: 58px;
+  width: 100%;
+  padding: 0;
+  cursor: pointer;
   border-bottom: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+}
+
+.member-spend-row:hover,
+.member-spend-row:focus-visible {
+  background: rgb(47 111 159 / 6%);
+  outline: 2px solid rgb(47 111 159 / 24%);
+  outline-offset: -2px;
 }
 
 .member-spend-track {
@@ -1640,6 +1663,33 @@ button:not(:disabled):active {
 
 .analysis-updated {
   text-align: center;
+}
+
+.analysis-detail-heading {
+  align-items: center;
+}
+
+.analysis-back-button svg {
+  width: 16px;
+  height: 16px;
+}
+
+.analysis-member-metrics {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.analysis-transaction-row {
+  min-height: 72px;
+  padding: 9px 0;
+}
+
+.analysis-transaction-row > div {
+  gap: 4px;
+}
+
+.analysis-transaction-row > strong {
+  align-self: start;
+  padding-top: 2px;
 }
 
 .bottom-nav {
@@ -1946,6 +1996,10 @@ button:not(:disabled):active {
     flex-direction: column;
   }
 
+  .analysis-detail-heading .analysis-back-button {
+    align-self: flex-start;
+  }
+
   .analysis-range {
     width: 100%;
   }
@@ -1954,6 +2008,19 @@ button:not(:disabled):active {
 @media (max-width: 380px) {
   .analysis-metrics {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .analysis-member-metrics {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .analysis-transaction-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .analysis-transaction-row > strong {
+    text-align: left;
   }
 
   .member-spend-row {

@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Ledger, LedgerDashboard, OfflineTransaction, UserAccount } from "./types";
 
 export interface OfflineSnapshot {
-  version: 1;
+  version: 2;
   user: UserAccount;
   ledgers: Ledger[];
   dashboards: Record<string, LedgerDashboard>;
@@ -63,7 +63,7 @@ function isOfflineSnapshot(value: unknown): value is OfflineSnapshot {
   if (!value || typeof value !== "object") return false;
   const snapshot = value as Partial<OfflineSnapshot>;
   return (
-    snapshot.version === 1 &&
+    snapshot.version === 2 &&
     Boolean(snapshot.user?.id) &&
     Array.isArray(snapshot.ledgers) &&
     Boolean(snapshot.dashboards) &&
@@ -104,8 +104,17 @@ async function browserClear(userId: string): Promise<void> {
 
 function openDatabase(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const open = indexedDB.open(databaseName, 1);
-    open.onupgradeneeded = () => open.result.createObjectStore(storeName);
+    const open = indexedDB.open(databaseName, 2);
+    open.onupgradeneeded = (event) => {
+      const database = open.result;
+      if (!database.objectStoreNames.contains(storeName)) {
+        database.createObjectStore(storeName);
+        return;
+      }
+      if ((event as IDBVersionChangeEvent).oldVersion < 2) {
+        open.transaction?.objectStore(storeName).clear();
+      }
+    };
     open.onsuccess = () => resolve(open.result);
     open.onerror = () => reject(open.error ?? new Error("无法打开离线存储"));
   });

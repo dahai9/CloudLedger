@@ -690,13 +690,13 @@ mod tests {
         .fetch_one(&store.pool)
         .await
         .expect("read migration version");
-        assert_eq!(migration_version, 4);
+        assert_eq!(migration_version, 5);
         let migration_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE success")
                 .fetch_one(&store.pool)
                 .await
                 .expect("count applied migrations");
-        assert_eq!(migration_count, 4);
+        assert_eq!(migration_count, 5);
         let admin_organization_fk_is_deferred: bool = sqlx::query_scalar(
             "SELECT condeferrable FROM pg_constraint WHERE conname = 'auth_users_organization_id_fkey'",
         )
@@ -722,7 +722,7 @@ mod tests {
                 .fetch_one(&reopened_store.pool)
                 .await
                 .expect("count migrations after reconnect");
-        assert_eq!(migration_count, 4);
+        assert_eq!(migration_count, 5);
         reopened_store.pool.close().await;
 
         reset_public_schema(&database_url).await;

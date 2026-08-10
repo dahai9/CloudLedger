@@ -3,7 +3,8 @@ use std::{path::PathBuf, sync::Mutex};
 use cloudledger_service::{
     AppConfirmTransactionReceiptInput, AppCreateCategoryInput, AppCreateTransactionInput,
     AppDecideApprovalInput, AppLedgerService, AppMarkTransactionPaidInput, AppServiceError,
-    CategoryDto, FinancialAnalysisDto, LedgerOverview, TransactionDto, TransactionMonthDto,
+    CategoryDto, FinancialAnalysisDto, FinancialMemberDetailDto, FinancialMonthDetailDto,
+    LedgerOverview, TransactionDto, TransactionMonthDto,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
@@ -133,6 +134,37 @@ fn get_financial_analysis(
         .map_err(|_| "ledger service lock poisoned".to_string())?;
     service
         .financial_analysis(service.current_user_id(), ledger_id, months)
+        .map_err(service_error)
+}
+
+#[tauri::command]
+fn get_financial_month_detail(
+    state: State<'_, AppState>,
+    ledger_id: Uuid,
+    month: String,
+) -> Result<FinancialMonthDetailDto, String> {
+    let service = state
+        .ledger_service
+        .lock()
+        .map_err(|_| "ledger service lock poisoned".to_string())?;
+    service
+        .financial_month_detail(service.current_user_id(), ledger_id, &month)
+        .map_err(service_error)
+}
+
+#[tauri::command]
+fn get_financial_member_detail(
+    state: State<'_, AppState>,
+    ledger_id: Uuid,
+    months: u8,
+    member_id: Uuid,
+) -> Result<FinancialMemberDetailDto, String> {
+    let service = state
+        .ledger_service
+        .lock()
+        .map_err(|_| "ledger service lock poisoned".to_string())?;
+    service
+        .financial_member_detail(service.current_user_id(), ledger_id, months, member_id)
         .map_err(service_error)
 }
 
@@ -267,6 +299,8 @@ pub fn run() {
             secure_session_clear,
             get_overview,
             get_financial_analysis,
+            get_financial_month_detail,
+            get_financial_member_detail,
             get_transactions_for_month,
             create_category,
             create_transaction,

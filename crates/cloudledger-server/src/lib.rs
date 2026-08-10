@@ -88,6 +88,14 @@ pub fn router(state: ServerState) -> Router {
         .route("/app/overview", get(app_api::overview))
         .route("/app/analytics", get(app_api::financial_analysis))
         .route(
+            "/app/analytics/month-detail",
+            get(app_api::financial_month_detail),
+        )
+        .route(
+            "/app/analytics/member-detail",
+            get(app_api::financial_member_detail),
+        )
+        .route(
             "/app/transactions",
             get(app_api::transactions_for_month).post(app_api::create_transaction),
         )
@@ -240,7 +248,7 @@ mod http_tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::auth::{AccountKind, AdminCreateUserInput};
+    use crate::auth::{AccountKind, AdminCreateUserInput, RegisterInput};
     use crate::login_protection::INVALID_BEARER_LIMIT;
 
     fn request(method: Method, uri: &str, body: serde_json::Value) -> Request<Body> {
@@ -255,6 +263,17 @@ mod http_tests {
         request.extensions_mut().insert(ConnectInfo(
             "127.0.0.1:42000".parse::<SocketAddr>().unwrap(),
         ));
+        request
+    }
+
+    fn authorized_get(uri: &str, access_token: &str) -> Request<Body> {
+        let mut request = request(Method::GET, uri, json!({}));
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {access_token}")
+                .parse()
+                .expect("bearer header"),
+        );
         request
     }
 
@@ -509,6 +528,86 @@ mod http_tests {
             .and_then(|value| value.to_str().ok())
             .is_none_or(|headers| !headers.contains("ngrok-skip-browser-warning")));
 
+        fs::remove_dir_all(data_dir).expect("remove test data");
+    }
+
+    #[tokio::test]
+    async fn employee_http_responses_hide_balances_and_reject_all_analytics_routes() {
+        let data_dir = std::env::temp_dir().join(format!("cloudledger-http-{}", Uuid::new_v4()));
+        let state = ServerState::load(data_dir.clone()).expect("load test state");
+        let service = cloudledger_service::AppLedgerService::seeded();
+        let bob = service
+            .users()
+            .into_iter()
+            .find(|user| user.display_name == "Bob")
+            .expect("seeded Bob");
+        let bob_id = Uuid::parse_str(&bob.id).expect("Bob id");
+        let public_ledger_id = service
+            .overview(bob_id)
+            .ledgers
+            .into_iter()
+            .find(|ledger| ledger.kind == "organization_public")
+            .map(|ledger| ledger.id)
+            .expect("public ledger");
+        *state.ledger_service.lock().expect("ledger lock") = service;
+        let session = state
+            .auth_service
+            .lock()
+            .expect("auth lock")
+            .register(RegisterInput {
+                user_id: Some(bob_id),
+                display_name: "Bob".to_string(),
+                email: Some("bob-http@example.com".to_string()),
+                phone: None,
+                password: "correct-password".to_string(),
+                installation_id: "bob-http-test".to_string(),
+            })
+            .expect("register Bob session");
+        let app = router(state);
+
+        let overview = app
+            .clone()
+            .oneshot(authorized_get("/app/overview", &session.access_token))
+            .await
+            .expect("overview response");
+        assert_eq!(overview.status(), StatusCode::OK);
+        let overview_body = to_bytes(overview.into_body(), 64 * 1024)
+            .await
+            .expect("overview body");
+        let overview: serde_json::Value =
+            serde_json::from_slice(&overview_body).expect("overview json");
+        let public_ledger = overview["ledgers"]
+            .as_array()
+            .expect("ledgers")
+            .iter()
+            .find(|ledger| ledger["id"] == public_ledger_id)
+            .expect("public ledger response");
+        assert_eq!(public_ledger["canViewBalances"], false);
+        assert!(overview["accounts"]
+            .as_array()
+            .expect("accounts")
+            .iter()
+            .filter(|account| account["ledgerId"] == public_ledger_id)
+            .all(|account| account["balanceMinor"].is_null()));
+
+        for uri in [
+            format!("/app/analytics?ledgerId={public_ledger_id}&months=3"),
+            format!(
+                "/app/analytics/month-detail?ledgerId={public_ledger_id}&month=2026-08"
+            ),
+            format!(
+                "/app/analytics/member-detail?ledgerId={public_ledger_id}&months=3&memberId={bob_id}"
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authorized_get(&uri, &session.access_token))
+                .await
+                .expect("analytics response");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+        }
+
+        drop(app);
         fs::remove_dir_all(data_dir).expect("remove test data");
     }
 }
