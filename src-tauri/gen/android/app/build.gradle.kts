@@ -12,6 +12,7 @@ val tauriProperties = Properties().apply {
         propFile.inputStream().use { load(it) }
     }
 }
+val appVersionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
 
 android {
     compileSdk = 36
@@ -23,7 +24,8 @@ android {
         minSdk = 24
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
-        versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+        versionName = appVersionName
+        setProperty("archivesBaseName", "CloudLedger-v$appVersionName")
     }
     buildTypes {
         getByName("debug") {

@@ -1150,6 +1150,19 @@ render_firewall_rules() {
   local ipv4=$1 ipv6=$2 target=$3 has_table=$4 v4_elements v6_elements
   v4_elements=$(paste -sd, "$ipv4") || return 1
   v6_elements=$(paste -sd, "$ipv6") || return 1
+  # nftables rejects `elements = { }`.  The initial fail-closed baseline
+  # deliberately renders empty sets before the Cloudflare ranges are fetched,
+  # so only emit an elements clause when the corresponding file has entries.
+  if [[ -n "$v4_elements" ]]; then
+    v4_elements="    elements = { $v4_elements }"
+  else
+    v4_elements=''
+  fi
+  if [[ -n "$v6_elements" ]]; then
+    v6_elements="    elements = { $v6_elements }"
+  else
+    v6_elements=''
+  fi
   : >"$target" || return 1
   if [[ "$has_table" == 1 ]]; then
     printf '%s\n' 'delete table inet cloudledger_origin' >>"$target" || return 1
@@ -1159,12 +1172,12 @@ table inet cloudledger_origin {
   set cloudflare_ipv4 {
     type ipv4_addr
     flags interval
-    elements = { $v4_elements }
+${v4_elements}
   }
   set cloudflare_ipv6 {
     type ipv6_addr
     flags interval
-    elements = { $v6_elements }
+${v6_elements}
   }
   chain input {
     type filter hook input priority -10; policy accept;
@@ -1248,12 +1261,26 @@ firewall_status() {
   input_body=$(awk '
     $1 == "chain" && $2 == "input" { active=1; next }
     active && /^[[:space:]]*}/ { exit }
-    active { gsub(/[[:space:]]+/, " "); sub(/^ /, ""); sub(/ $/, ""); if (length) print }
+    active {
+      # `nft list` may render a numeric priority as `priority filter - 10`
+      # even though the rule was loaded as `priority -10`.
+      gsub(/priority filter - 10/, "priority -10")
+      gsub(/[[:space:]]+/, " ")
+      sub(/^ /, "")
+      sub(/ $/, "")
+      if (length) print
+    }
   ' <<<"$table")
   forward_body=$(awk '
     $1 == "chain" && $2 == "forward" { active=1; next }
     active && /^[[:space:]]*}/ { exit }
-    active { gsub(/[[:space:]]+/, " "); sub(/^ /, ""); sub(/ $/, ""); if (length) print }
+    active {
+      gsub(/priority filter - 10/, "priority -10")
+      gsub(/[[:space:]]+/, " ")
+      sub(/^ /, "")
+      sub(/ $/, "")
+      if (length) print
+    }
   ' <<<"$table")
   [[ "$input_body" == $'type filter hook input priority -10; policy accept;\niifname "lo" tcp dport 443 accept\nip saddr @cloudflare_ipv4 tcp dport 443 accept\nip6 saddr @cloudflare_ipv6 tcp dport 443 accept\ntcp dport 443 reject with tcp reset' ]] \
     || { warn 'CloudLedger INPUT 链顺序、hook 或规则集合不符合 fail-closed 模型。'; return 1; }
@@ -1422,7 +1449,7 @@ deploy_locked() {
     && health_url 'Cloudflare /ready' "$(api_base_url)/ready" \
     && verify_turnstile || return 1
   log '12/12 复核 Cloudflare-only 防火墙状态...'
-  firewall_status >/dev/null || return 1
+  firewall_status || return 1
   printf '%s %s success\n' "$(date -u +%FT%TZ)" "${CLOUDLEDGER_RELEASE_TAG:-unknown}" >"$STATE_DIR/deploy.log"
   ok '首次部署流水线完成。'
 }
@@ -2032,7 +2059,7 @@ start_and_verify_restored_stack() {
   compose run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile || return 1
   compose up -d --no-deps caddy || return 1
   health_url '恢复后 /health' "$(api_base_url)/health" && health_url '恢复后 /ready' "$(api_base_url)/ready" \
-    && verify_turnstile && firewall_status >/dev/null
+    && verify_turnstile && firewall_status
 }
 
 preserve_failed_restore_snapshot() {
@@ -3138,7 +3165,7 @@ internal_health() {
     health_url 'API /health' "$api/health" || failed=1
     health_url 'API /ready' "$api/ready" || failed=1
     certificate_status || failed=1
-    firewall_status >/dev/null || failed=1
+    firewall_status || failed=1
   } >>"$STATE_DIR/health.log" 2>&1
   return "$failed"
 }

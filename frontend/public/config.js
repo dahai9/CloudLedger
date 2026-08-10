@@ -1,3 +1,3 @@
 window.__CLOUDLEDGER_CONFIG__ = {
-  apiBaseUrl: "https://subuncinated-deedee-bronchial.ngrok-free.dev",
+  apiBaseUrl: "https://cloudledger-test.513921.xyz",
 };

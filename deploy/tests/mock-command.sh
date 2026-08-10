@@ -48,6 +48,9 @@ remote_path() {
 
 emit_nft_table() {
   local mode=${CLOUDLEDGER_TEST_NFT_TABLE_MODE:-valid}
+  local priority='priority -10'
+  [[ ${CLOUDLEDGER_TEST_NFT_PRETTY_PRIORITY:-0} == 1 ]] \
+    && priority='priority filter - 10'
   printf '%s\n' 'table inet cloudledger_origin {'
   if [[ "$mode" != missing-sets ]]; then
     printf '%s\n' \
@@ -57,9 +60,9 @@ emit_nft_table() {
   if [[ "$mode" != missing-input ]]; then
     printf '%s\n' '  chain input {'
     if [[ "$mode" == non-hook ]]; then
-      printf '%s\n' '    type filter hook output priority -10; policy accept;'
+      printf '%s\n' "    type filter hook output $priority; policy accept;"
     else
-      printf '%s\n' '    type filter hook input priority -10; policy accept;'
+      printf '%s\n' "    type filter hook input $priority; policy accept;"
     fi
     [[ "$mode" == extra-accept ]] && printf '%s\n' '    tcp dport 443 accept'
     printf '%s\n' \
@@ -71,7 +74,7 @@ emit_nft_table() {
   fi
   if [[ "$mode" != missing-forward ]]; then
     printf '%s\n' '  chain forward {' \
-      '    type filter hook forward priority -10; policy accept;'
+      "    type filter hook forward $priority; policy accept;"
     if [[ "$mode" == missing-bridge ]]; then
       printf '%s\n' \
         '    oifname "wrong0" ip saddr @cloudflare_ipv4 tcp dport 443 accept' \
@@ -439,6 +442,16 @@ case $name in
     fi
     if has_arg -f "$@" || has_arg --file "$@"; then
       record 'firewall:apply'
+      if [[ -n ${CLOUDLEDGER_TEST_NFT_CAPTURE:-} ]]; then
+        nft_file=''
+        for arg in "$@"; do
+          if [[ -f "$arg" ]]; then
+            nft_file=$arg
+            break
+          fi
+        done
+        [[ -z "$nft_file" ]] || cp -- "$nft_file" "$CLOUDLEDGER_TEST_NFT_CAPTURE"
+      fi
       [[ -n "$nft_state" ]] && : >"$nft_state"
       exit 0
     fi

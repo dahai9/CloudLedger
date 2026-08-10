@@ -129,8 +129,8 @@ image's migration level, core tables, the audit chain, and successful temporary
 database cleanup. Deployment also probes the configured Turnstile secret
 directly against Cloudflare's `siteverify` endpoint before reporting success.
 
-For the complete host requirements, deployment order, timer units, backup
-contents, and verification gates, see `docs/backend-deployment.md`.
+完整的中文、菜单驱动生产手册（主机要求、部署顺序、定时任务、备份内容、恢复边界和
+验收门槛）见 [`docs/backend-deployment.md`](docs/backend-deployment.md)。
 
 When PostgreSQL has no CloudLedger application metadata, startup imports
 existing `ledger-state.json` and `auth-state.json` files from `server.data_dir`

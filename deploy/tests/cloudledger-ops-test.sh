@@ -136,7 +136,8 @@ setup_case() {
     CLOUDLEDGER_TEST_SIGNAL_ON_PG_RESTORE CLOUDLEDGER_TEST_SIGNAL_ON_COMPOSE \
     CLOUDLEDGER_TEST_SIGNAL_ON_RCLONE CLOUDLEDGER_TEST_ANCHOR_ID CLOUDLEDGER_TEST_HTTPS_DOCKER_OWNER \
     CLOUDLEDGER_TEST_HTTPS_LISTENER CLOUDLEDGER_TEST_ASSERT_CLEAN_COMPOSE_ENV \
-    CLOUDLEDGER_TEST_MIGRATION_SUMMARY CLOUDLEDGER_TEST_RM_FAIL_PATTERN
+    CLOUDLEDGER_TEST_MIGRATION_SUMMARY CLOUDLEDGER_TEST_RM_FAIL_PATTERN \
+    CLOUDLEDGER_TEST_NFT_CAPTURE CLOUDLEDGER_TEST_NFT_PRETTY_PRIORITY
 }
 
 cleanup_injected_rm_paths() {
@@ -542,9 +543,14 @@ test_firewall_internal_mode() {
 
   setup_case firewall-invalid
   export CLOUDLEDGER_TEST_CLOUDFLARE_IP_MODE=invalid
+  export CLOUDLEDGER_TEST_NFT_CAPTURE="$CASE_ROOT/fail-closed-baseline.nft"
   if "$OPS" --internal firewall-refresh >"$CASE_ROOT/firewall.out" 2>&1; then
     fail_test 'invalid Cloudflare ranges were accepted'
   fi
+  [[ -s "$CLOUDLEDGER_TEST_NFT_CAPTURE" ]] || fail_test 'fail-closed baseline was not rendered'
+  assert_not_contains 'elements = {  }' "$CLOUDLEDGER_TEST_NFT_CAPTURE"
+  assert_contains 'set cloudflare_ipv4 {' "$CLOUDLEDGER_TEST_NFT_CAPTURE"
+  assert_contains 'set cloudflare_ipv6 {' "$CLOUDLEDGER_TEST_NFT_CAPTURE"
   [[ $(grep -Fc 'firewall:apply' "$CLOUDLEDGER_TEST_TRACE") -eq 1 ]] \
     || fail_test 'invalid ranges must leave only the fail-closed baseline application'
   assert_contains '无法取得有效的 Cloudflare IPv4 官方列表' "$CASE_ROOT/firewall.out"
@@ -623,6 +629,13 @@ test_firewall_status_integrity() {
   : >"$CLOUDLEDGER_TEST_NFT_STATE"
   "$OPS" --internal health >"$CASE_ROOT/health.out" 2>&1 \
     || fail_test 'complete firewall table was reported unhealthy'
+
+  setup_case firewall-status-pretty-priority
+  seed_backup_fixture no
+  : >"$CLOUDLEDGER_TEST_NFT_STATE"
+  export CLOUDLEDGER_TEST_NFT_PRETTY_PRIORITY=1
+  "$OPS" --internal health >"$CASE_ROOT/health.out" 2>&1 \
+    || fail_test 'nft pretty-printed priority was reported as unhealthy'
 
   for mode in missing-sets missing-input missing-forward missing-bridge missing-reject extra-accept non-hook unauthorized-chain; do
     setup_case "firewall-status-$mode"
