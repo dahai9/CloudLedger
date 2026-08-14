@@ -3465,7 +3465,11 @@ mod tests {
         let bob_transaction_id = bob_overview
             .transactions
             .iter()
-            .find(|transaction| transaction.created_by_user_id == bob_id.to_string())
+            .find(|transaction| {
+                transaction.created_by_user_id == bob_id.to_string()
+                    && transaction.ledger_id == public_ledger_id.to_string()
+                    && transaction.approval_state == "submitted"
+            })
             .and_then(|transaction| Uuid::parse_str(&transaction.id).ok())
             .expect("Bob request");
         service
