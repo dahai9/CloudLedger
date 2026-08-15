@@ -1,27 +1,19 @@
-name: Backend CI
+name: Alpha
 
 on:
   push:
-    tags: ["v*.*.*"]
+    branches: [main]
 
 permissions:
   contents: read
   packages: write
 
 jobs:
-  verify-and-build:
-    name: Verify and build Rust backend
+  backend:
+    name: Verify and publish alpha backend
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Verify tag is from its matching release branch
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-          RELEASE_SHA: ${{ github.sha }}
-        run: bash deploy/verify-release-source.sh
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v19
@@ -42,13 +34,13 @@ jobs:
       - name: Test
         run: nix develop path:. -c cargo test --workspace --locked
 
-      - name: Build release server binary
+      - name: Build alpha server binary
         run: nix develop path:. -c cargo build -p cloudledger-server --release --locked
 
-      - name: Upload server artifact
+      - name: Upload alpha server artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cloudledger-server-linux-x86_64
+          name: cloudledger-server-alpha-${{ github.sha }}
           path: target/release/cloudledger-server
           if-no-files-found: error
           retention-days: 7
@@ -60,16 +52,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate server image metadata
+      - name: Generate alpha server image metadata
         id: server-image
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository_owner }}/cloudledger-server
           tags: |
-            type=ref,event=tag
-            type=raw,value=latest
+            type=raw,value=alpha
+            type=sha,prefix=alpha-,format=short
 
-      - name: Build and publish server image
+      - name: Build and publish alpha server image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -78,16 +70,16 @@ jobs:
           tags: ${{ steps.server-image.outputs.tags }}
           labels: ${{ steps.server-image.outputs.labels }}
 
-      - name: Generate PostgreSQL image metadata
+      - name: Generate alpha PostgreSQL image metadata
         id: postgres-image
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository_owner }}/cloudledger-postgres
           tags: |
-            type=ref,event=tag
-            type=raw,value=latest
+            type=raw,value=alpha
+            type=sha,prefix=alpha-,format=short
 
-      - name: Build and publish PostgreSQL image
+      - name: Build and publish alpha PostgreSQL image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -96,16 +88,16 @@ jobs:
           tags: ${{ steps.postgres-image.outputs.tags }}
           labels: ${{ steps.postgres-image.outputs.labels }}
 
-      - name: Generate Caddy image metadata
+      - name: Generate alpha Caddy image metadata
         id: caddy-image
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository_owner }}/cloudledger-caddy
           tags: |
-            type=ref,event=tag
-            type=raw,value=latest
+            type=raw,value=alpha
+            type=sha,prefix=alpha-,format=short
 
-      - name: Build and publish Caddy image
+      - name: Build and publish alpha Caddy image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -114,16 +106,16 @@ jobs:
           tags: ${{ steps.caddy-image.outputs.tags }}
           labels: ${{ steps.caddy-image.outputs.labels }}
 
-      - name: Generate network anchor image metadata
+      - name: Generate alpha network anchor image metadata
         id: anchor-image
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository_owner }}/cloudledger-network-anchor
           tags: |
-            type=ref,event=tag
-            type=raw,value=latest
+            type=raw,value=alpha
+            type=sha,prefix=alpha-,format=short
 
-      - name: Build and publish network anchor image
+      - name: Build and publish alpha network anchor image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -131,3 +123,37 @@ jobs:
           push: true
           tags: ${{ steps.anchor-image.outputs.tags }}
           labels: ${{ steps.anchor-image.outputs.labels }}
+
+  android:
+    name: Build alpha Android app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v19
+
+      - name: Build signed alpha universal APK
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          test -n "$ANDROID_KEYSTORE_BASE64"
+          test -n "$ANDROID_KEYSTORE_PASSWORD"
+          test -n "$ANDROID_KEY_ALIAS"
+          test -n "$ANDROID_KEY_PASSWORD"
+          key_store="$RUNNER_TEMP/cloudledger-alpha.jks"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$key_store"
+          export ANDROID_KEYSTORE_PATH="$key_store"
+          nix develop path:. -c npm ci
+          nix develop path:. -c npm run tauri:android:build -- --target aarch64
+
+      - name: Upload alpha APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudledger-android-alpha-${{ github.sha }}
+          path: src-tauri/gen/android/app/build/outputs/apk/universal/release/*.apk
+          if-no-files-found: error
+          retention-days: 7
