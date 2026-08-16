@@ -361,6 +361,34 @@ compose() {
   docker compose --project-directory "$DEPLOY_DIR" -f "$COMPOSE_FILE" "$@"
 }
 
+current_version() {
+  printf '%s' "${CLOUDLEDGER_RELEASE_TAG:-$OPS_VERSION}"
+}
+
+show_image_versions() {
+  local images container repository tag platform image_id size created created_display size_display
+  images=$(compose images --format json) || {
+    fail '无法读取 Compose 镜像 JSON 信息。'
+    return 1
+  }
+  [[ -n "$images" && "$images" != '[]' ]] || { warn '当前没有可显示的 CloudLedger 镜像。'; return 0; }
+  printf '%-36s %-44s %-24s %-16s %-14s %-12s %s\n' \
+    'CONTAINER' 'REPOSITORY' 'TAG' 'PLATFORM' 'IMAGE ID' 'SIZE' 'CREATED (UTC)'
+  while IFS=$'\t' read -r container repository tag platform image_id size created; do
+    [[ -n "$container" ]] || continue
+    image_id=${image_id#sha256:}
+    image_id=${image_id:0:12}
+    created_display=$(date -u -d "$created" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || printf '%s' "$created")
+    if command_exists numfmt; then
+      size_display=$(numfmt --to=si --suffix=B "$size" 2>/dev/null || printf '%s bytes' "$size")
+    else
+      size_display=$(printf '%s bytes' "$size")
+    fi
+    printf '%-36s %-44s %-24s %-16s %-14s %-12s %s\n' \
+      "$container" "$repository" "$tag" "$platform" "$image_id" "$size_display" "$created_display"
+  done < <(jq -r '.[] | [.ContainerName, .Repository, .Tag, .Platform, .ID, (.Size | tostring), .LastTagTime] | @tsv' <<<"$images")
+}
+
 api_base_url() {
   load_env || return 1
   if [[ -n "${CLOUDLEDGER_API_URL:-}" ]]; then
@@ -452,7 +480,7 @@ header() {
   if [[ -n "$(current_backup)" ]]; then backup=$(date -r "$(current_backup)" '+%F %H:%M' 2>/dev/null || printf '已创建'); fi
   disk=$(disk_percent || true); [[ -n "$disk" ]] || disk='?'
   printf '%s\n' '====================================================' ' CloudLedger 云服务运维工具箱' '===================================================='
-  printf ' 当前版本: %s\n 服务状态: %s\n 数据库: %s\n HTTPS: %s\n 最近备份: %s\n 磁盘使用: %s%%\n' "$OPS_VERSION" "$svc" "$db" "$https" "$backup" "$disk"
+  printf ' 当前版本: %s\n 服务状态: %s\n 数据库: %s\n HTTPS: %s\n 最近备份: %s\n 磁盘使用: %s%%\n' "$(current_version)" "$svc" "$db" "$https" "$backup" "$disk"
   if [[ "$disk" =~ ^[0-9]+$ ]]; then
     if (( disk >= ${CLOUDLEDGER_DISK_CRITICAL:-90} )); then
       fail " 磁盘告警: 已达到严重阈值 ${CLOUDLEDGER_DISK_CRITICAL:-90}%"
@@ -2710,8 +2738,8 @@ service_menu() {
       5) menu_action service_action start; pause ;;
       6) menu_action service_action stop; pause ;;
       7) menu_action service_action restart; pause ;;
-      8) menu_action compose ps; menu_action compose images; pause ;;
-      9) menu_action compose images; pause ;;
+      8) menu_action compose ps; menu_action show_image_versions; pause ;;
+      9) menu_action show_image_versions; pause ;;
       10) menu_action with_lock compose pull; pause ;;
       0) return ;;
     esac
@@ -2775,7 +2803,7 @@ migration_menu() {
       '8. 迁移前回滚' '9. 查看升级失败现场' '10. 加固已有数据库账号权限' '0. 返回上一级'
     read_choice choice '请选择: ' '^(0|[1-9]|10)$' || return
     case "$choice" in
-      1) load_env; printf '配置 tag: %s\n' "${CLOUDLEDGER_RELEASE_TAG:-未知}"; compose images; pause ;;
+      1) load_env; printf '配置 tag: %s\n' "${CLOUDLEDGER_RELEASE_TAG:-未知}"; show_image_versions; pause ;;
       2) query_releases || warn '无法查询 GitHub Releases。'; pause ;;
       3) menu_action upgrade; pause ;;
       4) menu_action migration_status; pause ;;
@@ -3187,7 +3215,7 @@ about_menu() {
     printf '%s\n' '1. 关于 CloudLedger' '2. 查看环境信息' '0. 返回上一级'
     read_choice choice '请选择: ' '^[0-2]$' || return
     case "$choice" in
-      1) log "CloudLedger 运维工具箱 $OPS_VERSION"; log '公开入口仅数字菜单；生产镜像固定 GHCR tag；备份必须是可校验 pg_dump -Fc。'; pause ;;
+      1) log "CloudLedger 运维工具箱 $(current_version)"; log '公开入口仅数字菜单；生产镜像固定 GHCR tag；备份必须是可校验 pg_dump -Fc。'; pause ;;
       2) uname -a; docker --version 2>/dev/null || true; docker compose version 2>/dev/null || true; rclone version 2>/dev/null | head -n1 || true; pause ;;
       0) return ;;
     esac
