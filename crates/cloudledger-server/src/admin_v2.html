@@ -151,6 +151,7 @@
         security: { turnstileEnabled: false, turnstileSiteKey: undefined },
         turnstileToken: "",
       };
+      let turnstileWidgetId;
 
       render();
       void initialize();
@@ -167,6 +168,7 @@
       }
 
       function render() {
+        disposeTurnstileWidget();
         app.innerHTML = `${renderTopbar()}${state.pageError ? `<div class="alert">${escapeHtml(state.pageError)}</div>` : ""}${state.principal ? renderWorkspace() : renderAuth()}${state.toast ? `<div class="toast ${state.toastTone}" role="status">${escapeHtml(state.toast)}</div>` : ""}`;
         bindEvents();
       }
@@ -426,15 +428,20 @@
       }
       function renderTurnstileWidget() {
         const container = app.querySelector("#turnstileWidget");
-        if (!container || !window.turnstile || !state.security.turnstileSiteKey) return;
+        if (!container || !window.turnstile || !state.security.turnstileSiteKey || turnstileWidgetId) return;
         state.turnstileToken = "";
-        window.turnstile.render(container, {
+        turnstileWidgetId = window.turnstile.render(container, {
           sitekey: state.security.turnstileSiteKey,
           action: "admin-login",
           callback: token => { state.turnstileToken = token; },
           "expired-callback": () => { state.turnstileToken = ""; },
           "error-callback": () => { state.turnstileToken = ""; },
         });
+      }
+      function disposeTurnstileWidget() {
+        if (turnstileWidgetId && window.turnstile?.remove) window.turnstile.remove(turnstileWidgetId);
+        turnstileWidgetId = undefined;
+        state.turnstileToken = "";
       }
       function loadTurnstileScript() {
         if (window.turnstile) return Promise.resolve();
