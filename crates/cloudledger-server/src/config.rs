@@ -635,7 +635,10 @@ mod tests {
         let loaded = BackendConfig::load_or_create(&path).expect("load private config");
 
         assert_eq!(loaded.admin.token, config.admin.token);
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         fs::remove_dir_all(root).expect("remove temp config dir");
     }
 
