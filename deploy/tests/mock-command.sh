@@ -129,7 +129,14 @@ case $name in
           record 'restore:migrations'
         elif [[ "$joined" == *to_regclass* ]]; then
           table=$(printf '%s' "$joined" | sed -n "s/.*public\.\([A-Za-z0-9_]*\).*/\1/p")
-          printf 'public.%s\n' "$table"
+          if [[ ${CLOUDLEDGER_TEST_MISSING_RESTORE_TABLE:-} == "$table" ]]; then
+            printf 'false\n'
+          elif [[ "$joined" == *'IS NOT NULL'* ]]; then
+            printf 'true\n'
+          else
+            # Visible regclass values are rendered without the public schema.
+            printf '%s\n' "$table"
+          fi
           record "restore:table:$table"
         else
           record 'postgres:query'
@@ -525,7 +532,13 @@ case $name in
     joined=" $* "
     if [[ "$joined" == *to_regclass* ]]; then
       table=$(printf '%s' "$joined" | sed -n "s/.*public\.\([A-Za-z0-9_]*\).*/\1/p")
-      printf 'public.%s\n' "$table"
+      if [[ ${CLOUDLEDGER_TEST_MISSING_RESTORE_TABLE:-} == "$table" ]]; then
+        printf 'false\n'
+      elif [[ "$joined" == *'IS NOT NULL'* ]]; then
+        printf 'true\n'
+      else
+        printf '%s\n' "$table"
+      fi
       record "restore:table:$table"
     elif [[ "$joined" == *'_sqlx_migrations'* ]]; then
       printf '5\n'

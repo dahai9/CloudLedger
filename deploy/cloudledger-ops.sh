@@ -2235,7 +2235,7 @@ internal_restore_test() {
     fi
   done
   for table in organizations ledgers financial_accounts categories transactions audit_events; do
-    postgres_psql "$db" -Atqc "SELECT to_regclass('public.$table')" | grep -qx "public.$table" \
+    postgres_psql "$db" -Atqc "SELECT (to_regclass('public.$table') IS NOT NULL)::text" | grep -qx true \
       || { cleanup_restore_database || true; cleanup_plaintext; unregister_sensitive_path "$temp"; fail "恢复演练缺少核心表: $table"; return 1; }
   done
   test_config="$temp/restore-test.toml"

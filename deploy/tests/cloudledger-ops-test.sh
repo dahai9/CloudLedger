@@ -137,7 +137,8 @@ setup_case() {
     CLOUDLEDGER_TEST_SIGNAL_ON_RCLONE CLOUDLEDGER_TEST_ANCHOR_ID CLOUDLEDGER_TEST_HTTPS_DOCKER_OWNER \
     CLOUDLEDGER_TEST_HTTPS_LISTENER CLOUDLEDGER_TEST_ASSERT_CLEAN_COMPOSE_ENV \
     CLOUDLEDGER_TEST_MIGRATION_SUMMARY CLOUDLEDGER_TEST_RM_FAIL_PATTERN \
-    CLOUDLEDGER_TEST_NFT_CAPTURE CLOUDLEDGER_TEST_NFT_PRETTY_PRIORITY
+    CLOUDLEDGER_TEST_NFT_CAPTURE CLOUDLEDGER_TEST_NFT_PRETTY_PRIORITY \
+    CLOUDLEDGER_TEST_MISSING_RESTORE_TABLE
 }
 
 cleanup_injected_rm_paths() {
@@ -774,6 +775,19 @@ test_restore_cleanup_failure() {
     || fail_test 'failed restore cleanup wrote a success record'
 }
 
+test_restore_core_table_validation() {
+  setup_case restore-missing-core-table
+  seed_backup_fixture no
+  "$OPS" --internal backup >"$CASE_ROOT/backup.out" 2>&1
+  export CLOUDLEDGER_TEST_MISSING_RESTORE_TABLE=organizations
+  if "$OPS" --internal restore-test >"$CASE_ROOT/restore.out" 2>&1; then
+    fail_test 'restore drill accepted a database without organizations'
+  fi
+  assert_contains '恢复演练缺少核心表: organizations' "$CASE_ROOT/restore.out"
+  [[ ! -e "$CLOUDLEDGER_OPS_STATE_DIR/restore-test.log" ]] \
+    || fail_test 'missing core table restore drill wrote a success record'
+}
+
 test_future_migration_compatibility() {
   setup_case future-migrations
   seed_backup_fixture no
@@ -1175,6 +1189,7 @@ main() {
   run_selected backup-freshness test_backup_identity_and_remote_freshness
   run_selected restore-passwords test_restore_with_archived_passwords
   run_selected restore-cleanup test_restore_cleanup_failure
+  run_selected restore-core-tables test_restore_core_table_validation
   run_selected future-migrations test_future_migration_compatibility
   run_selected https-port test_https_port_preflight
   run_selected remote-signal test_remote_pending_signal_cleanup
