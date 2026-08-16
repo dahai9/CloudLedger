@@ -4,8 +4,15 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 verify_script="$script_dir/../verify-release-source.sh"
 next_alpha_script="$script_dir/../next-alpha-tag.sh"
+formal_workflow="$script_dir/../../.github/workflows/frontend.yml"
+release_notes_guide="$script_dir/../../docs/releases/README.md"
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/cloudledger-release-test.XXXXXX")"
 trap 'rm -rf "$test_root"' EXIT
+
+grep -Fqx '      - name: Verify versioned release notes' "$formal_workflow"
+grep -Fqx '          body_path: docs/releases/${{ github.ref_name }}.md' "$formal_workflow"
+! grep -Fq 'generate_release_notes: true' "$formal_workflow"
+test -s "$release_notes_guide"
 
 alpha_tag="$(printf '%s\n' \
   v0.1.8.alpha.1 \

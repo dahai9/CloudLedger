@@ -32,6 +32,15 @@ jobs:
           app_version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
           test "$GITHUB_REF_NAME" = "v$app_version"
 
+      - name: Verify versioned release notes
+        env:
+          RELEASE_NOTES_PATH: docs/releases/${{ github.ref_name }}.md
+        run: |
+          test -s "$RELEASE_NOTES_PATH"
+          grep -Fxq "# CloudLedger $GITHUB_REF_NAME" "$RELEASE_NOTES_PATH"
+          grep -q '^## ' "$RELEASE_NOTES_PATH"
+          awk 'NF && $0 !~ /^#/ { found = 1 } END { exit !found }' "$RELEASE_NOTES_PATH"
+
       - name: Build signed universal APK
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -52,7 +61,7 @@ jobs:
       - name: Publish APK to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body_path: docs/releases/${{ github.ref_name }}.md
           files: src-tauri/gen/android/app/build/outputs/apk/universal/release/*.apk
 
       - name: Upload APK artifact

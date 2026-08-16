@@ -5,7 +5,10 @@ CloudLedger has two CI channels:
 - Stable releases use a tag such as `v0.1.8` created on the matching
   `release/v0.1.8` branch. The formal workflows verify that the tag points to
   that branch's current tip before publishing the four GHCR images and a GitHub
-  Release APK.
+  Release APK. Before creating the tag, the release branch must contain
+  `docs/releases/v0.1.8.md` with a matching title and operator-facing update
+  notes. The Android release workflow rejects formal tags without valid notes
+  and uses that file as the GitHub Release description.
 - Commits pushed to `main` run the alpha workflow. The workflow chooses the
   next prerelease tag from the app base version, starting with
   `v0.1.8.alpha.1`, and publishes that tag, the mutable `alpha` tag, and the
