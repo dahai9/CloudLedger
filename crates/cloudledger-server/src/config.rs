@@ -558,7 +558,10 @@ fn restrict_private_file_permissions(path: &Path) -> anyhow::Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
 
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
     }
     Ok(())
 }
@@ -613,6 +616,27 @@ mod tests {
         }
 
         fs::remove_dir_all(path.parent().unwrap()).expect("remove temp config");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepts_existing_private_config_with_restricted_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_config_path();
+        let root = path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&root).expect("create temp config dir");
+        let mut config = valid_reverse_proxy_config();
+        config.server.data_dir = root.clone();
+        write_private_config(&path, &config).expect("write private config");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("restrict config permissions");
+
+        let loaded = BackendConfig::load_or_create(&path).expect("load private config");
+
+        assert_eq!(loaded.admin.token, config.admin.token);
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        fs::remove_dir_all(root).expect("remove temp config dir");
     }
 
     #[test]
