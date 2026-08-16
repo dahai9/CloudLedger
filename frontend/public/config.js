@@ -1,3 +1,3 @@
 window.__CLOUDLEDGER_CONFIG__ = {
-  apiBaseUrl: "https://cloudledger-test.513921.xyz",
+  apiBaseUrl: "https://cloudledger.513921.xyz",
 };
