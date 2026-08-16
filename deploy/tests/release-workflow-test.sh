@@ -3,8 +3,25 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 verify_script="$script_dir/../verify-release-source.sh"
+next_alpha_script="$script_dir/../next-alpha-tag.sh"
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/cloudledger-release-test.XXXXXX")"
 trap 'rm -rf "$test_root"' EXIT
+
+alpha_tag="$(printf '%s\n' \
+  v0.1.8.alpha.1 \
+  v0.1.8.alpha.3 \
+  v0.1.7.alpha.99 \
+  v0.1.8.alpha.invalid \
+  v0.1.8 \
+  | bash "$next_alpha_script" 0.1.8)"
+[[ "$alpha_tag" == v0.1.8.alpha.4 ]] || {
+  printf 'Unexpected next alpha tag: %s\n' "$alpha_tag" >&2
+  exit 1
+}
+if printf '%s\n' v0.1.8.alpha.1 | bash "$next_alpha_script" invalid >/dev/null 2>&1; then
+  printf 'An invalid alpha base version was accepted.\n' >&2
+  exit 1
+fi
 
 git init --bare "$test_root/remote.git" >/dev/null
 git init "$test_root/work" >/dev/null

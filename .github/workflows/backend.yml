@@ -2,7 +2,9 @@ name: Backend CI
 
 on:
   push:
-    tags: ["v*.*.*"]
+    tags:
+      - 'v*.*.*'
+      - '!v*.*.*.*'
 
 permissions:
   contents: read
@@ -28,8 +30,8 @@ jobs:
 
       - name: Verify production operations toolbox
         run: |
-          bash -n deploy/cloudledger-ops.sh deploy/tests/cloudledger-ops-test.sh deploy/tests/mock-command.sh deploy/tests/mock-read.bash deploy/docker/network-anchor.sh deploy/docker/postgres-init.sh deploy/verify-release-source.sh deploy/tests/release-workflow-test.sh
-          nix run nixpkgs#shellcheck -- -S warning deploy/cloudledger-ops.sh deploy/tests/cloudledger-ops-test.sh deploy/tests/mock-command.sh deploy/tests/mock-read.bash deploy/docker/network-anchor.sh deploy/docker/postgres-init.sh deploy/verify-release-source.sh deploy/tests/release-workflow-test.sh
+          bash -n deploy/next-alpha-tag.sh deploy/cloudledger-ops.sh deploy/tests/cloudledger-ops-test.sh deploy/tests/mock-command.sh deploy/tests/mock-read.bash deploy/docker/network-anchor.sh deploy/docker/postgres-init.sh deploy/verify-release-source.sh deploy/tests/release-workflow-test.sh
+          nix run nixpkgs#shellcheck -- -S warning deploy/next-alpha-tag.sh deploy/cloudledger-ops.sh deploy/tests/cloudledger-ops-test.sh deploy/tests/mock-command.sh deploy/tests/mock-read.bash deploy/docker/network-anchor.sh deploy/docker/postgres-init.sh deploy/verify-release-source.sh deploy/tests/release-workflow-test.sh
           bash deploy/tests/cloudledger-ops-test.sh
           bash deploy/tests/release-workflow-test.sh
 
