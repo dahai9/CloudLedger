@@ -24,4 +24,23 @@ Add Rust tests beside the module or in the crate's existing test modules; run th
 
 ## Commit & Pull Request Guidelines
 
-Use concise Conventional Commit-style subjects such as `feat:`, `fix:`, or `ci:`. Keep commits focused and run `git diff --check` before committing. PRs should explain behavior and risk, list verification commands, and include screenshots for UI changes. Never rewrite an existing release tag. Commits on `main` publish numbered Alpha prereleases such as `v0.1.8.alpha.1`; formal `vX.Y.Z` releases must come from the matching `release/vX.Y.Z` branch and must publish explicit, matching GHCR image tags.
+Use concise Conventional Commit-style subjects such as `feat:`, `fix:`, or `ci:`. Keep commits focused and run `git diff --check` before committing. PRs should explain behavior and risk, list verification commands, and include screenshots for UI changes.
+
+## Versioning & Release Channels
+
+Treat versions as release lines; never derive tags from a stale
+`src-tauri/tauri.conf.json` value.
+
+- `main` is the testing line and always uses the test API endpoint. After stable
+  `vA.B.C`, bump the next development base before publishing
+  `vA.B.(C+1).alpha.1`, then `.alpha.2`, etc. Each Alpha tag is immutable and has
+  a matching GitHub prerelease and signed APK. Continuing `v0.1.8.alpha.*` after
+  stable `v0.1.8` or `v0.1.9` is invalid.
+- Promote a selected, tested main commit by creating only `release/vA.B.C` from
+  that exact commit. Set the app version to `A.B.C`, switch the client API to
+  production, add `docs/releases/vA.B.C.md`, and then create immutable `vA.B.C`.
+  The branch, tag, app version, notes, APK, and four GHCR tags must match.
+- `main` never publishes a stable tag; `release/vA.B.C` never publishes an
+  Alpha tag. Do not rewrite existing tags, use `latest`, or deploy mutable
+  `alpha`/`alpha-<sha>` image aliases. Those aliases are testing conveniences,
+  not release identifiers.
