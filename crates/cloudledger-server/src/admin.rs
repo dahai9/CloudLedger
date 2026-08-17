@@ -47,6 +47,10 @@ pub fn router(state: ServerState) -> Router {
         .route(&format!("{api_path}/logout"), post(admin_logout))
         .route(&format!("{api_path}/me"), get(admin_me))
         .route(
+            &format!("{api_path}/me/password"),
+            patch(change_admin_password),
+        )
+        .route(
             &format!("{api_path}/organizations"),
             get(list_organizations).post(create_organization),
         )
@@ -61,6 +65,12 @@ pub fn router(state: ServerState) -> Router {
         .route(
             &format!("{api_path}/organizations/:organization_id/members/:membership_id/password"),
             patch(reset_member_password),
+        )
+        .route(
+            &format!(
+                "{api_path}/organizations/:organization_id/members/:membership_id/admin-password"
+            ),
+            patch(reset_organization_admin_password),
         )
         .with_state(state)
         .layer(middleware::from_fn_with_state(
@@ -367,6 +377,51 @@ async fn admin_me(
     }))
 }
 
+async fn change_admin_password(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<ChangeAdminPasswordRequest>,
+) -> Result<StatusCode, AdminApiError> {
+    let token = bearer_token(&headers)?.to_string();
+    let _write_guard = state.write_gate.lock().await;
+    let actor = match authenticate_principal(&headers, &state)? {
+        AdminPrincipal::Organization(session) => session,
+        AdminPrincipal::Platform => {
+            return Err(AdminApiError::forbidden(
+                "organization admin session is required",
+            ));
+        }
+    };
+    let staged_auth = {
+        let auth = lock_auth(&state)?;
+        let mut staged_auth = auth.clone();
+        staged_auth
+            .change_admin_password(&token, &request.current_password, &request.new_password)
+            .map_err(AdminApiError::from_auth)?;
+        staged_auth
+    };
+    state
+        .storage
+        .save_auth(staged_auth.snapshot())
+        .await
+        .map_err(AdminApiError::from_storage)?;
+    *lock_auth(&state)? = staged_auth;
+    state
+        .storage
+        .append_security_event(SecurityAuditEvent {
+            scope_key: format!("organization:{}", actor.organization_id),
+            actor_type: "organization_admin".to_string(),
+            actor_id: Some(actor.user.id),
+            action: "password_changed".to_string(),
+            resource_type: "auth_user".to_string(),
+            resource_id: Some(actor.user.id),
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .map_err(AdminApiError::from_storage)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_organizations(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -638,6 +693,47 @@ async fn reset_member_password(
     Ok(Json(member))
 }
 
+async fn reset_organization_admin_password(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path((organization_id, membership_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<ResetPasswordRequest>,
+) -> Result<Json<MembershipDto>, AdminApiError> {
+    let _write_guard = state.write_gate.lock().await;
+    require_platform(authenticate_principal(&headers, &state)?)?;
+    let (member, target_user_id, staged_auth) = {
+        let auth = lock_auth(&state)?;
+        let service = lock_service(&state)?;
+        let member = find_member(&service, organization_id, membership_id)?;
+        let target_user_id = require_organization_admin_member(&auth, organization_id, &member)?;
+        let mut staged_auth = auth.clone();
+        staged_auth
+            .reset_organization_admin_password(target_user_id, &request.password)
+            .map_err(AdminApiError::from_auth)?;
+        (member, target_user_id, staged_auth)
+    };
+    state
+        .storage
+        .save_auth(staged_auth.snapshot())
+        .await
+        .map_err(AdminApiError::from_storage)?;
+    *lock_auth(&state)? = staged_auth;
+    state
+        .storage
+        .append_security_event(SecurityAuditEvent {
+            scope_key: format!("organization:{organization_id}"),
+            actor_type: "platform_admin".to_string(),
+            actor_id: None,
+            action: "organization_admin_password_reset".to_string(),
+            resource_type: "membership".to_string(),
+            resource_id: Some(membership_id),
+            metadata: serde_json::json!({"target_user_id": target_user_id}),
+        })
+        .await
+        .map_err(AdminApiError::from_storage)?;
+    Ok(Json(member))
+}
+
 fn organization_with_members(
     service: &AppLedgerService,
     organization_id: Uuid,
@@ -716,6 +812,24 @@ fn require_business_member(
     } else {
         Ok(())
     }
+}
+
+fn require_organization_admin_member(
+    auth: &crate::auth::AuthService,
+    organization_id: Uuid,
+    member: &MembershipDto,
+) -> Result<Uuid, AdminApiError> {
+    let user_id = Uuid::parse_str(&member.user_id)
+        .map_err(|_| AdminApiError::internal("invalid member user id"))?;
+    if !matches!(member.role.as_str(), "owner" | "admin")
+        || auth.account_kind(user_id) != Some(AccountKind::OrganizationAdmin)
+        || auth.organization_id(user_id) != Some(organization_id)
+    {
+        return Err(AdminApiError::forbidden(
+            "target member is not an organization admin",
+        ));
+    }
+    Ok(user_id)
 }
 
 #[derive(Debug)]
@@ -887,6 +1001,13 @@ struct AdminMeResponse {
     scope: &'static str,
     user: Option<AuthUserDto>,
     organization_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChangeAdminPasswordRequest {
+    current_password: String,
+    new_password: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1279,6 +1400,161 @@ mod tests {
         .await
         .expect_err("employee cannot be shared across organizations");
         assert_eq!(shared_employee.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn organization_admin_can_change_own_password() {
+        let state = test_state();
+        let organization =
+            create_test_organization(&state, "First", "first-admin@example.com").await;
+        let headers = organization_admin_headers(&state, "first-admin@example.com").await;
+
+        let response = change_admin_password(
+            State(state.clone()),
+            headers.clone(),
+            Json(ChangeAdminPasswordRequest {
+                current_password: "admin-password".to_string(),
+                new_password: "new-admin-password".to_string(),
+            }),
+        )
+        .await
+        .expect("change admin password");
+        assert_eq!(response, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin_me(State(state.clone()), headers)
+                .await
+                .expect_err("old session revoked")
+                .status,
+            StatusCode::UNAUTHORIZED
+        );
+
+        let new_session = admin_login(
+            peer_addr(),
+            State(state),
+            Json(AdminLoginRequest {
+                identifier: "first-admin@example.com".to_string(),
+                password: "new-admin-password".to_string(),
+                turnstile_token: String::new(),
+            }),
+        )
+        .await
+        .expect("login with new password")
+        .0;
+        assert_eq!(
+            new_session.organization_id,
+            Uuid::parse_str(&organization.organization.id).expect("organization id")
+        );
+    }
+
+    #[tokio::test]
+    async fn platform_can_reset_organization_admin_password() {
+        let state = test_state();
+        let organization =
+            create_test_organization(&state, "First", "first-admin@example.com").await;
+        let organization_id =
+            Uuid::parse_str(&organization.organization.id).expect("organization id");
+        let admin_membership = organization
+            .members
+            .iter()
+            .find(|member| matches!(member.role.as_str(), "owner" | "admin"))
+            .expect("organization admin membership");
+        let admin_headers = organization_admin_headers(&state, "first-admin@example.com").await;
+
+        let response = reset_organization_admin_password(
+            State(state.clone()),
+            platform_headers(&state),
+            Path((
+                organization_id,
+                Uuid::parse_str(&admin_membership.id).expect("membership id"),
+            )),
+            Json(ResetPasswordRequest {
+                password: "platform-reset-password".to_string(),
+            }),
+        )
+        .await
+        .expect("reset organization admin password")
+        .0;
+        assert_eq!(response.user_id, admin_membership.user_id);
+        assert_eq!(
+            admin_me(State(state.clone()), admin_headers)
+                .await
+                .expect_err("reset revokes old session")
+                .status,
+            StatusCode::UNAUTHORIZED
+        );
+        let _ = admin_login(
+            peer_addr(),
+            State(state),
+            Json(AdminLoginRequest {
+                identifier: "first-admin@example.com".to_string(),
+                password: "platform-reset-password".to_string(),
+                turnstile_token: String::new(),
+            }),
+        )
+        .await
+        .expect("login with reset password");
+    }
+
+    #[tokio::test]
+    async fn admin_password_reset_route_rejects_wrong_scope_and_business_members() {
+        let state = test_state();
+        let organization =
+            create_test_organization(&state, "First", "first-admin@example.com").await;
+        let organization_id =
+            Uuid::parse_str(&organization.organization.id).expect("organization id");
+        let admin_membership_id = Uuid::parse_str(
+            &organization
+                .members
+                .iter()
+                .find(|member| matches!(member.role.as_str(), "owner" | "admin"))
+                .expect("organization admin membership")
+                .id,
+        )
+        .expect("membership id");
+        let organization_headers =
+            organization_admin_headers(&state, "first-admin@example.com").await;
+
+        let organization_error = reset_organization_admin_password(
+            State(state.clone()),
+            organization_headers.clone(),
+            Path((organization_id, admin_membership_id)),
+            Json(ResetPasswordRequest {
+                password: "platform-reset-password".to_string(),
+            }),
+        )
+        .await
+        .expect_err("organization session cannot use platform reset");
+        assert_eq!(organization_error.status, StatusCode::FORBIDDEN);
+
+        let employee = add_member(
+            State(state.clone()),
+            organization_headers,
+            Path(organization_id),
+            Json(AddMemberRequest {
+                display_name: "Employee".to_string(),
+                email: Some("employee@example.com".to_string()),
+                phone: None,
+                password: Some("employee-password".to_string()),
+                role: MembershipRole::Employee,
+            }),
+        )
+        .await
+        .expect("add employee")
+        .0;
+        let employee_error = reset_organization_admin_password(
+            State(state.clone()),
+            platform_headers(&state),
+            Path((
+                organization_id,
+                Uuid::parse_str(&employee.id).expect("membership id"),
+            )),
+            Json(ResetPasswordRequest {
+                password: "platform-reset-password".to_string(),
+            }),
+        )
+        .await
+        .expect_err("platform cannot reset business member through admin route");
+        assert_eq!(employee_error.status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

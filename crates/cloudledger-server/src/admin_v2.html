@@ -69,6 +69,7 @@
       .form { display: grid; gap: 14px; }
       .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
       .form-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+      .password-panel { margin-bottom: 14px; padding: 17px; display: grid; gap: 14px; }
 
       .metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
       .metric { border: 1px solid var(--line); border-radius: 8px; background: var(--surface); padding: 14px; }
@@ -79,10 +80,14 @@
       .section-title h2 { font-size: 22px; overflow-wrap: anywhere; }
       .create-panel, .add-panel { padding: 17px; display: grid; gap: 15px; }
       .org-list { display: grid; }
-      .org-row { padding: 15px 16px; display: grid; grid-template-columns: minmax(220px, 1.4fr) minmax(180px, 1fr) 180px; gap: 14px; align-items: center; border-top: 1px solid var(--line); }
+      .org-row { padding: 15px 16px; display: grid; grid-template-columns: minmax(220px, 1.2fr) minmax(240px, 1.3fr) 180px; gap: 14px; align-items: center; border-top: 1px solid var(--line); }
       .org-row:first-child { border-top: 0; }
       .org-name, .person { display: grid; gap: 5px; min-width: 0; }
       .org-name strong, .person strong, .contact { overflow-wrap: anywhere; }
+      .org-admin-list { display: grid; gap: 10px; }
+      .org-admin-entry { display: grid; gap: 8px; }
+      .org-admin-line { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+      .org-admin-reset { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(140px, 1fr) auto; gap: 7px; }
 
       .toolbar { padding: 13px 16px; border-top: 1px solid var(--line); background: var(--surface-muted); display: grid; grid-template-columns: minmax(220px, 1fr) 190px auto; gap: 10px; }
       .member-table { overflow: hidden; }
@@ -104,8 +109,9 @@
       @media (max-width: 860px) {
         .org-row, .table-head, .member-row, .toolbar { grid-template-columns: 1fr; }
         .table-head { display: none; }
-        .member-actions, .row-extra { justify-content: flex-start; }
+        .member-actions, .row-extra, .org-admin-line { justify-content: flex-start; }
         .locked { text-align: left; }
+        .org-admin-reset { grid-template-columns: 1fr; }
       }
       @media (max-width: 640px) {
         .shell { width: min(100% - 20px, 1180px); margin-top: 12px; }
@@ -144,6 +150,8 @@
         query: "",
         roleFilter: "all",
         busy: {},
+        changePasswordOpen: false,
+        platformResetId: "",
         resetId: "",
         removeId: "",
         toast: "",
@@ -178,7 +186,7 @@
         return `<header class="topbar">
           <div class="brand"><div class="brand-mark">CL</div><div><h1>CloudLedger 后台</h1><p>${scope === "platform" ? "平台组织管理" : scope === "organization" ? "组织员工管理" : "安全管理入口"}</p></div></div>
           <div class="top-actions">
-            ${scope ? `<span class="pill ${scope}">${scope === "platform" ? "平台管理员" : "组织管理员"}</span><button class="quiet" type="button" data-action="refresh" ${state.loading ? "disabled" : ""}>刷新</button><button class="quiet" type="button" data-action="logout">退出</button>` : ""}
+            ${scope ? `<span class="pill ${scope}">${scope === "platform" ? "平台管理员" : "组织管理员"}</span>${scope === "organization" ? `<button class="quiet" type="button" data-action="toggle-change-password">${state.changePasswordOpen ? "关闭密码设置" : "修改密码"}</button>` : ""}<button class="quiet" type="button" data-action="refresh" ${state.loading ? "disabled" : ""}>刷新</button><button class="quiet" type="button" data-action="logout">退出</button>` : ""}
           </div>
         </header>`;
       }
@@ -186,7 +194,7 @@
       function renderAuth() {
         return `<section class="auth-layout">
           <div class="panel auth-panel">
-            <div class="auth-copy"><h2>${state.authMode === "organization" ? "组织管理员登录" : "平台管理入口"}</h2><p class="muted">${state.authMode === "organization" ? "使用所属组织的后台账号。" : "使用服务器平台令牌创建和查看组织。"}</p></div>
+            <div class="auth-copy"><h2>${state.authMode === "organization" ? "组织管理员登录" : "平台管理入口"}</h2><p class="muted">${state.authMode === "organization" ? "使用所属组织的后台账号。忘记密码请联系平台管理员重置。" : "使用服务器平台令牌创建和查看组织。"}</p></div>
             <div class="segmented" aria-label="登录方式"><button type="button" class="${state.authMode === "organization" ? "active" : ""}" data-auth-mode="organization">组织账号</button><button type="button" class="${state.authMode === "platform" ? "active" : ""}" data-auth-mode="platform">平台令牌</button></div>
             ${state.authMode === "organization" ? `<form class="form" id="organizationLoginForm"><label>邮箱或手机号<input id="loginIdentifier" autocomplete="username" maxlength="254" required /></label><label>密码<input id="loginPassword" type="password" autocomplete="current-password" required /></label><div class="form-actions"><button class="primary" type="submit" ${state.loading ? "disabled" : ""}>${state.loading ? "登录中" : "登录"}</button></div></form>` : `<form class="form" id="platformLoginForm"><label>平台令牌<input id="platformToken" type="password" autocomplete="off" maxlength="512" required /></label><div class="form-actions"><button class="primary" type="submit" ${state.loading ? "disabled" : ""}>${state.loading ? "验证中" : "进入平台"}</button></div></form>`}
             ${state.security.turnstileEnabled ? `<div class="turnstile" id="turnstileWidget"></div>` : ""}
@@ -196,6 +204,11 @@
 
       function renderWorkspace() {
         return state.principal.scope === "platform" ? renderPlatform() : renderOrganization();
+      }
+
+      function renderChangePasswordPanel() {
+        if (!state.changePasswordOpen) return "";
+        return `<section class="panel password-panel"><div class="section-title"><h2>修改管理员密码</h2><p class="muted">修改成功后，当前账号的其他登录会话都会失效，需要使用新密码重新登录。</p></div><form class="form" id="changeAdminPasswordForm"><div class="form-grid"><label>当前密码<input id="currentAdminPassword" type="password" autocomplete="current-password" required /></label><label>新密码<input id="newAdminPassword" type="password" autocomplete="new-password" minlength="${minPasswordLength}" maxlength="${maxPasswordLength}" required /></label><label>确认新密码<input id="newAdminPasswordConfirm" type="password" autocomplete="new-password" minlength="${minPasswordLength}" maxlength="${maxPasswordLength}" required /></label></div><div class="form-actions"><button class="primary" type="submit" ${state.loading ? "disabled" : ""}>保存新密码</button></div></form></section>`;
       }
 
       function renderPlatform() {
@@ -211,17 +224,23 @@
       function renderOrganizationList() {
         if (!state.organizations.length) return `<div class="empty">尚未创建组织</div>`;
         return `<div class="org-list">${state.organizations.map((item) => {
-          const admin = item.members.find(isAdminMember);
+          const admins = item.members.filter(isAdminMember);
           const employees = item.members.filter(isEmployee).length;
-          return `<div class="org-row"><div class="org-name"><strong>${escapeHtml(item.organization.name)}</strong><span class="muted mono">${escapeHtml(item.organization.id)}</span></div><div class="person"><strong>${escapeHtml(admin?.displayName || "未配置")}</strong><span class="muted">${escapeHtml(admin?.email || admin?.phone || "-")}</span></div><div class="meta"><span class="count">${employees} 个业务账号</span></div></div>`;
+          return `<div class="org-row"><div class="org-name"><strong>${escapeHtml(item.organization.name)}</strong><span class="muted mono">${escapeHtml(item.organization.id)}</span></div><div class="org-admin-list">${admins.length ? admins.map(member => renderPlatformAdmin(item, member)).join("") : `<span class="muted">未配置组织管理员</span>`}</div><div class="meta"><span class="count">${employees} 个业务账号</span></div></div>`;
         }).join("")}</div>`;
+      }
+
+      function renderPlatformAdmin(item, member) {
+        const open = state.platformResetId === member.id;
+        const busy = Boolean(state.busy[member.id]);
+        return `<div class="org-admin-entry" data-admin-membership-id="${escapeHtml(member.id)}" data-organization-id="${escapeHtml(item.organization.id)}"><div class="org-admin-line"><div class="person"><strong>${escapeHtml(member.displayName)}</strong><span class="muted">${escapeHtml(member.email || member.phone || "-")}</span></div><button class="quiet" type="button" data-action="toggle-platform-reset" ${busy ? "disabled" : ""}>${open ? "关闭" : "重置密码"}</button></div>${open ? `<div class="org-admin-reset"><input data-platform-reset-password type="password" autocomplete="new-password" minlength="${minPasswordLength}" maxlength="${maxPasswordLength}" placeholder="输入新密码" /><input data-platform-reset-password-confirm type="password" autocomplete="new-password" minlength="${minPasswordLength}" maxlength="${maxPasswordLength}" placeholder="确认新密码" /><button class="secondary" type="button" data-action="save-platform-password" ${busy ? "disabled" : ""}>确认重置</button></div>` : ""}</div>`;
       }
 
       function renderOrganization() {
         const item = state.organizations[0];
         if (!item) return `<div class="panel empty">当前管理员未绑定有效组织</div>`;
         const employees = filteredEmployees(item.members);
-        return `<section class="metrics"><div class="metric"><span>Organization</span><strong>${escapeHtml(item.organization.name)}</strong></div><div class="metric"><span>Employees</span><strong>${item.members.filter(isEmployee).length}</strong></div><div class="metric"><span>Admin</span><strong>${escapeHtml(state.principal.user?.displayName || "-")}</strong></div></section>
+        return `${renderChangePasswordPanel()}<section class="metrics"><div class="metric"><span>Organization</span><strong>${escapeHtml(item.organization.name)}</strong></div><div class="metric"><span>Employees</span><strong>${item.members.filter(isEmployee).length}</strong></div><div class="metric"><span>Admin</span><strong>${escapeHtml(state.principal.user?.displayName || "-")}</strong></div></section>
           <section class="panel"><div class="section-head"><div class="section-title"><h2>${escapeHtml(item.organization.name)}</h2><div class="meta"><span class="pill organization">组织管理员</span><span class="muted mono">${escapeHtml(item.organization.id)}</span></div></div><button class="primary" type="button" data-action="toggle-add">${state.addOpen ? "关闭" : "新增业务账号"}</button></div>${state.addOpen ? renderAddEmployee() : ""}<div class="toolbar"><input id="memberQuery" value="${escapeHtml(state.query)}" placeholder="搜索姓名、邮箱或手机号" aria-label="搜索业务账号" /><select id="roleFilter" aria-label="按角色筛选"><option value="all">全部角色</option>${employeeRoles.map(role => `<option value="${role}" ${state.roleFilter === role ? "selected" : ""}>${roleLabels[role]}</option>`).join("")}</select><button class="quiet" type="button" data-action="clear-filter">清除</button></div></section>
           <section class="panel member-table">${renderMemberTable(item, employees)}</section>`;
       }
@@ -248,6 +267,8 @@
         app.querySelector("#organizationLoginForm")?.addEventListener("submit", loginOrganization);
         app.querySelector("#platformLoginForm")?.addEventListener("submit", loginPlatform);
         app.querySelector("[data-action='logout']")?.addEventListener("click", logout);
+        app.querySelector("[data-action='toggle-change-password']")?.addEventListener("click", () => { state.changePasswordOpen = !state.changePasswordOpen; render(); });
+        app.querySelector("#changeAdminPasswordForm")?.addEventListener("submit", changeAdminPassword);
         app.querySelector("[data-action='refresh']")?.addEventListener("click", () => loadWorkspace(false));
         app.querySelector("[data-action='toggle-create']")?.addEventListener("click", () => { state.createOpen = !state.createOpen; render(); });
         app.querySelector("#createOrganizationForm")?.addEventListener("submit", createOrganization);
@@ -256,6 +277,7 @@
         app.querySelector("#memberQuery")?.addEventListener("input", event => { state.query = event.currentTarget.value; render(); app.querySelector("#memberQuery")?.focus(); });
         app.querySelector("#roleFilter")?.addEventListener("change", event => { state.roleFilter = event.currentTarget.value; render(); });
         app.querySelector("[data-action='clear-filter']")?.addEventListener("click", () => { state.query = ""; state.roleFilter = "all"; render(); });
+        app.querySelectorAll("[data-admin-membership-id]").forEach(row => bindPlatformAdminRow(row));
         app.querySelectorAll("[data-member-id]").forEach(row => bindMemberRow(row));
         renderTurnstileWidget();
       }
@@ -266,6 +288,13 @@
         row.querySelector("[data-action='toggle-reset']")?.addEventListener("click", () => { state.resetId = state.resetId === memberId ? "" : memberId; state.removeId = ""; render(); });
         row.querySelector("[data-action='save-password']")?.addEventListener("click", () => resetPassword(memberId, row.querySelector("[data-reset-password]").value));
         row.querySelector("[data-action='remove']")?.addEventListener("click", () => { if (state.removeId !== memberId) { state.removeId = memberId; state.resetId = ""; render(); return; } void removeEmployee(memberId); });
+      }
+
+      function bindPlatformAdminRow(row) {
+        const membershipId = row.dataset.adminMembershipId;
+        const organizationId = row.dataset.organizationId;
+        row.querySelector("[data-action='toggle-platform-reset']")?.addEventListener("click", () => { state.platformResetId = state.platformResetId === membershipId ? "" : membershipId; render(); });
+        row.querySelector("[data-action='save-platform-password']")?.addEventListener("click", () => resetOrganizationAdminPassword(organizationId, membershipId, row.querySelector("[data-platform-reset-password]").value, row.querySelector("[data-platform-reset-password-confirm]").value));
       }
 
       async function loginOrganization(event) {
@@ -284,6 +313,20 @@
           const session = await api(`${adminApiPath}/platform-login`, { method: "POST", body: JSON.stringify({ platformToken: app.querySelector("#platformToken").value.trim(), turnstileToken: state.turnstileToken }) }, false);
           await acceptToken(session.accessToken);
         }, "平台令牌验证失败");
+      }
+
+      async function changeAdminPassword(event) {
+        event.preventDefault();
+        const currentPassword = app.querySelector("#currentAdminPassword").value;
+        const newPassword = app.querySelector("#newAdminPassword").value;
+        if (newPassword !== app.querySelector("#newAdminPasswordConfirm").value) return showToast("两次新密码不一致", "error");
+        if (!validNewPassword(newPassword)) return;
+        await run(async () => {
+          await api(`${adminApiPath}/me/password`, { method: "PATCH", body: JSON.stringify({ currentPassword, newPassword }) });
+          state.changePasswordOpen = false;
+          clearSession();
+          state.pageError = "密码已修改，请使用新密码重新登录。";
+        }, "修改密码失败");
       }
 
       async function acceptToken(token) {
@@ -357,6 +400,25 @@
         await mutateMember(memberId, async item => api(`${adminApiPath}/organizations/${item.organization.id}/members/${memberId}/password`, { method: "PATCH", body: JSON.stringify({ password }) }), "密码已重置", "重置密码失败");
       }
 
+      async function resetOrganizationAdminPassword(organizationId, membershipId, password, confirmation) {
+        if (password !== confirmation) return showToast("两次新密码不一致", "error");
+        if (!validNewPassword(password)) return;
+        if (!window.confirm("重置后，该组织管理员的现有登录会话都会失效。确认继续吗？")) return;
+        state.busy[membershipId] = true;
+        render();
+        try {
+          await api(`${adminApiPath}/organizations/${organizationId}/members/${membershipId}/admin-password`, { method: "PATCH", body: JSON.stringify({ password }) });
+          state.platformResetId = "";
+          await loadWorkspace(true);
+          showToast("组织管理员密码已重置");
+        } catch (error) {
+          showToast(readableError(error, "重置管理员密码失败"), "error");
+        } finally {
+          delete state.busy[membershipId];
+          render();
+        }
+      }
+
       async function removeEmployee(memberId) {
         await mutateMember(memberId, async item => api(`${adminApiPath}/organizations/${item.organization.id}/members/${memberId}`, { method: "DELETE" }), "员工已移出组织", "删除员工失败");
       }
@@ -408,6 +470,8 @@
         state.token = "";
         state.principal = undefined;
         state.organizations = [];
+        state.changePasswordOpen = false;
+        state.platformResetId = "";
         sessionStorage.removeItem("cloudledger.adminSession");
       }
 

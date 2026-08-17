@@ -493,6 +493,90 @@ impl AuthService {
         self.issue_admin_session(user_id)
     }
 
+    pub fn change_admin_password(
+        &mut self,
+        access_token: &str,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<AdminAuthenticatedSession, AuthError> {
+        let access_token = normalize_bearer_token(access_token);
+        let access_token = token_digest(access_token);
+        let session = self
+            .sessions_by_access_token
+            .get(&access_token)
+            .cloned()
+            .ok_or(AuthError::InvalidCredentials)?;
+        if session.kind != SessionKind::Admin || session.revoked_at.is_some() {
+            return Err(AuthError::InvalidCredentials);
+        }
+        if OffsetDateTime::now_utc() >= session.access_expires_at {
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        let user = self
+            .users_by_id
+            .get(&session.user_id)
+            .cloned()
+            .ok_or(AuthError::InvalidCredentials)?;
+        if user.account_kind != AccountKind::OrganizationAdmin {
+            return Err(AuthError::AdminAccessDenied);
+        }
+        let organization_id = user
+            .organization_id
+            .ok_or(AuthError::AdminOrganizationRequired)?;
+        verify_password(current_password, &user.password_hash)?;
+        let new_password = validate_new_password(new_password)?;
+        let password_hash = hash_password(&new_password)?;
+
+        let updated_user = self
+            .users_by_id
+            .get_mut(&user.id)
+            .ok_or(AuthError::InvalidCredentials)?;
+        updated_user.password_hash = password_hash;
+        updated_user.updated_at = OffsetDateTime::now_utc();
+        self.revoke_user_sessions(user.id);
+
+        let updated_user = self
+            .users_by_id
+            .get(&user.id)
+            .ok_or(AuthError::InvalidCredentials)?;
+        Ok(AdminAuthenticatedSession {
+            user: auth_user_dto(updated_user),
+            organization_id,
+        })
+    }
+
+    pub fn reset_organization_admin_password(
+        &mut self,
+        user_id: Uuid,
+        new_password: &str,
+    ) -> Result<AuthUserDto, AuthError> {
+        let new_password = validate_new_password(new_password)?;
+        let user = self
+            .users_by_id
+            .get(&user_id)
+            .cloned()
+            .ok_or(AuthError::InvalidCredentials)?;
+        if user.account_kind != AccountKind::OrganizationAdmin {
+            return Err(AuthError::AdminAccessDenied);
+        }
+        if user.organization_id.is_none() {
+            return Err(AuthError::AdminOrganizationRequired);
+        }
+        let password_hash = hash_password(&new_password)?;
+        let updated_user = self
+            .users_by_id
+            .get_mut(&user_id)
+            .ok_or(AuthError::InvalidCredentials)?;
+        updated_user.password_hash = password_hash;
+        updated_user.updated_at = OffsetDateTime::now_utc();
+        self.revoke_user_sessions(user_id);
+        self.users_by_id
+            .get(&user_id)
+            .map(auth_user_dto)
+            .ok_or(AuthError::InvalidCredentials)
+    }
+
     pub fn refresh(&mut self, input: RefreshInput) -> Result<Session, AuthError> {
         self.refresh_for_client(input, SessionKind::Tauri)
     }
@@ -1079,6 +1163,115 @@ mod tests {
         assert!(auth
             .authenticate_admin_access_token(&admin_session.access_token)
             .is_err());
+    }
+
+    #[test]
+    fn organization_admin_can_change_password_and_old_sessions_are_revoked() {
+        let mut auth = AuthService::default();
+        let user_id = Uuid::new_v4();
+        auth.create_or_update_admin_user(AdminCreateUserInput {
+            user_id,
+            display_name: "Organization Admin".to_string(),
+            email: Some("admin@example.com".to_string()),
+            phone: None,
+            password: Some("old-password".to_string()),
+            account_kind: AccountKind::OrganizationAdmin,
+            organization_id: Some(Uuid::new_v4()),
+        })
+        .unwrap();
+        let session = auth
+            .admin_login(AdminLoginInput {
+                email: Some("admin@example.com".to_string()),
+                phone: None,
+                password: "old-password".to_string(),
+            })
+            .unwrap();
+
+        let changed = auth
+            .change_admin_password(&session.access_token, "old-password", "new-password")
+            .unwrap();
+        assert_eq!(changed.user.id, user_id);
+        assert!(auth
+            .authenticate_admin_access_token(&session.access_token)
+            .is_err());
+        assert_eq!(
+            auth.admin_login(AdminLoginInput {
+                email: Some("admin@example.com".to_string()),
+                phone: None,
+                password: "old-password".to_string(),
+            })
+            .unwrap_err(),
+            AuthError::InvalidCredentials
+        );
+        assert_eq!(
+            auth.admin_login(AdminLoginInput {
+                email: Some("admin@example.com".to_string()),
+                phone: None,
+                password: "new-password".to_string(),
+            })
+            .unwrap()
+            .user
+            .id,
+            user_id
+        );
+    }
+
+    #[test]
+    fn platform_reset_only_accepts_organization_admin_accounts() {
+        let mut auth = AuthService::default();
+        let organization_id = Uuid::new_v4();
+        let admin_id = Uuid::new_v4();
+        auth.create_or_update_admin_user(AdminCreateUserInput {
+            user_id: admin_id,
+            display_name: "Organization Admin".to_string(),
+            email: Some("admin@example.com".to_string()),
+            phone: None,
+            password: Some("old-password".to_string()),
+            account_kind: AccountKind::OrganizationAdmin,
+            organization_id: Some(organization_id),
+        })
+        .unwrap();
+        let session = auth
+            .admin_login(AdminLoginInput {
+                email: Some("admin@example.com".to_string()),
+                phone: None,
+                password: "old-password".to_string(),
+            })
+            .unwrap();
+
+        auth.reset_organization_admin_password(admin_id, "reset-password")
+            .unwrap();
+        assert!(auth
+            .authenticate_admin_access_token(&session.access_token)
+            .is_err());
+        assert_eq!(
+            auth.admin_login(AdminLoginInput {
+                email: Some("admin@example.com".to_string()),
+                phone: None,
+                password: "reset-password".to_string(),
+            })
+            .unwrap()
+            .user
+            .id,
+            admin_id
+        );
+
+        let business_id = Uuid::new_v4();
+        auth.create_or_update_admin_user(AdminCreateUserInput {
+            user_id: business_id,
+            display_name: "Business User".to_string(),
+            email: Some("business@example.com".to_string()),
+            phone: None,
+            password: Some("business-password".to_string()),
+            account_kind: AccountKind::Business,
+            organization_id: None,
+        })
+        .unwrap();
+        assert_eq!(
+            auth.reset_organization_admin_password(business_id, "reset-password")
+                .unwrap_err(),
+            AuthError::AdminAccessDenied
+        );
     }
 
     #[test]

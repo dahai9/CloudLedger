@@ -53,6 +53,10 @@ records applied versions and checksums in SQLx's `_sqlx_migrations` table.
 - `auth_users`: password hash, account kind, and organization-admin scope.
 - `auth_installations`: one app installation bound to one business identity.
 - `auth_sessions`: rotating business sessions and organization-admin sessions.
+- Organization administrators can change their own password after verifying the
+  current password. A platform administrator can reset an organization
+  administrator password; either operation updates `updated_at` and revokes all
+  sessions for that account.
 
 Platform sessions and brute-force counters remain intentionally ephemeral. They
 contain no business records and are reset when the process restarts.

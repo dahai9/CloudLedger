@@ -64,6 +64,20 @@ new sequence and previous hash.
    `/auth/login`, then confirm login, refresh rotation, logout, and admin login.
 9. Confirm PostgreSQL and browser storage contain no raw access or refresh token.
 
+## Organization Administrator Password Recovery
+
+An organization administrator can open the `修改密码` action in the admin
+backend, provide the current password, and set a new 12–128 character password.
+After a successful change, every administrator session for that account is
+revoked and the account must sign in again.
+
+If the current password is forgotten, a platform administrator signs in through
+the platform-token entry, selects the organization administrator, and uses
+`重置密码`. The reset also revokes all existing sessions. This path is limited
+to `owner`/`admin` memberships whose authentication identity is scoped to the
+same organization; it cannot reset employee accounts or accounts in another
+organization. Passwords and reset values are never written to audit metadata.
+
 Do not restart an old binary after migration. Restore the database and matching
 audit keys from the pre-cutover backup if rollback is required.
 
