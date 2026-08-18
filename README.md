@@ -8,11 +8,14 @@ deletes, and audit trails.
 ## Development
 
 ```bash
-nix develop
-npm install
-cargo test --workspace
-npm run build
+nix develop path:. -c npm install
+nix develop path:. -c cargo test --workspace --locked
+nix develop path:. -c npm run build
 ```
+
+The repository uses the pinned Rust toolchain from `flake.nix`; run Rust and
+Tauri commands through `nix develop` (or the `just` wrappers) so a stale host
+`rustup` installation cannot be selected accidentally.
 
 Useful commands are wrapped in `justfile`:
 
