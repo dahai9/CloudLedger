@@ -12,7 +12,7 @@ use cloudledger_core::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use time::{format_description::well_known::Rfc3339, Date, Month, OffsetDateTime, Time};
+use time::{format_description::well_known::Rfc3339, Date, Month, OffsetDateTime, Time, UtcOffset};
 use uuid::Uuid;
 
 const APP_STATE_SCHEMA_VERSION: u32 = 3;
@@ -82,6 +82,12 @@ pub enum AppServiceError {
     InvalidAnalysisRange,
     #[error("transaction month must use YYYY-MM format")]
     InvalidTransactionMonth,
+    #[error("transaction day must use YYYY-MM-DD format")]
+    InvalidTransactionDay,
+    #[error("audit period must use day or month granularity")]
+    InvalidAuditGranularity,
+    #[error("audit period format is invalid for its granularity")]
+    InvalidAuditPeriod,
     #[error("storage error: {0}")]
     Storage(String),
 }
@@ -167,7 +173,9 @@ pub struct LedgerOverview {
 pub struct TransactionMonthDto {
     pub ledger_id: String,
     pub month: String,
+    pub day: Option<String>,
     pub available_months: Vec<String>,
+    pub available_days: Vec<String>,
     pub transactions: Vec<TransactionDto>,
 }
 
@@ -308,6 +316,39 @@ pub struct AuditLogDto {
     pub resource_id: String,
     pub summary: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditPeriodGranularity {
+    Day,
+    Month,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditPeriodDto {
+    pub ledger_id: String,
+    pub granularity: AuditPeriodGranularity,
+    pub period: String,
+    pub available_months: Vec<String>,
+    pub available_days: Vec<String>,
+    pub lifecycles: Vec<TransactionAuditLifecycleDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionAuditLifecycleDto {
+    pub transaction_id: String,
+    pub description: String,
+    pub kind: String,
+    pub amount_minor: i64,
+    pub currency: String,
+    pub occurred_at: String,
+    pub approval_state: String,
+    pub payment_state: String,
+    pub latest_at: String,
+    pub steps: Vec<AuditLogDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -911,6 +952,31 @@ impl AppLedgerService {
         ledger_id: Uuid,
         requested_month: Option<&str>,
     ) -> Result<TransactionMonthDto, AppServiceError> {
+        self.transactions_for_period(actor_user_id, ledger_id, requested_month, None)
+    }
+
+    pub fn transactions_for_day(
+        &self,
+        actor_user_id: Uuid,
+        ledger_id: Uuid,
+        requested_month: Option<&str>,
+        requested_day: &str,
+    ) -> Result<TransactionMonthDto, AppServiceError> {
+        self.transactions_for_period(
+            actor_user_id,
+            ledger_id,
+            requested_month,
+            Some(requested_day),
+        )
+    }
+
+    fn transactions_for_period(
+        &self,
+        actor_user_id: Uuid,
+        ledger_id: Uuid,
+        requested_month: Option<&str>,
+        requested_day: Option<&str>,
+    ) -> Result<TransactionMonthDto, AppServiceError> {
         let ledger = self
             .ledgers
             .get(&ledger_id)
@@ -919,12 +985,25 @@ impl AppLedgerService {
             return Err(AppServiceError::Unauthorized);
         }
 
+        let selected_day = requested_day
+            .map(|day| {
+                parse_day_key(day)
+                    .map(|_| day.to_string())
+                    .ok_or(AppServiceError::InvalidTransactionDay)
+            })
+            .transpose()?;
         let current_month = month_key(OffsetDateTime::now_utc());
         let selected_month = requested_month
-            .unwrap_or(current_month.as_str())
-            .to_string();
+            .map(str::to_string)
+            .or_else(|| selected_day.as_deref().map(|day| day[..7].to_string()))
+            .unwrap_or(current_month);
         if parse_month_key(&selected_month).is_none() {
             return Err(AppServiceError::InvalidTransactionMonth);
+        }
+        if let Some(day) = selected_day.as_deref() {
+            if !day.starts_with(&format!("{}-", selected_month)) {
+                return Err(AppServiceError::InvalidTransactionDay);
+            }
         }
 
         let available_months = self
@@ -938,6 +1017,21 @@ impl AppLedgerService {
             .collect::<BTreeSet<_>>();
         let available_months = available_months.into_iter().rev().collect::<Vec<_>>();
 
+        let available_days = self
+            .transactions
+            .values()
+            .filter(|transaction| {
+                transaction.ledger_id == ledger_id
+                    && transaction.deleted_at.is_none()
+                    && month_key(transaction.occurred_at) == selected_month
+            })
+            .filter(|transaction| self.transaction_visible_to_actor(actor_user_id, transaction))
+            .map(|transaction| day_key(transaction.occurred_at))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>();
+
         let mut transactions = self
             .transactions
             .values()
@@ -945,6 +1039,9 @@ impl AppLedgerService {
                 transaction.ledger_id == ledger_id
                     && transaction.deleted_at.is_none()
                     && month_key(transaction.occurred_at) == selected_month
+                    && selected_day
+                        .as_deref()
+                        .is_none_or(|day| day_key(transaction.occurred_at) == day)
             })
             .filter(|transaction| self.transaction_visible_to_actor(actor_user_id, transaction))
             .map(|transaction| self.transaction_dto(transaction))
@@ -959,8 +1056,102 @@ impl AppLedgerService {
         Ok(TransactionMonthDto {
             ledger_id: ledger_id.to_string(),
             month: selected_month,
+            day: selected_day,
             available_months,
+            available_days,
             transactions,
+        })
+    }
+
+    pub fn audit_period(
+        &self,
+        actor_user_id: Uuid,
+        ledger_id: Uuid,
+        granularity: AuditPeriodGranularity,
+        period: &str,
+    ) -> Result<AuditPeriodDto, AppServiceError> {
+        let ledger = self
+            .ledgers
+            .get(&ledger_id)
+            .ok_or(AppServiceError::LedgerNotFound)?;
+        if !self.authorized(actor_user_id, ledger, Action::ViewAuditLog) {
+            return Err(AppServiceError::Unauthorized);
+        }
+        match granularity {
+            AuditPeriodGranularity::Day => {
+                if parse_day_key(period).is_none() {
+                    return Err(AppServiceError::InvalidAuditPeriod);
+                }
+            }
+            AuditPeriodGranularity::Month => {
+                if parse_month_key(period).is_none() {
+                    return Err(AppServiceError::InvalidAuditPeriod);
+                }
+            }
+        }
+
+        let mut grouped = BTreeMap::<Uuid, Vec<&AuditLog>>::new();
+        for audit in self.audit_logs.iter().filter(|audit| {
+            audit.ledger_id == ledger_id
+                && audit.resource_type == "transaction"
+                && self.audit_visible_to_actor(actor_user_id, audit)
+        }) {
+            grouped.entry(audit.resource_id).or_default().push(audit);
+        }
+
+        let mut lifecycles = Vec::new();
+        let mut available_months = BTreeSet::new();
+        let mut available_days = BTreeSet::new();
+        for (transaction_id, mut steps) in grouped {
+            steps.sort_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            let Some(latest) = steps.last().copied() else {
+                continue;
+            };
+            let latest_day = day_key(latest.created_at);
+            let latest_month = month_key(latest.created_at);
+            available_days.insert(latest_day.clone());
+            available_months.insert(latest_month.clone());
+            let matches_period = match granularity {
+                AuditPeriodGranularity::Day => latest_day == period,
+                AuditPeriodGranularity::Month => latest_month == period,
+            };
+            if !matches_period {
+                continue;
+            }
+            let Some(transaction) = self.transactions.get(&transaction_id) else {
+                continue;
+            };
+            lifecycles.push(TransactionAuditLifecycleDto {
+                transaction_id: transaction.id.to_string(),
+                description: transaction.description.clone(),
+                kind: transaction_kind_name(transaction.kind).to_string(),
+                amount_minor: transaction.amount.amount_minor,
+                currency: transaction.amount.currency.clone(),
+                occurred_at: format_time(transaction.occurred_at),
+                approval_state: approval_state_name(transaction.approval_state).to_string(),
+                payment_state: payment_state_name(transaction.payment_state).to_string(),
+                latest_at: format_time(latest.created_at),
+                steps: steps.into_iter().map(|step| self.audit_dto(step)).collect(),
+            });
+        }
+        lifecycles.sort_by(|left, right| {
+            right
+                .latest_at
+                .cmp(&left.latest_at)
+                .then_with(|| right.transaction_id.cmp(&left.transaction_id))
+        });
+
+        Ok(AuditPeriodDto {
+            ledger_id: ledger_id.to_string(),
+            granularity,
+            period: period.to_string(),
+            available_months: available_months.into_iter().rev().collect(),
+            available_days: available_days.into_iter().rev().collect(),
+            lifecycles,
         })
     }
 
@@ -1052,9 +1243,10 @@ impl AppLedgerService {
         let mut trend = (0..months)
             .map(|offset| {
                 let start = shift_month_start(period_start, i32::from(offset));
+                let local_start = beijing_time(start);
                 CashFlowTrendPointDto {
-                    key: format!("{:04}-{:02}", start.year(), start.month() as u8),
-                    label: format!("{}月", start.month() as u8),
+                    key: format!("{:04}-{:02}", local_start.year(), local_start.month() as u8),
+                    label: format!("{}月", local_start.month() as u8),
                     income_minor: 0,
                     expense_minor: 0,
                     net_cash_flow_minor: 0,
@@ -1192,10 +1384,7 @@ impl AppLedgerService {
         let ledger = self.analytics_ledger(actor_user_id, ledger_id)?;
         let (year, calendar_month) =
             parse_month_key(month).ok_or(AppServiceError::InvalidTransactionMonth)?;
-        let period_start = Date::from_calendar_date(year, calendar_month, 1)
-            .expect("validated month has a start")
-            .with_time(Time::MIDNIGHT)
-            .assume_utc();
+        let period_start = calendar_month_start(year, calendar_month);
         let period_end = shift_month_start(period_start, 1);
         let currency = self.ledger_currency(ledger_id);
         let mut income_minor = 0;
@@ -2598,20 +2787,64 @@ fn transaction_cash_effective_at(transaction: &Transaction) -> Option<OffsetDate
     }
 }
 
+fn transaction_kind_name(kind: TransactionKind) -> &'static str {
+    match kind {
+        TransactionKind::Income => "income",
+        TransactionKind::Expense => "expense",
+        TransactionKind::Transfer => "transfer",
+    }
+}
+
 fn add_exposure(exposure: &mut FinancialExposureDto, transaction: &Transaction) {
     exposure.count += 1;
     exposure.amount_minor += transaction.amount.amount_minor;
 }
 
-fn month_start(value: OffsetDateTime) -> OffsetDateTime {
-    Date::from_calendar_date(value.year(), value.month(), 1)
-        .expect("an existing timestamp always has a valid month start")
+fn beijing_offset() -> UtcOffset {
+    UtcOffset::from_hms(8, 0, 0).expect("Beijing has a fixed UTC+8 offset")
+}
+
+fn beijing_time(value: OffsetDateTime) -> OffsetDateTime {
+    value.to_offset(beijing_offset())
+}
+
+fn calendar_month_start(year: i32, month: Month) -> OffsetDateTime {
+    Date::from_calendar_date(year, month, 1)
+        .expect("a validated calendar month always has a valid start")
         .with_time(Time::MIDNIGHT)
-        .assume_utc()
+        .assume_offset(beijing_offset())
+        .to_offset(UtcOffset::UTC)
+}
+
+fn month_start(value: OffsetDateTime) -> OffsetDateTime {
+    let local = beijing_time(value);
+    calendar_month_start(local.year(), local.month())
 }
 
 fn month_key(value: OffsetDateTime) -> String {
-    format!("{:04}-{:02}", value.year(), value.month() as u8)
+    let local = beijing_time(value);
+    format!("{:04}-{:02}", local.year(), local.month() as u8)
+}
+
+fn day_key(value: OffsetDateTime) -> String {
+    let local = beijing_time(value);
+    format!(
+        "{:04}-{:02}-{:02}",
+        local.year(),
+        local.month() as u8,
+        local.day()
+    )
+}
+
+fn parse_day_key(value: &str) -> Option<Date> {
+    let mut parts = value.split('-');
+    let year = parts.next()?.parse::<i32>().ok()?;
+    let month = Month::try_from(parts.next()?.parse::<u8>().ok()?).ok()?;
+    let day = parts.next()?.parse::<u8>().ok()?;
+    if parts.next().is_some() || value.len() != 10 {
+        return None;
+    }
+    Date::from_calendar_date(year, month, day).ok()
 }
 
 fn parse_month_key(value: &str) -> Option<(i32, Month)> {
@@ -2627,17 +2860,17 @@ fn parse_month_key(value: &str) -> Option<(i32, Month)> {
 }
 
 fn shift_month_start(value: OffsetDateTime, offset: i32) -> OffsetDateTime {
-    let absolute_month = value.year() * 12 + i32::from(value.month() as u8) - 1 + offset;
+    let local = beijing_time(value);
+    let absolute_month = local.year() * 12 + i32::from(local.month() as u8) - 1 + offset;
     let year = absolute_month.div_euclid(12);
     let month_number = absolute_month.rem_euclid(12) + 1;
     let month = Month::try_from(month_number as u8).expect("normalized month is valid");
-    Date::from_calendar_date(year, month, 1)
-        .expect("normalized month start is valid")
-        .with_time(Time::MIDNIGHT)
-        .assume_utc()
+    calendar_month_start(year, month)
 }
 
 fn month_distance(start: OffsetDateTime, end: OffsetDateTime) -> i32 {
+    let start = beijing_time(start);
+    let end = beijing_time(end);
     (end.year() - start.year()) * 12 + i32::from(end.month() as u8) - i32::from(start.month() as u8)
 }
 
@@ -3972,5 +4205,116 @@ mod tests {
         });
 
         assert!(matches!(result, Err(AppServiceError::SelfApprovalDenied)));
+    }
+
+    #[test]
+    fn beijing_calendar_and_day_transaction_filter_handle_utc_boundary() {
+        let mut service = AppLedgerService::seeded();
+        let owner_id = service.current_user_id();
+        let ledger = service
+            .ledgers
+            .values()
+            .find(|ledger| {
+                ledger.kind == LedgerKind::Personal && ledger.owner_user_id == Some(owner_id)
+            })
+            .expect("owner personal ledger")
+            .clone();
+        let account = service
+            .accounts
+            .values()
+            .find(|account| account.ledger_id == ledger.id)
+            .expect("personal account")
+            .clone();
+        let transaction = service
+            .create_transaction(AppCreateTransactionInput {
+                actor_user_id: owner_id,
+                ledger_id: ledger.id,
+                account_id: account.id,
+                category_id: None,
+                kind: TransactionKind::Expense,
+                amount_minor: 1_200,
+                currency: "CNY".to_string(),
+                description: "北京时间边界测试".to_string(),
+                client_mutation_id: None,
+            })
+            .expect("create boundary transaction");
+        let transaction_id = Uuid::parse_str(&transaction.id).expect("transaction id");
+        service
+            .transactions
+            .get_mut(&transaction_id)
+            .expect("created transaction")
+            .occurred_at = OffsetDateTime::parse("2026-07-31T16:30:00Z", &Rfc3339)
+            .expect("valid boundary timestamp");
+
+        let day = service
+            .transactions_for_day(owner_id, ledger.id, Some("2026-08"), "2026-08-01")
+            .expect("load Beijing day");
+        assert_eq!(day.day.as_deref(), Some("2026-08-01"));
+        assert!(day.available_days.contains(&"2026-08-01".to_string()));
+        assert!(day
+            .transactions
+            .iter()
+            .any(|item| item.id == transaction.id));
+    }
+
+    #[test]
+    fn audit_period_groups_full_transaction_lifecycle_by_latest_step() {
+        let mut service = AppLedgerService::seeded();
+        let owner_id = service.current_user_id();
+        let public_ledger_id = service
+            .ledgers
+            .values()
+            .find(|ledger| ledger.kind == LedgerKind::OrganizationPublic)
+            .map(|ledger| ledger.id)
+            .expect("public ledger");
+        let pending_id = service
+            .transactions
+            .values()
+            .find(|transaction| {
+                transaction.ledger_id == public_ledger_id
+                    && transaction.approval_state == ApprovalState::Submitted
+            })
+            .map(|transaction| transaction.id)
+            .expect("pending transaction");
+
+        service
+            .decide_approval(AppDecideApprovalInput {
+                actor_user_id: owner_id,
+                transaction_id: pending_id,
+                decision: ApprovalDecision::Approve,
+                decision_note: None,
+            })
+            .expect("approve transaction");
+        service
+            .mark_transaction_paid(AppMarkTransactionPaidInput {
+                actor_user_id: owner_id,
+                transaction_id: pending_id,
+            })
+            .expect("pay transaction");
+
+        let period = month_key(OffsetDateTime::now_utc());
+        let audit = service
+            .audit_period(
+                owner_id,
+                public_ledger_id,
+                AuditPeriodGranularity::Month,
+                &period,
+            )
+            .expect("load audit period");
+        let lifecycle = audit
+            .lifecycles
+            .iter()
+            .find(|item| item.transaction_id == pending_id.to_string())
+            .expect("grouped lifecycle");
+        assert!(lifecycle.steps.len() >= 3);
+        assert_eq!(
+            lifecycle.steps.first().map(|step| step.action.as_str()),
+            Some("transaction.submitted")
+        );
+        assert_eq!(
+            lifecycle.steps.last().map(|step| step.action.as_str()),
+            Some("transaction.paid")
+        );
+        assert!(audit.available_months.contains(&period));
     }
 }

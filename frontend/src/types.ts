@@ -24,6 +24,8 @@ export type AuditAction =
   | "transaction_auto_approved"
   | "transaction_deleted";
 
+export type PeriodGranularity = "day" | "month";
+
 export interface Ledger {
   id: string;
   name: string;
@@ -157,12 +159,36 @@ export interface AuditLogEntry {
   summary: string;
 }
 
+export interface AuditPeriod {
+  ledgerId: string;
+  granularity: PeriodGranularity;
+  period: string;
+  availableMonths: string[];
+  availableDays: string[];
+  lifecycles: TransactionAuditLifecycle[];
+}
+
+export interface TransactionAuditLifecycle {
+  transactionId: string;
+  description: string;
+  direction: TransactionDirection;
+  amountCents: number;
+  currency: string;
+  occurredAt: string;
+  approvalState: ApprovalState;
+  paymentState: PaymentState;
+  latestAt: string;
+  steps: AuditLogEntry[];
+}
+
 export interface LedgerDashboard {
   ledger: Ledger;
   accounts: FinancialAccount[];
   categories: Category[];
   selectedTransactionMonth: string;
+  selectedTransactionDay?: string;
   availableTransactionMonths: string[];
+  availableTransactionDays: string[];
   recentTransactions: Transaction[];
   approvalQueue: ApprovalQueueItem[];
   auditTrail: AuditLogEntry[];

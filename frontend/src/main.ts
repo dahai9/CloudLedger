@@ -5,6 +5,7 @@ import "./styles.css";
 import type {
   AnalysisMonths,
   ApprovalState,
+  AuditPeriod,
   Category,
   Ledger,
   LedgerDashboard,
@@ -14,6 +15,8 @@ import type {
   LoginDraft,
   NewTransactionDraft,
   OfflineTransaction,
+  PeriodGranularity,
+  TransactionAuditLifecycle,
   TransactionDirection,
   UpdateProfileDraft,
   UserAccount,
@@ -71,6 +74,7 @@ interface AppState {
   analysisDetailLoading: boolean;
   analysisDetailError?: string;
   cachedDashboards: Record<string, LedgerDashboard>;
+  cachedAuditPeriods: Record<string, AuditPeriod>;
   outbox: OfflineTransaction[];
   sync: SyncState;
   reauthRequired: boolean;
@@ -84,6 +88,14 @@ interface AppState {
   view: ViewMode;
   filter: TransactionFilter;
   activityMonth: string;
+  activityDay: string;
+  activityGranularity: PeriodGranularity;
+  auditGranularity: PeriodGranularity;
+  auditPeriod: string;
+  auditData?: AuditPeriod;
+  auditLoading: boolean;
+  auditError?: string;
+  auditDetailTransactionId?: string;
   categoryEditing: boolean;
   categoryName: string;
   amountsVisible: boolean;
@@ -115,6 +127,7 @@ const state: AppState = {
   analysisLoading: false,
   analysisDetailLoading: false,
   cachedDashboards: {},
+  cachedAuditPeriods: {},
   outbox: [],
   sync: { phase: "idle", completed: 0, total: 0, syncedCount: 0 },
   reauthRequired: false,
@@ -122,6 +135,11 @@ const state: AppState = {
   view: "activity",
   filter: "all",
   activityMonth: currentMonthKey(),
+  activityDay: currentDayKey(),
+  activityGranularity: "month",
+  auditGranularity: "month",
+  auditPeriod: currentMonthKey(),
+  auditLoading: false,
   categoryEditing: false,
   categoryName: "",
   amountsVisible: false,
@@ -145,12 +163,14 @@ const state: AppState = {
 
 const moneyFormatterCache = new Map<string, Intl.NumberFormat>();
 const dateFormatter = new Intl.DateTimeFormat("zh-CN", {
+  timeZone: "Asia/Shanghai",
   month: "2-digit",
   day: "2-digit",
   hour: "2-digit",
   minute: "2-digit",
 });
 const periodMonthFormatter = new Intl.DateTimeFormat("zh-CN", {
+  timeZone: "Asia/Shanghai",
   year: "numeric",
   month: "short",
 });
@@ -258,7 +278,11 @@ async function loadInitialState() {
     const activeLedgerId = pickDefaultLedgerId(ledgers);
 
     const dashboard = activeLedgerId
-      ? await cloudLedgerApi.getLedgerDashboard(activeLedgerId, state.activityMonth)
+      ? await cloudLedgerApi.getLedgerDashboard(
+          activeLedgerId,
+          state.activityMonth,
+          state.activityGranularity === "day" ? state.activityDay : undefined,
+        )
       : undefined;
     applyRemoteState(session, ledgers, activeLedgerId, dashboard);
     state.authStatus = "authenticated";
@@ -296,7 +320,10 @@ async function loadInitialState() {
       state.activeLedgerId = undefined;
       state.dashboard = undefined;
       state.analysis = undefined;
+      state.auditData = undefined;
+      state.auditDetailTransactionId = undefined;
       state.cachedDashboards = {};
+      state.cachedAuditPeriods = {};
       state.outbox = [];
       state.reauthRequired = false;
       state.sync = { phase: "idle", completed: 0, total: 0, syncedCount: 0 };
@@ -381,8 +408,11 @@ async function logout() {
     state.activeLedgerId = undefined;
     state.dashboard = undefined;
     state.analysis = undefined;
+    state.auditData = undefined;
+    state.auditDetailTransactionId = undefined;
     resetAnalysisDetail();
     state.cachedDashboards = {};
+    state.cachedAuditPeriods = {};
     state.outbox = [];
     state.reauthRequired = false;
     state.recentlySyncedTransactionIds.clear();
@@ -403,6 +433,9 @@ async function switchLedger(ledgerId: string) {
     state.activeLedgerId = ledgerId;
     state.dashboard = cached;
     state.activityMonth = cached.selectedTransactionMonth;
+    state.activityDay = cached.selectedTransactionDay ?? currentDayKey();
+    state.auditData = undefined;
+    state.auditDetailTransactionId = undefined;
     state.analysis = undefined;
     state.analysisError = undefined;
     resetAnalysisDetail();
@@ -416,11 +449,16 @@ async function switchLedger(ledgerId: string) {
     state.loading = true;
     state.activeLedgerId = ledgerId;
     state.activityMonth = currentMonthKey();
+    state.activityDay = currentDayKey();
+    state.auditPeriod = currentMonthKey();
+    state.auditData = undefined;
+    state.auditDetailTransactionId = undefined;
     state.categoryEditing = false;
     state.categoryName = "";
     render();
     state.dashboard = await cloudLedgerApi.getLedgerDashboard(ledgerId, state.activityMonth);
     state.activityMonth = state.dashboard.selectedTransactionMonth;
+    state.activityDay = state.dashboard.selectedTransactionDay ?? currentDayKey();
     rememberDashboard(state.dashboard);
     state.analysis = undefined;
     state.analysisError = undefined;
@@ -438,9 +476,9 @@ async function switchLedger(ledgerId: string) {
   }
 }
 
-async function loadActivityMonth(month: string) {
+async function loadActivityMonth(month: string, force = false) {
   const ledgerId = state.activeLedgerId;
-  if (!ledgerId || month === state.activityMonth || state.pendingAction) {
+  if (!ledgerId || (!force && month === state.activityMonth && !state.dashboard?.selectedTransactionDay) || state.pendingAction) {
     return;
   }
   if (state.cloudStatus.state === "offline") {
@@ -450,6 +488,7 @@ async function loadActivityMonth(month: string) {
       return;
     }
     state.activityMonth = cached.selectedTransactionMonth;
+    state.activityDay = cached.selectedTransactionDay ?? currentDayKey();
     state.dashboard = cached;
     resetFormForDashboard({ preserveDraft: true });
     render();
@@ -461,6 +500,7 @@ async function loadActivityMonth(month: string) {
     render();
     state.dashboard = await cloudLedgerApi.getLedgerDashboard(ledgerId, month);
     state.activityMonth = state.dashboard.selectedTransactionMonth;
+    state.activityDay = state.dashboard.selectedTransactionDay ?? state.dashboard.availableTransactionDays[0] ?? currentDayKey();
     rememberDashboard(state.dashboard);
     resetFormForDashboard({ preserveDraft: true });
     state.error = undefined;
@@ -473,16 +513,139 @@ async function loadActivityMonth(month: string) {
   }
 }
 
+async function loadActivityDay(day: string, force = false) {
+  const ledgerId = state.activeLedgerId;
+  if (!ledgerId || (!force && day === state.activityDay && state.dashboard?.selectedTransactionDay === day) || state.pendingAction) return;
+  const month = day.slice(0, 7);
+  if (state.cloudStatus.state === "offline") {
+    const cached = cachedDashboard(ledgerId, month, day);
+    if (!cached) {
+      showToast("该日期尚未缓存，联网后可查看");
+      return;
+    }
+    state.activityMonth = month;
+    state.activityDay = day;
+    state.dashboard = cached;
+    resetFormForDashboard({ preserveDraft: true });
+    render();
+    return;
+  }
+  try {
+    state.pendingAction = "activity-day";
+    state.activityMonth = month;
+    state.activityDay = day;
+    render();
+    state.dashboard = await cloudLedgerApi.getLedgerDashboard(ledgerId, month, day);
+    state.activityMonth = state.dashboard.selectedTransactionMonth;
+    state.activityDay = state.dashboard.selectedTransactionDay ?? day;
+    rememberDashboard(state.dashboard);
+    resetFormForDashboard({ preserveDraft: true });
+    state.error = undefined;
+    await saveOfflineSnapshot();
+  } catch (error) {
+    showToast(friendlyError(error, "加载日期流水失败"));
+  } finally {
+    state.pendingAction = undefined;
+    render();
+  }
+}
+
+async function changeActivityGranularity(granularity: PeriodGranularity) {
+  if (state.activityGranularity === granularity || state.pendingAction) return;
+  state.activityGranularity = granularity;
+  if (granularity === "month") {
+    await loadActivityMonth(state.activityMonth, true);
+    return;
+  }
+  const day =
+    state.dashboard?.availableTransactionDays.find((candidate) => candidate === state.activityDay) ??
+    state.dashboard?.availableTransactionDays[0] ??
+    (state.activityMonth === currentMonthKey() ? currentDayKey() : `${state.activityMonth}-01`);
+  state.activityDay = day;
+  await loadActivityDay(day, true);
+}
+
 async function refreshDashboard() {
   await refreshRemoteState({ silent: false, allowPending: true });
 }
 
 async function changeView(view: ViewMode) {
   state.view = view;
+  if (view !== "audit") {
+    state.auditDetailTransactionId = undefined;
+  }
   render();
   if (view === "analysis") {
     await loadFinancialAnalysis(false);
+  } else if (view === "audit") {
+    await loadAuditPeriod(false);
   }
+}
+
+async function loadAuditPeriod(force = false) {
+  const dashboard = state.dashboard;
+  if (!dashboard || state.auditLoading) return;
+  if (
+    !force &&
+    state.auditData?.ledgerId === dashboard.ledger.id &&
+    state.auditData.granularity === state.auditGranularity &&
+    state.auditData.period === state.auditPeriod
+  ) {
+    return;
+  }
+  const ledgerId = dashboard.ledger.id;
+  const granularity = state.auditGranularity;
+  const period = state.auditPeriod;
+  const cacheKey = auditPeriodCacheKey(ledgerId, granularity, period);
+  if (state.cloudStatus.state === "offline") {
+    const cached = state.cachedAuditPeriods[cacheKey];
+    if (cached) {
+      state.auditData = cached;
+      state.auditError = undefined;
+    } else {
+      state.auditError = "该日期或月份尚未缓存，联网后可查看";
+    }
+    render();
+    return;
+  }
+  state.auditLoading = true;
+  state.auditError = undefined;
+  render();
+  try {
+    const data = await cloudLedgerApi.getAuditPeriod(ledgerId, granularity, period);
+    if (
+      state.activeLedgerId === ledgerId &&
+      state.auditGranularity === granularity &&
+      state.auditPeriod === period
+    ) {
+      state.auditData = data;
+      state.cachedAuditPeriods[cacheKey] = data;
+      await saveOfflineSnapshot();
+    }
+  } catch (error) {
+    if (state.activeLedgerId === ledgerId && state.auditPeriod === period) {
+      state.auditError = friendlyError(error, "加载审计生命周期失败");
+    }
+  } finally {
+    state.auditLoading = false;
+    render();
+  }
+}
+
+function setAuditPeriod(granularity: PeriodGranularity, period: string) {
+  state.auditGranularity = granularity;
+  state.auditPeriod = period;
+  state.auditData = undefined;
+  state.auditDetailTransactionId = undefined;
+  void loadAuditPeriod(true);
+}
+
+function auditPeriodCacheKey(
+  ledgerId: string,
+  granularity: PeriodGranularity,
+  period: string,
+) {
+  return `${ledgerId}:${granularity}:${period}`;
 }
 
 async function loadFinancialAnalysis(force: boolean) {
@@ -640,7 +803,11 @@ async function refreshRemoteState(
       : pickDefaultLedgerId(ledgers);
 
     const dashboard = activeLedgerId
-      ? await cloudLedgerApi.getLedgerDashboard(activeLedgerId, state.activityMonth)
+      ? await cloudLedgerApi.getLedgerDashboard(
+          activeLedgerId,
+          state.activityMonth,
+          state.activityGranularity === "day" ? state.activityDay : undefined,
+        )
       : undefined;
     if (expectedUserId && state.currentUser?.id !== expectedUserId) return;
     applyRemoteState(session, ledgers, activeLedgerId, dashboard);
@@ -680,7 +847,10 @@ async function refreshRemoteState(
         state.activeLedgerId = undefined;
         state.dashboard = undefined;
         state.analysis = undefined;
+        state.auditData = undefined;
+        state.auditDetailTransactionId = undefined;
         state.cachedDashboards = {};
+        state.cachedAuditPeriods = {};
         state.outbox = [];
         state.userMenuOpen = false;
         state.profileEditing = false;
@@ -726,24 +896,39 @@ function applyRemoteState(
   state.activeLedgerId = activeLedgerId;
   state.dashboard = dashboard;
   state.activityMonth = dashboard?.selectedTransactionMonth ?? currentMonthKey();
+  state.activityDay = dashboard?.selectedTransactionDay ?? currentDayKey();
+  if (state.auditData && state.auditData.ledgerId !== activeLedgerId) {
+    state.auditData = undefined;
+    state.auditDetailTransactionId = undefined;
+  }
   if (dashboard) rememberDashboard(dashboard);
   updateCloudStatusLabel();
 }
 
-function dashboardCacheKey(ledgerId: string, month: string) {
-  return `${ledgerId}:${month}`;
+function dashboardCacheKey(ledgerId: string, month: string, day?: string) {
+  return `${ledgerId}:${month}:${day ?? "month"}`;
 }
 
 function rememberDashboard(dashboard: LedgerDashboard) {
-  state.cachedDashboards[dashboardCacheKey(dashboard.ledger.id, dashboard.selectedTransactionMonth)] =
+  state.cachedDashboards[
+    dashboardCacheKey(
+      dashboard.ledger.id,
+      dashboard.selectedTransactionMonth,
+      dashboard.selectedTransactionDay,
+    )
+  ] =
     dashboard;
 }
 
-function cachedDashboard(ledgerId: string, month: string) {
+function cachedDashboard(ledgerId: string, month: string, day?: string) {
   return (
-    state.cachedDashboards[dashboardCacheKey(ledgerId, month)] ??
+    state.cachedDashboards[dashboardCacheKey(ledgerId, month, day)] ??
+    (!day ? state.cachedDashboards[dashboardCacheKey(ledgerId, month)] : undefined) ??
     Object.values(state.cachedDashboards).find(
-      (dashboard) => dashboard.ledger.id === ledgerId,
+      (dashboard) =>
+        dashboard.ledger.id === ledgerId &&
+        dashboard.selectedTransactionMonth === month &&
+        (day ? dashboard.selectedTransactionDay === day : !dashboard.selectedTransactionDay),
     )
   );
 }
@@ -756,7 +941,12 @@ async function restoreOfflineState(): Promise<boolean> {
   const activeLedgerId = snapshot.activeLedgerId ?? pickDefaultLedgerId(snapshot.ledgers);
   const dashboard = activeLedgerId
     ? snapshot.dashboards[dashboardCacheKey(activeLedgerId, snapshot.activityMonth)] ??
-      Object.values(snapshot.dashboards).find((item) => item.ledger.id === activeLedgerId)
+      Object.values(snapshot.dashboards).find(
+        (item) =>
+          item.ledger.id === activeLedgerId &&
+          item.selectedTransactionMonth === snapshot.activityMonth &&
+          !item.selectedTransactionDay,
+      )
     : undefined;
   if (!dashboard) {
     return false;
@@ -765,10 +955,12 @@ async function restoreOfflineState(): Promise<boolean> {
   state.currentUser = snapshot.user;
   state.ledgers = snapshot.ledgers;
   state.cachedDashboards = snapshot.dashboards;
+  state.cachedAuditPeriods = snapshot.auditPeriods;
   state.outbox = snapshot.outbox;
   state.activeLedgerId = activeLedgerId;
   state.dashboard = dashboard;
   state.activityMonth = dashboard.selectedTransactionMonth;
+  state.activityDay = dashboard.selectedTransactionDay ?? currentDayKey();
   state.analysis = undefined;
   state.analysisError = undefined;
   state.authStatus = "authenticated";
@@ -793,10 +985,12 @@ async function hydrateOfflineCacheForUser(userId: string) {
   authoritativeCacheUserId = userId;
   if (!snapshot || snapshot.user.id !== userId) {
     state.cachedDashboards = {};
+    state.cachedAuditPeriods = {};
     state.outbox = [];
     return;
   }
   state.cachedDashboards = snapshot.dashboards;
+  state.cachedAuditPeriods = snapshot.auditPeriods;
   state.outbox = snapshot.outbox;
   const dashboard = state.activeLedgerId
     ? cachedDashboard(state.activeLedgerId, state.activityMonth)
@@ -809,10 +1003,11 @@ function offlineSnapshot(): OfflineSnapshot | undefined {
     return undefined;
   }
   return {
-    version: 2,
+    version: 3,
     user: state.currentUser,
     ledgers: state.ledgers,
     dashboards: state.cachedDashboards,
+    auditPeriods: state.cachedAuditPeriods,
     activeLedgerId: state.activeLedgerId,
     activityMonth: state.activityMonth,
     outbox: state.outbox,
@@ -2105,18 +2300,25 @@ function renderTransactionList(dashboard: LedgerDashboard) {
         </div>
       </div>
       <div class="activity-month-bar">
-        <label for="activityMonthSelect">月份</label>
-        <select id="activityMonthSelect" ${dashboard.availableTransactionMonths.length === 0 ? "disabled" : ""}>
-          ${
-            dashboard.availableTransactionMonths.length > 0
-              ? dashboard.availableTransactionMonths
-                  .map(
-                    (month) => `<option value="${escapeHtml(month)}" ${month === dashboard.selectedTransactionMonth ? "selected" : ""}>${escapeHtml(formatMonthLabel(month))}</option>`,
-                  )
-                  .join("")
-              : `<option value="">暂无可用月份</option>`
-          }
-        </select>
+        <div class="period-toggle" role="group" aria-label="流水时间范围">
+          ${renderPeriodButton("activity", "month", "月")}
+          ${renderPeriodButton("activity", "day", "日")}
+        </div>
+        ${
+          state.activityGranularity === "day"
+            ? `<label for="activityDaySelect">日期</label><input id="activityDaySelect" type="date" value="${escapeHtml(state.activityDay)}" />`
+            : `<label for="activityMonthSelect">月份</label><select id="activityMonthSelect" ${dashboard.availableTransactionMonths.length === 0 ? "disabled" : ""}>
+                ${
+                  dashboard.availableTransactionMonths.length > 0
+                    ? dashboard.availableTransactionMonths
+                        .map(
+                          (month) => `<option value="${escapeHtml(month)}" ${month === dashboard.selectedTransactionMonth ? "selected" : ""}>${escapeHtml(formatMonthLabel(month))}</option>`,
+                        )
+                        .join("")
+                    : `<option value="">暂无可用月份</option>`
+                }
+              </select>`
+        }
         <span>${filtered.length} / ${dashboard.recentTransactions.length} 笔</span>
       </div>
       <div class="transaction-list">
@@ -2143,6 +2345,18 @@ function renderFilterButton(filter: TransactionFilter, label: string) {
       ${label}
     </button>
   `;
+}
+
+function renderPeriodButton(
+  scope: "activity" | "audit",
+  granularity: PeriodGranularity,
+  label: string,
+) {
+  const active =
+    scope === "activity"
+      ? state.activityGranularity === granularity
+      : state.auditGranularity === granularity;
+  return `<button class="period-button ${active ? "is-active" : ""}" type="button" data-${scope}-granularity="${granularity}" aria-pressed="${active}">${label}</button>`;
 }
 
 function renderTransactionRow(
@@ -2310,7 +2524,13 @@ function renderApprovalRow(item: LedgerDashboard["approvalQueue"][number], curre
   `;
 }
 
-function renderAuditPanel(dashboard: LedgerDashboard) {
+function renderAuditPanel(_dashboard: LedgerDashboard) {
+  const detail = state.auditData?.lifecycles.find(
+    (item) => item.transactionId === state.auditDetailTransactionId,
+  );
+  if (detail) return renderAuditLifecycleDetail(detail);
+
+  const audit = state.auditData;
   return `
     <section class="activity-panel" aria-label="审计入口">
       <div class="section-heading">
@@ -2318,29 +2538,103 @@ function renderAuditPanel(dashboard: LedgerDashboard) {
           <span class="section-kicker">Audit</span>
           <h2>审计</h2>
         </div>
-        <span class="count-badge">${dashboard.auditTrail.length}</span>
+        <span class="count-badge">${audit?.lifecycles.length ?? 0}</span>
       </div>
+      <div class="activity-month-bar audit-period-bar">
+        <div class="period-toggle" role="group" aria-label="审计时间范围">
+          ${renderPeriodButton("audit", "month", "月")}
+          ${renderPeriodButton("audit", "day", "日")}
+        </div>
+        ${
+          state.auditGranularity === "day"
+            ? `<label for="auditDaySelect">日期</label><input id="auditDaySelect" type="date" value="${escapeHtml(state.auditPeriod)}" />`
+            : `<label for="auditMonthSelect">月份</label><input id="auditMonthSelect" type="month" value="${escapeHtml(state.auditPeriod)}" />`
+        }
+        <span>${audit?.lifecycles.length ?? 0} 笔流水</span>
+      </div>
+      ${state.auditLoading ? '<div class="audit-state"><div class="spinner" aria-hidden="true"></div><p>正在加载审计生命周期</p></div>' : ""}
+      ${state.auditError ? `<div class="audit-state"><p>${escapeHtml(state.auditError)}</p><button class="primary-button" id="retryAuditButton" type="button">重新加载</button></div>` : ""}
       <div class="audit-list">
         ${
-          dashboard.auditTrail.length > 0
-            ? dashboard.auditTrail
-                .map(
-                  (item) => `
-                    <article class="audit-row">
-                      <span class="audit-dot" aria-hidden="true"></span>
-                      <div>
-                        <h3>${escapeHtml(item.summary)}</h3>
-                        <p>${escapeHtml(item.actorName)} · ${auditActionLabel(item.action)} · ${formatDate(
-                          item.createdAt,
-                        )}</p>
-                        <p>资源 #${escapeHtml(item.resourceId.slice(0, 8))}</p>
-                      </div>
-                    </article>
-                  `,
-                )
-                .join("")
+          audit && audit.lifecycles.length > 0
+            ? renderAuditLifecycleGroups(audit.lifecycles)
             : `<p class="empty-copy">暂无审计记录</p>`
         }
+      </div>
+    </section>
+  `;
+}
+
+function renderAuditLifecycleGroups(lifecycles: TransactionAuditLifecycle[]) {
+  const groups = new Map<string, TransactionAuditLifecycle[]>();
+  for (const lifecycle of lifecycles) {
+    const key = transactionDayKey(lifecycle.latestAt);
+    groups.set(key, [...(groups.get(key) ?? []), lifecycle]);
+  }
+  return Array.from(groups.entries())
+    .sort(([left], [right]) => right.localeCompare(left))
+    .map(
+      ([day, items]) => `
+        <section class="audit-day-group" aria-label="${escapeHtml(formatDayLabel(day))}">
+          <h3 class="audit-day-heading">${escapeHtml(formatDayLabel(day))}</h3>
+          ${items.map(renderAuditLifecycleCard).join("")}
+        </section>
+      `,
+    )
+    .join("");
+}
+
+function renderAuditLifecycleCard(lifecycle: TransactionAuditLifecycle) {
+  const signedAmount = formatSignedMoney(
+    lifecycle.amountCents,
+    lifecycle.currency,
+    lifecycle.direction,
+  );
+  const latestStep = lifecycle.steps[lifecycle.steps.length - 1];
+  return `
+    <button class="audit-row audit-lifecycle-row" type="button" data-audit-transaction="${escapeHtml(lifecycle.transactionId)}">
+      <span class="audit-dot" aria-hidden="true"></span>
+      <span class="audit-row-copy">
+        <span class="audit-row-main"><strong>${escapeHtml(lifecycle.description)}</strong><strong class="${lifecycle.direction === "expense" ? "amount-out" : "amount-in"}">${signedAmount}</strong></span>
+        <span>${lifecycle.steps.length} 个步骤 · ${latestStep ? escapeHtml(auditActionLabel(latestStep.action)) : "生命周期"} · ${formatDate(lifecycle.latestAt)}</span>
+        <span>发生于 ${formatDate(lifecycle.occurredAt)} · 点击查看完整生命周期</span>
+      </span>
+    </button>
+  `;
+}
+
+function renderAuditLifecycleDetail(lifecycle: TransactionAuditLifecycle) {
+  return `
+    <section class="activity-panel audit-detail-panel" aria-label="流水生命周期">
+      <div class="section-heading audit-detail-heading">
+        <div>
+          <span class="section-kicker">Lifecycle</span>
+          <h2>${escapeHtml(lifecycle.description)}</h2>
+          <p>${formatSignedMoney(lifecycle.amountCents, lifecycle.currency, lifecycle.direction)} · 发生于 ${formatDate(lifecycle.occurredAt)}</p>
+        </div>
+        <button class="ghost-button" id="closeAuditDetailButton" type="button" title="返回审计列表" aria-label="返回审计列表"><i data-lucide="arrow-left" aria-hidden="true"></i>返回</button>
+      </div>
+      <div class="audit-lifecycle-summary">
+        <span>审批：${approvalStateLabel(lifecycle.approvalState)}</span>
+        <span>付款：${paymentStateLabel(lifecycle.paymentState)}</span>
+        <span>${lifecycle.steps.length} 个审计步骤</span>
+      </div>
+      <div class="audit-timeline">
+        ${lifecycle.steps
+          .map(
+            (step, index) => `
+              <article class="audit-timeline-step">
+                <span class="audit-dot" aria-hidden="true"></span>
+                <div>
+                  <h3>${escapeHtml(auditActionLabel(step.action))}</h3>
+                  <p>${escapeHtml(step.actorName)} · ${formatDate(step.createdAt)}</p>
+                  <p>${escapeHtml(step.summary)}</p>
+                </div>
+                <span class="audit-step-index">${index + 1}</span>
+              </article>
+            `,
+          )
+          .join("")}
       </div>
     </section>
   `;
@@ -2355,9 +2649,13 @@ function renderBottomNav(dashboard: LedgerDashboard) {
       ${renderNavButton("activity", "流水", dashboard.recentTransactions.length)}
       ${canViewAnalysis ? renderNavButton("analysis", "分析") : ""}
       ${dashboard.ledger.role === "business_owner" ? renderNavButton("approval", "审批", dashboard.approvalQueue.length) : ""}
-      ${renderNavButton("audit", "审计", dashboard.auditTrail.length)}
+      ${renderNavButton("audit", "审计", auditLifecycleCount(dashboard))}
     </nav>
   `;
+}
+
+function auditLifecycleCount(dashboard: LedgerDashboard) {
+  return new Set(dashboard.auditTrail.map((item) => item.resourceId)).size;
 }
 
 function renderNavButton(view: ViewMode, label: string, count?: number) {
@@ -2548,6 +2846,59 @@ function bindEvents() {
 
   app.querySelector<HTMLSelectElement>("#activityMonthSelect")?.addEventListener("change", (event) => {
     void loadActivityMonth((event.currentTarget as HTMLSelectElement).value);
+  });
+
+  app.querySelector<HTMLInputElement>("#activityDaySelect")?.addEventListener("change", (event) => {
+    const day = (event.currentTarget as HTMLInputElement).value;
+    if (day) void loadActivityDay(day);
+  });
+
+  app.querySelectorAll<HTMLButtonElement>("[data-activity-granularity]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const granularity = button.dataset.activityGranularity;
+      if (granularity === "day" || granularity === "month") {
+        void changeActivityGranularity(granularity);
+      }
+    });
+  });
+
+  app.querySelectorAll<HTMLButtonElement>("[data-audit-granularity]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const granularity = button.dataset.auditGranularity;
+      if (granularity === "day" || granularity === "month") {
+        const period = granularity === "day" ? currentDayKey() : currentMonthKey();
+        setAuditPeriod(granularity, period);
+      }
+    });
+  });
+
+  app.querySelector<HTMLInputElement>("#auditDaySelect")?.addEventListener("change", (event) => {
+    const period = (event.currentTarget as HTMLInputElement).value;
+    if (period) setAuditPeriod("day", period);
+  });
+
+  app.querySelector<HTMLInputElement>("#auditMonthSelect")?.addEventListener("change", (event) => {
+    const period = (event.currentTarget as HTMLInputElement).value;
+    if (period) setAuditPeriod("month", period);
+  });
+
+  app.querySelectorAll<HTMLButtonElement>("[data-audit-transaction]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const transactionId = button.dataset.auditTransaction;
+      if (transactionId) {
+        state.auditDetailTransactionId = transactionId;
+        render();
+      }
+    });
+  });
+
+  app.querySelector<HTMLButtonElement>("#closeAuditDetailButton")?.addEventListener("click", () => {
+    state.auditDetailTransactionId = undefined;
+    render();
+  });
+
+  app.querySelector<HTMLButtonElement>("#retryAuditButton")?.addEventListener("click", () => {
+    void loadAuditPeriod(true);
   });
 
   app.querySelectorAll<HTMLButtonElement>("[data-view-target]").forEach((button) => {
@@ -2762,6 +3113,7 @@ async function saveCategory() {
     state.dashboard = await cloudLedgerApi.getLedgerDashboard(
       dashboard.ledger.id,
       state.activityMonth,
+      state.activityGranularity === "day" ? state.activityDay : undefined,
     );
     rememberDashboard(state.dashboard);
     state.form.categoryId = category.id;
@@ -2896,14 +3248,25 @@ async function queueOfflineTransaction(draft: NewTransactionDraft, clientMutatio
     memo: draft.memo,
     auditRequired: dashboard.ledger.kind === "organization",
   };
+  const targetDay = transactionDayKey(draft.occurredAt);
+  const shouldShowLocally =
+    dashboard.selectedTransactionMonth === targetMonth &&
+    (!dashboard.selectedTransactionDay || dashboard.selectedTransactionDay === targetDay);
   const updatedDashboard: LedgerDashboard = {
     ...dashboard,
-    recentTransactions: [localTransaction, ...dashboard.recentTransactions],
+    recentTransactions: shouldShowLocally
+      ? [localTransaction, ...dashboard.recentTransactions]
+      : dashboard.recentTransactions,
     availableTransactionMonths: dashboard.availableTransactionMonths.includes(
       transactionMonthKey(draft.occurredAt),
     )
       ? dashboard.availableTransactionMonths
       : [transactionMonthKey(draft.occurredAt), ...dashboard.availableTransactionMonths],
+    availableTransactionDays:
+      dashboard.selectedTransactionMonth === targetMonth &&
+      !dashboard.availableTransactionDays.includes(targetDay)
+        ? [targetDay, ...dashboard.availableTransactionDays]
+        : dashboard.availableTransactionDays,
   };
   state.dashboard = updatedDashboard;
   state.activityMonth = targetMonth;
@@ -3050,11 +3413,32 @@ function formatPeriodMonth(value: string) {
 }
 
 function currentMonthKey() {
-  return transactionMonthKey(new Date().toISOString());
+  return transactionDayKey(new Date().toISOString()).slice(0, 7);
 }
 
 function transactionMonthKey(value: string) {
-  return value.slice(0, 7);
+  return transactionDayKey(value).slice(0, 7);
+}
+
+function transactionDayKey(value: string) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(value));
+  const get = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((part) => part.type === type)?.value ?? "";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+function currentDayKey() {
+  return transactionDayKey(new Date().toISOString());
+}
+
+function formatDayLabel(day: string) {
+  const [year, month, date] = day.split("-");
+  return `${year}年${Number(month)}月${Number(date)}日`;
 }
 
 function formatMonthLabel(month: string) {
@@ -3134,6 +3518,27 @@ function auditActionLabel(action: LedgerDashboard["auditTrail"][number]["action"
   };
 
   return labels[action];
+}
+
+function approvalStateLabel(stateValue: ApprovalState) {
+  const labels: Record<ApprovalState, string> = {
+    draft: "草稿",
+    pending: "待审批",
+    approved: "已批准",
+    rejected: "已驳回",
+    deleted: "已作废",
+  };
+  return labels[stateValue];
+}
+
+function paymentStateLabel(stateValue: LedgerDashboard["recentTransactions"][number]["paymentState"]) {
+  const labels = {
+    not_applicable: "无需付款",
+    pending_payment: "待打款",
+    paid_pending_receipt: "待确认收款",
+    received: "已完成",
+  } as const;
+  return labels[stateValue];
 }
 
 function userInitial(displayName: string) {

@@ -1,5 +1,6 @@
 import type {
   AccountDto,
+  AuditPeriodDto,
   AuditLogDto,
   CategoryDto,
   FinancialAnalysisDto,
@@ -17,6 +18,7 @@ import type {
   AnalysisMonths,
   AuthSession,
   AuditLogEntry,
+  AuditPeriod,
   Category,
   FinancialAccount,
   FinancialAnalysis,
@@ -40,7 +42,12 @@ export interface CloudLedgerApi {
   getUserSession(): Promise<UserSession>;
   checkCloudStatus(): Promise<UserSession["cloudStatus"]>;
   listLedgers(): Promise<Ledger[]>;
-  getLedgerDashboard(ledgerId: string, month?: string): Promise<LedgerDashboard>;
+  getLedgerDashboard(ledgerId: string, month?: string, day?: string): Promise<LedgerDashboard>;
+  getAuditPeriod(
+    ledgerId: string,
+    granularity: AuditPeriod["granularity"],
+    period: string,
+  ): Promise<AuditPeriod>;
   getFinancialAnalysis(ledgerId: string, months: AnalysisMonths): Promise<FinancialAnalysis>;
   getFinancialMonthDetail(ledgerId: string, month: string): Promise<FinancialMonthDetail>;
   getFinancialMemberDetail(
@@ -202,13 +209,21 @@ const serverApi: CloudLedgerApi = {
     return overview.ledgers.map((ledger) => mapLedger(ledger, overview));
   },
 
-  async getLedgerDashboard(ledgerId, month) {
+  async getLedgerDashboard(ledgerId, month, day) {
     const overview = await getOverview();
     const monthQuery = month ? `&month=${encodeURIComponent(month)}` : "";
+    const dayQuery = day ? `&day=${encodeURIComponent(day)}` : "";
     const transactionMonth = await authenticatedJson<TransactionMonthDto>(
-      `/app/transactions?ledgerId=${encodeURIComponent(ledgerId)}${monthQuery}`,
+      `/app/transactions?ledgerId=${encodeURIComponent(ledgerId)}${monthQuery}${dayQuery}`,
     );
     return mapDashboard(ledgerId, overview, transactionMonth);
+  },
+
+  async getAuditPeriod(ledgerId, granularity, period) {
+    const audit = await authenticatedJson<AuditPeriodDto>(
+      `/app/audit-period?ledgerId=${encodeURIComponent(ledgerId)}&granularity=${granularity}&period=${encodeURIComponent(period)}`,
+    );
+    return mapAuditPeriod(audit);
   },
 
   async getFinancialAnalysis(ledgerId, months) {
@@ -543,8 +558,20 @@ function getInstallationId() {
   return created;
 }
 
+const beijingDateFormatter = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Asia/Shanghai",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
 const nowIso = () => new Date().toISOString();
-const transactionMonthKey = (value: string) => value.slice(0, 7);
+const transactionDayKey = (value: string) => {
+  const parts = beijingDateFormatter.formatToParts(new Date(value));
+  const get = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((part) => part.type === type)?.value ?? "";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+};
+const transactionMonthKey = (value: string) => transactionDayKey(value).slice(0, 7);
 const currentMonthKey = () => transactionMonthKey(nowIso());
 const mockEmployeeMode = import.meta.env.VITE_CLOUDLEDGER_MOCK_ROLE === "employee";
 
@@ -831,7 +858,7 @@ const mockApi: CloudLedgerApi = {
     return mockLedgers;
   },
 
-  async getLedgerDashboard(ledgerId, month) {
+  async getLedgerDashboard(ledgerId, month, day) {
     const ledger = mockLedgers.find((item) => item.id === ledgerId) ?? mockLedgers[0];
     const selectedMonth = month ?? currentMonthKey();
     const visibleTransactions = mockTransactions.filter(
@@ -845,14 +872,27 @@ const mockApi: CloudLedgerApi = {
     const availableTransactionMonths = Array.from(
       new Set(visibleTransactions.map((item) => transactionMonthKey(item.occurredAt))),
     ).sort((left, right) => right.localeCompare(left));
+    const availableTransactionDays = Array.from(
+      new Set(
+        visibleTransactions
+          .filter((item) => transactionMonthKey(item.occurredAt) === selectedMonth)
+          .map((item) => transactionDayKey(item.occurredAt)),
+      ),
+    ).sort((left, right) => right.localeCompare(left));
     return {
       ledger,
       accounts: mockAccounts.filter((item) => item.ledgerId === ledger.id),
       categories: mockCategories.filter((item) => item.ledgerId === ledger.id),
       selectedTransactionMonth: selectedMonth,
       availableTransactionMonths,
+      selectedTransactionDay: day,
+      availableTransactionDays,
       recentTransactions: visibleTransactions
-        .filter((item) => transactionMonthKey(item.occurredAt) === selectedMonth)
+        .filter(
+          (item) =>
+            transactionMonthKey(item.occurredAt) === selectedMonth &&
+            (!day || transactionDayKey(item.occurredAt) === day),
+        )
         .sort((a, b) => Date.parse(b.occurredAt) - Date.parse(a.occurredAt)),
       approvalQueue: mockApprovalQueue.filter(
         (item) =>
@@ -862,6 +902,76 @@ const mockApi: CloudLedgerApi = {
       auditTrail: mockAuditTrail.filter(
         (item) => item.ledgerId === ledger.id && visibleTransactionIds.has(item.resourceId),
       ),
+    };
+  },
+
+  async getAuditPeriod(ledgerId, granularity, period) {
+    const ledger = mockLedgers.find((item) => item.id === ledgerId) ?? mockLedgers[0];
+    const visibleTransactionIds = new Set(
+      mockTransactions
+        .filter(
+          (item) =>
+            item.ledgerId === ledger.id &&
+            (ledger.kind !== "organization" ||
+              ledger.role === "business_owner" ||
+              item.createdByUserId === "demo-user"),
+        )
+        .map((item) => item.id),
+    );
+    const grouped = new Map<string, AuditLogEntry[]>();
+    for (const entry of mockAuditTrail) {
+      if (entry.ledgerId !== ledger.id || !visibleTransactionIds.has(entry.resourceId)) continue;
+      const steps = grouped.get(entry.resourceId) ?? [];
+      steps.push(entry);
+      grouped.set(entry.resourceId, steps);
+    }
+    const lifecycles = Array.from(grouped.entries())
+      .map(([transactionId, steps]) => {
+        const transaction = mockTransactions.find((item) => item.id === transactionId);
+        if (!transaction) return undefined;
+        const orderedSteps = [...steps].sort(
+          (left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt),
+        );
+        const latestAt = orderedSteps[orderedSteps.length - 1]?.createdAt;
+        if (!latestAt) return undefined;
+        const latestPeriod = granularity === "day" ? transactionDayKey(latestAt) : transactionMonthKey(latestAt);
+        if (latestPeriod !== period) return undefined;
+        return {
+          transactionId,
+          description: transaction.title,
+          direction: transaction.direction,
+          amountCents: transaction.amountCents,
+          currency: ledger.currency,
+          occurredAt: transaction.occurredAt,
+          approvalState: transaction.approvalState,
+          paymentState: transaction.paymentState,
+          latestAt,
+          steps: orderedSteps,
+        };
+      })
+      .filter((item): item is NonNullable<typeof item> => Boolean(item))
+      .sort((left, right) => Date.parse(right.latestAt) - Date.parse(left.latestAt));
+    const availableMonths = Array.from(
+      new Set(
+        Array.from(grouped.values()).map((steps) =>
+          transactionMonthKey(steps.reduce((latest, item) => (item.createdAt > latest.createdAt ? item : latest)).createdAt),
+        ),
+      ),
+    ).sort((left, right) => right.localeCompare(left));
+    const availableDays = Array.from(
+      new Set(
+        Array.from(grouped.values()).map((steps) =>
+          transactionDayKey(steps.reduce((latest, item) => (item.createdAt > latest.createdAt ? item : latest)).createdAt),
+        ),
+      ),
+    ).sort((left, right) => right.localeCompare(left));
+    return {
+      ledgerId,
+      granularity,
+      period,
+      availableMonths,
+      availableDays,
+      lifecycles,
     };
   },
 
@@ -1462,7 +1572,9 @@ function mapDashboard(
     accounts,
     categories,
     selectedTransactionMonth: transactionMonth.month,
+    selectedTransactionDay: transactionMonth.day,
     availableTransactionMonths: transactionMonth.availableMonths,
+    availableTransactionDays: transactionMonth.availableDays,
     recentTransactions,
     approvalQueue: mapApprovalQueue(ledger.id, overview).sort(
       (a, b) => Date.parse(b.submittedAt) - Date.parse(a.submittedAt),
@@ -1628,6 +1740,28 @@ function mapAuditLog(entry: AuditLogDto): AuditLogEntry {
     resourceId: entry.resourceId,
     createdAt: entry.createdAt,
     summary: entry.summary,
+  };
+}
+
+function mapAuditPeriod(audit: AuditPeriodDto): AuditPeriod {
+  return {
+    ledgerId: audit.ledgerId,
+    granularity: audit.granularity,
+    period: audit.period,
+    availableMonths: audit.availableMonths,
+    availableDays: audit.availableDays,
+    lifecycles: audit.lifecycles.map((lifecycle) => ({
+      transactionId: lifecycle.transactionId,
+      description: lifecycle.description,
+      direction: lifecycle.kind === "income" ? "income" : "expense",
+      amountCents: lifecycle.amountMinor,
+      currency: lifecycle.currency,
+      occurredAt: lifecycle.occurredAt,
+      approvalState: normalizeApprovalState(lifecycle.approvalState),
+      paymentState: lifecycle.paymentState,
+      latestAt: lifecycle.latestAt,
+      steps: lifecycle.steps.map(mapAuditLog),
+    })),
   };
 }
 

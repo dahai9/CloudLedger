@@ -84,8 +84,34 @@ export interface LedgerOverview {
 export interface TransactionMonthDto {
   ledgerId: string;
   month: string;
+  day?: string;
   availableMonths: string[];
+  availableDays: string[];
   transactions: TransactionDto[];
+}
+
+export type AuditPeriodGranularityDto = "day" | "month";
+
+export interface AuditPeriodDto {
+  ledgerId: string;
+  granularity: AuditPeriodGranularityDto;
+  period: string;
+  availableMonths: string[];
+  availableDays: string[];
+  lifecycles: TransactionAuditLifecycleDto[];
+}
+
+export interface TransactionAuditLifecycleDto {
+  transactionId: string;
+  description: string;
+  kind: TransactionKind;
+  amountMinor: number;
+  currency: string;
+  occurredAt: string;
+  approvalState: ApprovalState;
+  paymentState: PaymentState;
+  latestAt: string;
+  steps: AuditLogDto[];
 }
 
 export interface FinancialAnalysisDto {
@@ -262,8 +288,17 @@ export async function createTransaction(
 export async function loadTransactionsForMonth(
   ledgerId: string,
   month?: string,
+  day?: string,
 ): Promise<TransactionMonthDto> {
-  return invoke<TransactionMonthDto>("get_transactions_for_month", { ledgerId, month });
+  return invoke<TransactionMonthDto>("get_transactions_for_month", { ledgerId, month, day });
+}
+
+export async function loadAuditPeriod(
+  ledgerId: string,
+  granularity: AuditPeriodGranularityDto,
+  period: string,
+): Promise<AuditPeriodDto> {
+  return invoke<AuditPeriodDto>("get_audit_period", { ledgerId, granularity, period });
 }
 
 export async function createCategory(input: CreateCategoryInput): Promise<CategoryDto> {

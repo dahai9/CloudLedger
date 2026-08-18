@@ -3,8 +3,9 @@ use std::{path::PathBuf, sync::Mutex};
 use cloudledger_service::{
     AppConfirmTransactionReceiptInput, AppCreateCategoryInput, AppCreateTransactionInput,
     AppDecideApprovalInput, AppLedgerService, AppMarkTransactionPaidInput, AppServiceError,
-    CategoryDto, FinancialAnalysisDto, FinancialMemberDetailDto, FinancialMonthDetailDto,
-    LedgerOverview, TransactionDto, TransactionMonthDto,
+    AuditPeriodDto, AuditPeriodGranularity, CategoryDto, FinancialAnalysisDto,
+    FinancialMemberDetailDto, FinancialMonthDetailDto, LedgerOverview, TransactionDto,
+    TransactionMonthDto,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
@@ -173,13 +174,40 @@ fn get_transactions_for_month(
     state: State<'_, AppState>,
     ledger_id: Uuid,
     month: Option<String>,
+    day: Option<String>,
 ) -> Result<TransactionMonthDto, String> {
     let service = state
         .ledger_service
         .lock()
         .map_err(|_| "ledger service lock poisoned".to_string())?;
+    match day.as_deref() {
+        Some(day) => service
+            .transactions_for_day(service.current_user_id(), ledger_id, month.as_deref(), day)
+            .map_err(service_error),
+        None => service
+            .transactions_for_month(service.current_user_id(), ledger_id, month.as_deref())
+            .map_err(service_error),
+    }
+}
+
+#[tauri::command]
+fn get_audit_period(
+    state: State<'_, AppState>,
+    ledger_id: Uuid,
+    granularity: String,
+    period: String,
+) -> Result<AuditPeriodDto, String> {
+    let granularity = match granularity.as_str() {
+        "day" => AuditPeriodGranularity::Day,
+        "month" => AuditPeriodGranularity::Month,
+        _ => return Err(service_error(AppServiceError::InvalidAuditGranularity)),
+    };
+    let service = state
+        .ledger_service
+        .lock()
+        .map_err(|_| "ledger service lock poisoned".to_string())?;
     service
-        .transactions_for_month(service.current_user_id(), ledger_id, month.as_deref())
+        .audit_period(service.current_user_id(), ledger_id, granularity, &period)
         .map_err(service_error)
 }
 
@@ -302,6 +330,7 @@ pub fn run() {
             get_financial_month_detail,
             get_financial_member_detail,
             get_transactions_for_month,
+            get_audit_period,
             create_category,
             create_transaction,
             decide_approval,

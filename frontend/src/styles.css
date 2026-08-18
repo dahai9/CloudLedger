@@ -1055,7 +1055,7 @@ button:not(:disabled):active {
 
 .activity-month-bar {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 10px;
   margin: 0 12px 10px;
@@ -1080,6 +1080,42 @@ button:not(:disabled):active {
   padding: 0 10px;
   border: 1px solid var(--line);
   border-radius: 8px;
+  background: #fff;
+  color: var(--ink);
+}
+
+.activity-month-bar input[type="date"],
+.activity-month-bar input[type="month"] {
+  width: 100%;
+  min-width: 0;
+  min-height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--ink);
+}
+
+.period-toggle {
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(34px, 1fr));
+  gap: 3px;
+  padding: 3px;
+  border-radius: 8px;
+  background: #eef2ea;
+}
+
+.period-button {
+  min-height: 30px;
+  padding: 0 9px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.period-button.is-active {
   background: #fff;
   color: var(--ink);
 }
@@ -1271,6 +1307,9 @@ button:not(:disabled):active {
   grid-template-columns: 12px 1fr;
   gap: 10px;
   padding: 12px;
+  width: 100%;
+  text-align: left;
+  font: inherit;
 }
 
 .audit-dot {
@@ -1279,6 +1318,114 @@ button:not(:disabled):active {
   margin-top: 4px;
   border-radius: 999px;
   background: var(--blue);
+}
+
+.audit-day-group {
+  display: grid;
+  gap: 8px;
+}
+
+.audit-day-heading {
+  margin: 8px 2px 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.audit-lifecycle-row {
+  cursor: pointer;
+  transition: border-color 160ms ease, transform 160ms ease;
+}
+
+.audit-lifecycle-row:hover,
+.audit-lifecycle-row:focus-visible {
+  border-color: var(--blue);
+  transform: translateY(-1px);
+}
+
+.audit-row-copy {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.audit-row-copy > span:not(.audit-row-main) {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.audit-row-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.audit-state {
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+  padding: 18px 12px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.audit-detail-heading {
+  align-items: flex-start;
+}
+
+.audit-detail-heading p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.audit-lifecycle-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 12px 12px;
+}
+
+.audit-lifecycle-summary span {
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: #eef2ea;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.audit-timeline {
+  display: grid;
+  gap: 10px;
+  padding: 0 12px 18px;
+}
+
+.audit-timeline-step {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.audit-timeline-step h3 {
+  font-size: 14px;
+}
+
+.audit-timeline-step p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.audit-step-index {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
 }
 
 .count-badge {
@@ -1982,6 +2129,20 @@ button:not(:disabled):active {
 }
 
 @media (max-width: 420px) {
+  .activity-month-bar {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  .activity-month-bar .period-toggle {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+
+  .activity-month-bar > span {
+    align-self: center;
+    text-align: right;
+  }
+
   .activity-panel > .section-heading {
     align-items: stretch;
     flex-direction: column;

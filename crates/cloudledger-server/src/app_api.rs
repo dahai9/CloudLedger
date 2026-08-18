@@ -5,9 +5,9 @@ use axum::{
 };
 use cloudledger_service::{
     AppConfirmTransactionReceiptInput, AppCreateCategoryInput, AppCreateTransactionInput,
-    AppDecideApprovalInput, AppMarkTransactionPaidInput, CategoryDto, FinancialAnalysisDto,
-    FinancialMemberDetailDto, FinancialMonthDetailDto, LedgerOverview, TransactionDto,
-    TransactionMonthDto,
+    AppDecideApprovalInput, AppMarkTransactionPaidInput, AuditPeriodDto, AuditPeriodGranularity,
+    CategoryDto, FinancialAnalysisDto, FinancialMemberDetailDto, FinancialMonthDetailDto,
+    LedgerOverview, TransactionDto, TransactionMonthDto,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -27,6 +27,15 @@ pub struct FinancialAnalysisQuery {
 pub struct TransactionMonthQuery {
     pub ledger_id: Uuid,
     pub month: Option<String>,
+    pub day: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditPeriodQuery {
+    pub ledger_id: Uuid,
+    pub granularity: String,
+    pub period: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,9 +136,43 @@ pub async fn transactions_for_month(
         .ledger_service
         .lock()
         .map_err(|_| ApiError::internal("ledger service lock poisoned"))?;
+    Ok(Json(match query.day.as_deref() {
+        Some(day) => service
+            .transactions_for_day(
+                session.user.id,
+                query.ledger_id,
+                query.month.as_deref(),
+                day,
+            )
+            .map_err(ApiError::from_service)?,
+        None => service
+            .transactions_for_month(session.user.id, query.ledger_id, query.month.as_deref())
+            .map_err(ApiError::from_service)?,
+    }))
+}
+
+pub async fn audit_period(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<AuditPeriodQuery>,
+) -> Result<Json<AuditPeriodDto>, ApiError> {
+    let session = auth_routes::authenticate(&state, &headers)?;
+    let granularity = match query.granularity.as_str() {
+        "day" => AuditPeriodGranularity::Day,
+        "month" => AuditPeriodGranularity::Month,
+        _ => {
+            return Err(ApiError::from_service(
+                cloudledger_service::AppServiceError::InvalidAuditGranularity,
+            ))
+        }
+    };
+    let service = state
+        .ledger_service
+        .lock()
+        .map_err(|_| ApiError::internal("ledger service lock poisoned"))?;
     Ok(Json(
         service
-            .transactions_for_month(session.user.id, query.ledger_id, query.month.as_deref())
+            .audit_period(session.user.id, query.ledger_id, granularity, &query.period)
             .map_err(ApiError::from_service)?,
     ))
 }

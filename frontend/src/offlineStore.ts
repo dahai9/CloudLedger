@@ -1,11 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Ledger, LedgerDashboard, OfflineTransaction, UserAccount } from "./types";
+import type { AuditPeriod, Ledger, LedgerDashboard, OfflineTransaction, UserAccount } from "./types";
 
 export interface OfflineSnapshot {
-  version: 2;
+  version: 3;
   user: UserAccount;
   ledgers: Ledger[];
   dashboards: Record<string, LedgerDashboard>;
+  auditPeriods: Record<string, AuditPeriod>;
   activeLedgerId?: string;
   activityMonth: string;
   outbox: OfflineTransaction[];
@@ -63,10 +64,11 @@ function isOfflineSnapshot(value: unknown): value is OfflineSnapshot {
   if (!value || typeof value !== "object") return false;
   const snapshot = value as Partial<OfflineSnapshot>;
   return (
-    snapshot.version === 2 &&
+    snapshot.version === 3 &&
     Boolean(snapshot.user?.id) &&
     Array.isArray(snapshot.ledgers) &&
     Boolean(snapshot.dashboards) &&
+    Boolean(snapshot.auditPeriods) &&
     Array.isArray(snapshot.outbox) &&
     typeof snapshot.activityMonth === "string"
   );
@@ -104,14 +106,14 @@ async function browserClear(userId: string): Promise<void> {
 
 function openDatabase(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const open = indexedDB.open(databaseName, 2);
+    const open = indexedDB.open(databaseName, 3);
     open.onupgradeneeded = (event) => {
       const database = open.result;
       if (!database.objectStoreNames.contains(storeName)) {
         database.createObjectStore(storeName);
         return;
       }
-      if ((event as IDBVersionChangeEvent).oldVersion < 2) {
+      if ((event as IDBVersionChangeEvent).oldVersion < 3) {
         open.transaction?.objectStore(storeName).clear();
       }
     };

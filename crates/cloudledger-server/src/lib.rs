@@ -95,6 +95,7 @@ pub fn router(state: ServerState) -> Router {
             "/app/analytics/member-detail",
             get(app_api::financial_member_detail),
         )
+        .route("/app/audit-period", get(app_api::audit_period))
         .route(
             "/app/transactions",
             get(app_api::transactions_for_month).post(app_api::create_transaction),
