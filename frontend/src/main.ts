@@ -30,6 +30,14 @@ type AnalysisDetailTarget =
 type TransactionFilter = "all" | "pending" | "approved" | "rejected";
 type AuthStatus = "checking" | "authenticated" | "anonymous";
 type SyncPhase = "idle" | "connecting" | "syncing" | "success" | "failed";
+type DatePickerScope = "activity" | "audit";
+
+interface DatePickerState {
+  scope: DatePickerScope;
+  granularity: PeriodGranularity;
+  draft: string;
+  viewMonth: string;
+}
 
 interface SyncState {
   phase: SyncPhase;
@@ -92,6 +100,7 @@ interface AppState {
   activityGranularity: PeriodGranularity;
   auditGranularity: PeriodGranularity;
   auditPeriod: string;
+  datePicker?: DatePickerState;
   auditData?: AuditPeriod;
   auditLoading: boolean;
   auditError?: string;
@@ -241,7 +250,14 @@ document.addEventListener("click", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && state.userMenuOpen) {
+  if (event.key !== "Escape") {
+    return;
+  }
+  if (state.datePicker) {
+    closeDatePicker();
+    return;
+  }
+  if (state.userMenuOpen) {
     closeUserMenu();
     app.querySelector<HTMLButtonElement>("#userMenuButton")?.focus();
   }
@@ -392,6 +408,7 @@ async function logout() {
   const userId = state.currentUser?.id;
   try {
     state.loading = true;
+    state.datePicker = undefined;
     state.userMenuOpen = false;
     state.profileEditing = false;
     render();
@@ -447,6 +464,7 @@ async function switchLedger(ledgerId: string) {
   }
   try {
     state.loading = true;
+    state.datePicker = undefined;
     state.activeLedgerId = ledgerId;
     state.activityMonth = currentMonthKey();
     state.activityDay = currentDayKey();
@@ -565,11 +583,199 @@ async function changeActivityGranularity(granularity: PeriodGranularity) {
   await loadActivityDay(day, true);
 }
 
+function openDatePicker(scope: DatePickerScope, granularity: PeriodGranularity) {
+  const value =
+    scope === "activity"
+      ? granularity === "day"
+        ? state.activityDay
+        : state.activityMonth
+      : state.auditPeriod;
+  const draft = value || (granularity === "day" ? currentDayKey() : currentMonthKey());
+  state.datePicker = {
+    scope,
+    granularity,
+    draft,
+    viewMonth: granularity === "day" ? draft.slice(0, 7) : draft,
+  };
+  render();
+  window.requestAnimationFrame(() => {
+    app.querySelector<HTMLButtonElement>("#datePickerDialog [data-picker-close]")?.focus();
+  });
+}
+
+function closeDatePicker() {
+  if (!state.datePicker) return;
+  state.datePicker = undefined;
+  render();
+}
+
+function updateDatePickerDraft(value: string) {
+  const picker = state.datePicker;
+  if (!picker) return;
+  state.datePicker = {
+    ...picker,
+    draft: value,
+    viewMonth: picker.granularity === "day" ? value.slice(0, 7) : value,
+  };
+  render();
+}
+
+function navigateDatePicker(direction: "previous" | "next") {
+  const picker = state.datePicker;
+  if (!picker) return;
+  const delta = direction === "previous" ? -1 : 1;
+  state.datePicker = {
+    ...picker,
+    viewMonth: shiftMonthKey(picker.viewMonth, picker.granularity === "month" ? delta * 12 : delta),
+  };
+  render();
+}
+
+function setDatePickerToday() {
+  const picker = state.datePicker;
+  if (!picker) return;
+  const value = picker.granularity === "day" ? currentDayKey() : currentMonthKey();
+  updateDatePickerDraft(value);
+}
+
+function confirmDatePicker() {
+  const picker = state.datePicker;
+  if (!picker) return;
+  state.datePicker = undefined;
+  render();
+  if (picker.scope === "activity") {
+    if (picker.granularity === "day") {
+      void loadActivityDay(picker.draft);
+    } else {
+      void loadActivityMonth(picker.draft);
+    }
+    return;
+  }
+  setAuditPeriod(picker.granularity, picker.draft);
+}
+
+function renderDatePicker() {
+  const picker = state.datePicker;
+  if (!picker) return "";
+  const title = picker.granularity === "day" ? "选择日期" : "选择月份";
+  const selection =
+    picker.granularity === "day" ? formatDayLabel(picker.draft) : formatMonthLabel(picker.draft);
+  const context = picker.scope === "activity" ? "流水" : "审计";
+  const availableMonths =
+    picker.scope === "activity" ? state.dashboard?.availableTransactionMonths ?? [] : [];
+  const helper =
+    picker.granularity === "day"
+      ? picker.scope === "activity"
+        ? `${state.dashboard?.availableTransactionDays.length ?? 0} 个有流水日期`
+        : "生命周期记录"
+      : picker.scope === "activity"
+        ? `${availableMonths.length} 个可查看月份`
+        : "审计记录";
+
+  return `
+    <div class="date-picker-backdrop" data-picker-backdrop>
+      <section class="date-picker-dialog" id="datePickerDialog" role="dialog" aria-modal="true" aria-labelledby="datePickerTitle">
+        <header class="date-picker-header">
+          <div class="date-picker-title-wrap">
+            <span class="date-picker-icon" aria-hidden="true"><i data-lucide="${picker.granularity === "day" ? "calendar-days" : "calendar-range"}"></i></span>
+            <div>
+              <span class="date-picker-context">${context} · 时间范围</span>
+              <h2 id="datePickerTitle">${title}</h2>
+            </div>
+          </div>
+          <button class="date-picker-close" type="button" data-picker-close aria-label="关闭日期选择器" title="关闭"><i data-lucide="x"></i></button>
+        </header>
+        <div class="date-picker-selection">
+          <span>当前选择</span>
+          <strong>${escapeHtml(selection)}</strong>
+          <small>${escapeHtml(helper)}</small>
+        </div>
+        <div class="date-picker-content">
+          ${picker.granularity === "day" ? renderDatePickerDayGrid(picker) : renderDatePickerMonthGrid(picker)}
+        </div>
+        <footer class="date-picker-footer">
+          <button class="date-picker-secondary" type="button" data-picker-today>${picker.granularity === "day" ? "今天" : "本月"}</button>
+          <div class="date-picker-footer-actions">
+            <button class="date-picker-secondary" type="button" data-picker-close>取消</button>
+            <button class="date-picker-primary" type="button" data-picker-confirm>确定</button>
+          </div>
+        </footer>
+      </section>
+    </div>
+  `;
+}
+
+function renderDatePickerMonthGrid(picker: DatePickerState) {
+  const year = Number(picker.viewMonth.slice(0, 4));
+  const available = new Set(
+    picker.scope === "activity" ? state.dashboard?.availableTransactionMonths ?? [] : [],
+  );
+  const months = Array.from({ length: 12 }, (_, index) => {
+    const month = `${year}-${String(index + 1).padStart(2, "0")}`;
+    const disabled = picker.scope === "activity" && !available.has(month) && picker.draft !== month;
+    const active = picker.draft === month;
+    return `
+      <button class="date-picker-month ${active ? "is-selected" : ""}" type="button" data-picker-value="${month}" aria-pressed="${active}" ${disabled ? "disabled" : ""}>
+        <strong>${index + 1}月</strong>
+        <span>${disabled ? "暂无流水" : picker.scope === "activity" ? "可查看" : "审计记录"}</span>
+      </button>
+    `;
+  }).join("");
+  return `
+    <div class="date-picker-period-heading">
+      <button class="date-picker-nav" type="button" data-picker-nav="previous" aria-label="上一年" title="上一年"><i data-lucide="chevron-left"></i></button>
+      <strong>${year}年</strong>
+      <button class="date-picker-nav" type="button" data-picker-nav="next" aria-label="下一年" title="下一年"><i data-lucide="chevron-right"></i></button>
+    </div>
+    <div class="date-picker-month-grid" role="grid" aria-label="${year}年月份">
+      ${months}
+    </div>
+  `;
+}
+
+function renderDatePickerDayGrid(picker: DatePickerState) {
+  const month = picker.viewMonth;
+  const year = Number(month.slice(0, 4));
+  const monthNumber = Number(month.slice(5, 7));
+  const firstWeekday = new Date(Date.UTC(year, monthNumber - 1, 1)).getUTCDay();
+  const dayCount = daysInMonthKey(month);
+  const available =
+    picker.scope === "activity" && state.dashboard?.selectedTransactionMonth === month
+      ? new Set(state.dashboard.availableTransactionDays)
+      : undefined;
+  const cells = Array.from({ length: firstWeekday }, () => '<span class="date-picker-day is-empty" aria-hidden="true"></span>');
+  for (let day = 1; day <= dayCount; day += 1) {
+    const value = `${month}-${String(day).padStart(2, "0")}`;
+    const active = picker.draft === value;
+    const today = currentDayKey() === value;
+    const hasData = available?.has(value) ?? false;
+    cells.push(`
+      <button class="date-picker-day ${active ? "is-selected" : ""} ${today ? "is-today" : ""}" type="button" data-picker-value="${value}" aria-label="${formatDayLabel(value)}" aria-pressed="${active}">
+        <span>${day}</span>${hasData ? '<i class="date-picker-day-dot" aria-label="有流水"></i>' : ""}
+      </button>
+    `);
+  }
+  return `
+    <div class="date-picker-period-heading">
+      <button class="date-picker-nav" type="button" data-picker-nav="previous" aria-label="上个月" title="上个月"><i data-lucide="chevron-left"></i></button>
+      <strong>${escapeHtml(formatMonthLabel(month))}</strong>
+      <button class="date-picker-nav" type="button" data-picker-nav="next" aria-label="下个月" title="下个月"><i data-lucide="chevron-right"></i></button>
+    </div>
+    <div class="date-picker-weekdays" aria-hidden="true">
+      ${["日", "一", "二", "三", "四", "五", "六"].map((day) => `<span>${day}</span>`).join("")}
+    </div>
+    <div class="date-picker-day-grid" role="grid" aria-label="${escapeHtml(formatMonthLabel(month))}">
+      ${cells.join("")}
+    </div>
+  `;
+}
+
 async function refreshDashboard() {
   await refreshRemoteState({ silent: false, allowPending: true });
 }
 
 async function changeView(view: ViewMode) {
+  state.datePicker = undefined;
   state.view = view;
   if (view !== "audit") {
     state.auditDetailTransactionId = undefined;
@@ -1190,6 +1396,7 @@ function render() {
       }
       ${dashboard && ledger ? renderBottomNav(dashboard) : ""}
       ${state.toast ? `<div class="toast" role="status">${escapeHtml(state.toast)}</div>` : ""}
+      ${renderDatePicker()}
     </main>
   `;
 
@@ -2314,24 +2521,11 @@ function renderTransactionList(dashboard: LedgerDashboard) {
             ${renderPeriodButton("activity", "day", "日")}
           </div>
         </div>
-        <label class="activity-period-input" for="${state.activityGranularity === "day" ? "activityDaySelect" : "activityMonthSelect"}">
-          <span>${state.activityGranularity === "day" ? "选择日期" : "选择月份"}</span>
-          ${
-            state.activityGranularity === "day"
-              ? `<input id="activityDaySelect" type="date" value="${escapeHtml(state.activityDay)}" />`
-              : `<select id="activityMonthSelect" ${dashboard.availableTransactionMonths.length === 0 ? "disabled" : ""}>
-                  ${
-                    dashboard.availableTransactionMonths.length > 0
-                      ? dashboard.availableTransactionMonths
-                          .map(
-                            (month) => `<option value="${escapeHtml(month)}" ${month === dashboard.selectedTransactionMonth ? "selected" : ""}>${escapeHtml(formatMonthLabel(month))}</option>`,
-                          )
-                          .join("")
-                      : `<option value="">暂无可用月份</option>`
-                  }
-                </select>`
-          }
-        </label>
+        ${renderDatePickerTrigger(
+          "activity",
+          state.activityGranularity,
+          state.activityGranularity === "day" ? state.activityDay : state.activityMonth,
+        )}
         <span class="activity-range-note">${state.activityGranularity === "day" ? "当天流水" : "整月流水"}</span>
       </div>
       <div class="activity-filter-row">
@@ -2351,6 +2545,31 @@ function renderTransactionList(dashboard: LedgerDashboard) {
         }
       </div>
     </section>
+  `;
+}
+
+function renderDatePickerTrigger(
+  scope: DatePickerScope,
+  granularity: PeriodGranularity,
+  value: string,
+) {
+  const isDay = granularity === "day";
+  return `
+    <div class="activity-period-input">
+      <span>${isDay ? "选择日期" : "选择月份"}</span>
+      <button
+        class="date-picker-trigger"
+        type="button"
+        data-date-picker-scope="${scope}"
+        data-date-picker-granularity="${granularity}"
+        aria-haspopup="dialog"
+        aria-expanded="${state.datePicker?.scope === scope && state.datePicker.granularity === granularity}"
+      >
+        <span class="date-picker-trigger-icon" aria-hidden="true"><i data-lucide="${isDay ? "calendar-days" : "calendar-range"}"></i></span>
+        <span class="date-picker-trigger-copy"><strong>${escapeHtml(isDay ? formatDayLabel(value) : formatMonthLabel(value))}</strong><small>${isDay ? "按天查看" : "按月查看"}</small></span>
+        <i class="date-picker-trigger-chevron" data-lucide="chevron-down" aria-hidden="true"></i>
+      </button>
+    </div>
   `;
 }
 
@@ -2574,14 +2793,7 @@ function renderAuditPanel(_dashboard: LedgerDashboard) {
             ${renderPeriodButton("audit", "day", "日")}
           </div>
         </div>
-        <label class="activity-period-input" for="${state.auditGranularity === "day" ? "auditDaySelect" : "auditMonthSelect"}">
-          <span>${state.auditGranularity === "day" ? "选择日期" : "选择月份"}</span>
-          ${
-            state.auditGranularity === "day"
-              ? `<input id="auditDaySelect" type="date" value="${escapeHtml(state.auditPeriod)}" />`
-              : `<input id="auditMonthSelect" type="month" value="${escapeHtml(state.auditPeriod)}" />`
-          }
-        </label>
+        ${renderDatePickerTrigger("audit", state.auditGranularity, state.auditPeriod)}
         <span class="activity-range-note">${audit?.lifecycles.length ?? 0} 笔流水</span>
       </div>
       ${state.auditLoading ? '<div class="audit-state"><div class="spinner" aria-hidden="true"></div><p>正在加载审计生命周期</p></div>' : ""}
@@ -2882,13 +3094,35 @@ function bindEvents() {
     });
   });
 
-  app.querySelector<HTMLSelectElement>("#activityMonthSelect")?.addEventListener("change", (event) => {
-    void loadActivityMonth((event.currentTarget as HTMLSelectElement).value);
+  app.querySelectorAll<HTMLButtonElement>("[data-date-picker-scope]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const scope = button.dataset.datePickerScope;
+      const granularity = button.dataset.datePickerGranularity;
+      if ((scope === "activity" || scope === "audit") && (granularity === "day" || granularity === "month")) {
+        openDatePicker(scope, granularity);
+      }
+    });
   });
 
-  app.querySelector<HTMLInputElement>("#activityDaySelect")?.addEventListener("change", (event) => {
-    const day = (event.currentTarget as HTMLInputElement).value;
-    if (day) void loadActivityDay(day);
+  app.querySelector<HTMLElement>("[data-picker-backdrop]")?.addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeDatePicker();
+  });
+  app.querySelectorAll<HTMLButtonElement>("[data-picker-close]").forEach((button) => {
+    button.addEventListener("click", closeDatePicker);
+  });
+  app.querySelector<HTMLButtonElement>("[data-picker-confirm]")?.addEventListener("click", confirmDatePicker);
+  app.querySelector<HTMLButtonElement>("[data-picker-today]")?.addEventListener("click", setDatePickerToday);
+  app.querySelectorAll<HTMLButtonElement>("[data-picker-nav]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const direction = button.dataset.pickerNav;
+      if (direction === "previous" || direction === "next") navigateDatePicker(direction);
+    });
+  });
+  app.querySelectorAll<HTMLButtonElement>("[data-picker-value]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const value = button.dataset.pickerValue;
+      if (value) updateDatePickerDraft(value);
+    });
   });
 
   app.querySelectorAll<HTMLButtonElement>("[data-activity-granularity]").forEach((button) => {
@@ -2908,16 +3142,6 @@ function bindEvents() {
         setAuditPeriod(granularity, period);
       }
     });
-  });
-
-  app.querySelector<HTMLInputElement>("#auditDaySelect")?.addEventListener("change", (event) => {
-    const period = (event.currentTarget as HTMLInputElement).value;
-    if (period) setAuditPeriod("day", period);
-  });
-
-  app.querySelector<HTMLInputElement>("#auditMonthSelect")?.addEventListener("change", (event) => {
-    const period = (event.currentTarget as HTMLInputElement).value;
-    if (period) setAuditPeriod("month", period);
   });
 
   app.querySelectorAll<HTMLButtonElement>("[data-audit-transaction]").forEach((button) => {
@@ -3452,6 +3676,17 @@ function formatPeriodMonth(value: string) {
 
 function currentMonthKey() {
   return transactionDayKey(new Date().toISOString()).slice(0, 7);
+}
+
+function shiftMonthKey(value: string, delta: number) {
+  const [year, month] = value.split("-").map(Number);
+  const shifted = new Date(Date.UTC(year, month - 1 + delta, 1));
+  return `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+function daysInMonthKey(value: string) {
+  const [year, month] = value.split("-").map(Number);
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
 }
 
 function transactionMonthKey(value: string) {
