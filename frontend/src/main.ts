@@ -2284,42 +2284,64 @@ function renderTransactionList(dashboard: LedgerDashboard) {
 
     return true;
   });
+  const filterCounts: Record<TransactionFilter, number> = {
+    all: dashboard.recentTransactions.length,
+    pending: dashboard.recentTransactions.filter(
+      (transaction) => transaction.approvalState === "pending",
+    ).length,
+    approved: dashboard.recentTransactions.filter(
+      (transaction) => transaction.approvalState === "approved",
+    ).length,
+    rejected: dashboard.recentTransactions.filter(
+      (transaction) => transaction.approvalState === "rejected",
+    ).length,
+  };
 
   return `
     <section class="activity-panel" aria-label="流水列表">
-      <div class="section-heading">
+      <div class="section-heading activity-heading">
         <div>
           <span class="section-kicker">Activity</span>
           <h2>流水</h2>
         </div>
-        <div class="filter-tabs" role="tablist" aria-label="流水筛选">
-          ${renderFilterButton("all", "全部")}
-          ${renderFilterButton("pending", "待审")}
-          ${renderFilterButton("approved", "已入账")}
-          ${renderFilterButton("rejected", "驳回")}
-        </div>
+        <span class="activity-total"><strong>${filtered.length}</strong><span>笔记录</span></span>
       </div>
-      <div class="activity-month-bar">
-        <div class="period-toggle" role="group" aria-label="流水时间范围">
-          ${renderPeriodButton("activity", "month", "月")}
-          ${renderPeriodButton("activity", "day", "日")}
+      <div class="activity-toolbar">
+        <div class="activity-range-control">
+          <span class="toolbar-label">查看范围</span>
+          <div class="period-toggle" role="group" aria-label="流水时间范围">
+            ${renderPeriodButton("activity", "month", "月")}
+            ${renderPeriodButton("activity", "day", "日")}
+          </div>
         </div>
-        ${
-          state.activityGranularity === "day"
-            ? `<label for="activityDaySelect">日期</label><input id="activityDaySelect" type="date" value="${escapeHtml(state.activityDay)}" />`
-            : `<label for="activityMonthSelect">月份</label><select id="activityMonthSelect" ${dashboard.availableTransactionMonths.length === 0 ? "disabled" : ""}>
-                ${
-                  dashboard.availableTransactionMonths.length > 0
-                    ? dashboard.availableTransactionMonths
-                        .map(
-                          (month) => `<option value="${escapeHtml(month)}" ${month === dashboard.selectedTransactionMonth ? "selected" : ""}>${escapeHtml(formatMonthLabel(month))}</option>`,
-                        )
-                        .join("")
-                    : `<option value="">暂无可用月份</option>`
-                }
-              </select>`
-        }
-        <span>${filtered.length} / ${dashboard.recentTransactions.length} 笔</span>
+        <label class="activity-period-input" for="${state.activityGranularity === "day" ? "activityDaySelect" : "activityMonthSelect"}">
+          <span>${state.activityGranularity === "day" ? "选择日期" : "选择月份"}</span>
+          ${
+            state.activityGranularity === "day"
+              ? `<input id="activityDaySelect" type="date" value="${escapeHtml(state.activityDay)}" />`
+              : `<select id="activityMonthSelect" ${dashboard.availableTransactionMonths.length === 0 ? "disabled" : ""}>
+                  ${
+                    dashboard.availableTransactionMonths.length > 0
+                      ? dashboard.availableTransactionMonths
+                          .map(
+                            (month) => `<option value="${escapeHtml(month)}" ${month === dashboard.selectedTransactionMonth ? "selected" : ""}>${escapeHtml(formatMonthLabel(month))}</option>`,
+                          )
+                          .join("")
+                      : `<option value="">暂无可用月份</option>`
+                  }
+                </select>`
+          }
+        </label>
+        <span class="activity-range-note">${state.activityGranularity === "day" ? "当天流水" : "整月流水"}</span>
+      </div>
+      <div class="activity-filter-row">
+        <span class="toolbar-label">状态</span>
+        <div class="filter-tabs" role="tablist" aria-label="流水筛选">
+          ${renderFilterButton("all", "全部", filterCounts.all)}
+          ${renderFilterButton("pending", "待审", filterCounts.pending)}
+          ${renderFilterButton("approved", "已入账", filterCounts.approved)}
+          ${renderFilterButton("rejected", "驳回", filterCounts.rejected)}
+        </div>
       </div>
       <div class="transaction-list">
         ${
@@ -2332,7 +2354,7 @@ function renderTransactionList(dashboard: LedgerDashboard) {
   `;
 }
 
-function renderFilterButton(filter: TransactionFilter, label: string) {
+function renderFilterButton(filter: TransactionFilter, label: string, count?: number) {
   const active = state.filter === filter;
 
   return `
@@ -2342,7 +2364,7 @@ function renderFilterButton(filter: TransactionFilter, label: string) {
       data-filter="${filter}"
       aria-selected="${active}"
     >
-      ${label}
+      <span>${label}</span>${count === undefined ? "" : `<small>${count}</small>`}
     </button>
   `;
 }
@@ -2367,20 +2389,24 @@ function renderTransactionRow(
   const signedAmount = formatSignedMoney(transaction.amountCents, currency, transaction.direction);
   const unsynced = isUnsyncedTransaction(transaction.id);
   const recentlySynced = state.recentlySyncedTransactionIds.has(transaction.id);
+  const directionIcon = transaction.direction === "expense" ? "arrow-down-left" : "arrow-up-right";
 
   return `
     <article class="transaction-row ${recentlySynced ? "is-just-synced" : ""}" data-transaction-id="${escapeHtml(transaction.id)}">
-      <div class="row-main">
-        <div>
-          <h3>${escapeHtml(transaction.title)}</h3>
-          <p>${escapeHtml(transaction.accountName)} · ${escapeHtml(transaction.categoryName)}</p>
+      <div class="row-main transaction-row-head">
+        <div class="transaction-leading">
+          <span class="transaction-icon ${transaction.direction === "expense" ? "is-expense" : "is-income"}" aria-hidden="true"><i data-lucide="${directionIcon}"></i></span>
+          <div class="transaction-copy">
+            <h3>${escapeHtml(transaction.title)}</h3>
+            <p>${escapeHtml(transaction.accountName)} · ${escapeHtml(transaction.categoryName)}</p>
+          </div>
         </div>
         <strong class="${transaction.direction === "expense" ? "amount-out" : "amount-in"}">
           ${signedAmount}
         </strong>
       </div>
-      <div class="row-meta">
-        <span>${formatDate(transaction.occurredAt)}</span>
+      <div class="row-meta transaction-row-foot">
+        <span class="transaction-date"><i data-lucide="calendar-days" aria-hidden="true"></i>${formatDate(transaction.occurredAt)}</span>
         ${
           unsynced
             ? '<span class="status-chip is-unsynced">未同步</span>'
@@ -2540,17 +2566,23 @@ function renderAuditPanel(_dashboard: LedgerDashboard) {
         </div>
         <span class="count-badge">${audit?.lifecycles.length ?? 0}</span>
       </div>
-      <div class="activity-month-bar audit-period-bar">
-        <div class="period-toggle" role="group" aria-label="审计时间范围">
-          ${renderPeriodButton("audit", "month", "月")}
-          ${renderPeriodButton("audit", "day", "日")}
+      <div class="activity-toolbar audit-period-bar">
+        <div class="activity-range-control">
+          <span class="toolbar-label">查看范围</span>
+          <div class="period-toggle" role="group" aria-label="审计时间范围">
+            ${renderPeriodButton("audit", "month", "月")}
+            ${renderPeriodButton("audit", "day", "日")}
+          </div>
         </div>
-        ${
-          state.auditGranularity === "day"
-            ? `<label for="auditDaySelect">日期</label><input id="auditDaySelect" type="date" value="${escapeHtml(state.auditPeriod)}" />`
-            : `<label for="auditMonthSelect">月份</label><input id="auditMonthSelect" type="month" value="${escapeHtml(state.auditPeriod)}" />`
-        }
-        <span>${audit?.lifecycles.length ?? 0} 笔流水</span>
+        <label class="activity-period-input" for="${state.auditGranularity === "day" ? "auditDaySelect" : "auditMonthSelect"}">
+          <span>${state.auditGranularity === "day" ? "选择日期" : "选择月份"}</span>
+          ${
+            state.auditGranularity === "day"
+              ? `<input id="auditDaySelect" type="date" value="${escapeHtml(state.auditPeriod)}" />`
+              : `<input id="auditMonthSelect" type="month" value="${escapeHtml(state.auditPeriod)}" />`
+          }
+        </label>
+        <span class="activity-range-note">${audit?.lifecycles.length ?? 0} 笔流水</span>
       </div>
       ${state.auditLoading ? '<div class="audit-state"><div class="spinner" aria-hidden="true"></div><p>正在加载审计生命周期</p></div>' : ""}
       ${state.auditError ? `<div class="audit-state"><p>${escapeHtml(state.auditError)}</p><button class="primary-button" id="retryAuditButton" type="button">重新加载</button></div>` : ""}
@@ -2590,14 +2622,14 @@ function renderAuditLifecycleCard(lifecycle: TransactionAuditLifecycle) {
     lifecycle.currency,
     lifecycle.direction,
   );
-  const latestStep = lifecycle.steps[lifecycle.steps.length - 1];
+  const directionIcon = lifecycle.direction === "expense" ? "arrow-down-left" : "arrow-up-right";
   return `
     <button class="audit-row audit-lifecycle-row" type="button" data-audit-transaction="${escapeHtml(lifecycle.transactionId)}">
-      <span class="audit-dot" aria-hidden="true"></span>
+      <span class="audit-card-marker ${lifecycle.direction === "expense" ? "is-expense" : "is-income"}" aria-hidden="true"><i data-lucide="${directionIcon}"></i></span>
       <span class="audit-row-copy">
-        <span class="audit-row-main"><strong>${escapeHtml(lifecycle.description)}</strong><strong class="${lifecycle.direction === "expense" ? "amount-out" : "amount-in"}">${signedAmount}</strong></span>
-        <span>${lifecycle.steps.length} 个步骤 · ${latestStep ? escapeHtml(auditActionLabel(latestStep.action)) : "生命周期"} · ${formatDate(lifecycle.latestAt)}</span>
-        <span>发生于 ${formatDate(lifecycle.occurredAt)} · 点击查看完整生命周期</span>
+        <span class="audit-row-main"><span class="audit-title-line"><strong>${escapeHtml(lifecycle.description)}</strong><i data-lucide="chevron-right" aria-hidden="true"></i></span><strong class="${lifecycle.direction === "expense" ? "amount-out" : "amount-in"}">${signedAmount}</strong></span>
+        <span class="audit-row-meta"><span><i data-lucide="clock-3" aria-hidden="true"></i>${formatDate(lifecycle.latestAt)}</span><span class="audit-step-count">${lifecycle.steps.length} 个步骤</span><span class="status-chip ${statusClass(lifecycle.approvalState)}">${approvalStateLabel(lifecycle.approvalState)}</span></span>
+        <span class="audit-row-hint">发生于 ${formatDate(lifecycle.occurredAt)} · 查看完整生命周期</span>
       </span>
     </button>
   `;
@@ -2615,22 +2647,22 @@ function renderAuditLifecycleDetail(lifecycle: TransactionAuditLifecycle) {
         <button class="ghost-button" id="closeAuditDetailButton" type="button" title="返回审计列表" aria-label="返回审计列表"><i data-lucide="arrow-left" aria-hidden="true"></i>返回</button>
       </div>
       <div class="audit-lifecycle-summary">
-        <span>审批：${approvalStateLabel(lifecycle.approvalState)}</span>
-        <span>付款：${paymentStateLabel(lifecycle.paymentState)}</span>
-        <span>${lifecycle.steps.length} 个审计步骤</span>
+        <span><i data-lucide="clipboard-check" aria-hidden="true"></i>审批：${approvalStateLabel(lifecycle.approvalState)}</span>
+        <span><i data-lucide="wallet-cards" aria-hidden="true"></i>付款：${paymentStateLabel(lifecycle.paymentState)}</span>
+        <span><i data-lucide="route" aria-hidden="true"></i>${lifecycle.steps.length} 个审计步骤</span>
       </div>
       <div class="audit-timeline">
         ${lifecycle.steps
           .map(
             (step, index) => `
               <article class="audit-timeline-step">
-                <span class="audit-dot" aria-hidden="true"></span>
+                <span class="audit-step-marker" aria-hidden="true"><i data-lucide="${auditActionIcon(step.action)}"></i></span>
                 <div>
                   <h3>${escapeHtml(auditActionLabel(step.action))}</h3>
                   <p>${escapeHtml(step.actorName)} · ${formatDate(step.createdAt)}</p>
                   <p>${escapeHtml(step.summary)}</p>
                 </div>
-                <span class="audit-step-index">${index + 1}</span>
+                <span class="audit-step-index">${String(index + 1).padStart(2, "0")}</span>
               </article>
             `,
           )
@@ -2660,10 +2692,16 @@ function auditLifecycleCount(dashboard: LedgerDashboard) {
 
 function renderNavButton(view: ViewMode, label: string, count?: number) {
   const active = state.view === view;
+  const iconsByView: Record<ViewMode, string> = {
+    activity: "receipt",
+    analysis: "chart-column",
+    approval: "clipboard-check",
+    audit: "shield-check",
+  };
 
   return `
     <button class="nav-button ${active ? "is-active" : ""}" type="button" data-view-target="${view}">
-      <span class="nav-icon" aria-hidden="true">${label.slice(0, 1)}</span>
+      <span class="nav-icon" aria-hidden="true"><i data-lucide="${iconsByView[view]}"></i></span>
       <span>${label}</span>
       <span class="nav-count ${count === undefined ? "is-empty" : ""}">${count ?? ""}</span>
     </button>
@@ -3518,6 +3556,20 @@ function auditActionLabel(action: LedgerDashboard["auditTrail"][number]["action"
   };
 
   return labels[action];
+}
+
+function auditActionIcon(action: LedgerDashboard["auditTrail"][number]["action"]) {
+  const icons: Record<LedgerDashboard["auditTrail"][number]["action"], string> = {
+    transaction_created: "plus-circle",
+    transaction_submitted: "send",
+    transaction_approved: "circle-check",
+    transaction_rejected: "circle-x",
+    transaction_paid: "banknote",
+    transaction_received: "hand-coins",
+    transaction_auto_approved: "badge-check",
+    transaction_deleted: "trash-2",
+  };
+  return icons[action];
 }
 
 function approvalStateLabel(stateValue: ApprovalState) {
