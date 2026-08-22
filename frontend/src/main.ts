@@ -37,6 +37,7 @@ interface DatePickerState {
   granularity: PeriodGranularity;
   draft: string;
   viewMonth: string;
+  opening?: boolean;
   transition?: "previous" | "next";
 }
 
@@ -597,9 +598,14 @@ function openDatePicker(scope: DatePickerScope, granularity: PeriodGranularity) 
     granularity,
     draft,
     viewMonth: granularity === "day" ? draft.slice(0, 7) : draft,
+    opening: true,
   };
   render();
+  const openingPicker = state.datePicker;
   window.requestAnimationFrame(() => {
+    if (state.datePicker === openingPicker) {
+      state.datePicker = { ...state.datePicker, opening: undefined };
+    }
     app.querySelector<HTMLButtonElement>("#datePickerDialog [data-picker-close]")?.focus();
   });
 }
@@ -675,10 +681,11 @@ function renderDatePicker() {
         ? `${availableMonths.length} 个可查看月份`
         : "审计记录";
   const transitionClass = picker.transition ? ` is-transitioning-${picker.transition}` : "";
+  const openingClass = picker.opening ? " is-entering" : "";
 
   return `
-    <div class="date-picker-backdrop" data-picker-backdrop>
-      <section class="date-picker-dialog" id="datePickerDialog" role="dialog" aria-modal="true" aria-labelledby="datePickerTitle">
+    <div class="date-picker-backdrop${openingClass}" data-picker-backdrop>
+      <section class="date-picker-dialog${openingClass}" id="datePickerDialog" role="dialog" aria-modal="true" aria-labelledby="datePickerTitle">
         <header class="date-picker-header">
           <div class="date-picker-title-wrap">
             <span class="date-picker-icon" aria-hidden="true"><i data-lucide="${picker.granularity === "day" ? "calendar-days" : "calendar-range"}"></i></span>

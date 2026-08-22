@@ -1217,6 +1217,9 @@ button:not(:disabled):active {
   padding: 12px 12px max(12px, env(safe-area-inset-bottom));
   background: rgb(23 34 31 / 48%);
   backdrop-filter: blur(5px);
+}
+
+.date-picker-backdrop.is-entering {
   animation: date-picker-backdrop-enter 180ms ease both;
 }
 
@@ -1229,6 +1232,9 @@ button:not(:disabled):active {
   border-radius: 20px;
   background: var(--surface);
   box-shadow: 0 24px 70px rgb(13 38 30 / 26%);
+}
+
+.date-picker-dialog.is-entering {
   animation: date-picker-dialog-enter 240ms var(--motion-ease) both;
 }
 
@@ -2689,25 +2695,21 @@ button:not(:disabled):active {
 
 @keyframes date-picker-content-previous {
   from {
-    opacity: 0;
-    transform: translateX(-14px);
+    transform: translate3d(-14px, 0, 0);
   }
 
   to {
-    opacity: 1;
-    transform: translateX(0);
+    transform: translate3d(0, 0, 0);
   }
 }
 
 @keyframes date-picker-content-next {
   from {
-    opacity: 0;
-    transform: translateX(14px);
+    transform: translate3d(14px, 0, 0);
   }
 
   to {
-    opacity: 1;
-    transform: translateX(0);
+    transform: translate3d(0, 0, 0);
   }
 }
 
@@ -2818,7 +2820,7 @@ button:not(:disabled):active {
     max-height: min(760px, calc(100dvh - 48px));
   }
 
-  .date-picker-dialog {
+  .date-picker-dialog.is-entering {
     animation-name: date-picker-dialog-center-enter;
   }
 }
