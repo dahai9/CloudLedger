@@ -1332,7 +1332,16 @@ button:not(:disabled):active {
 }
 
 .date-picker-content {
+  overflow: hidden;
   padding: 0 20px 8px;
+}
+
+.date-picker-content.is-transitioning-previous {
+  animation: date-picker-content-previous 240ms var(--motion-ease) both;
+}
+
+.date-picker-content.is-transitioning-next {
+  animation: date-picker-content-next 240ms var(--motion-ease) both;
 }
 
 .date-picker-period-heading {
@@ -2675,6 +2684,30 @@ button:not(:disabled):active {
   to {
     opacity: 1;
     transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes date-picker-content-previous {
+  from {
+    opacity: 0;
+    transform: translateX(-14px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes date-picker-content-next {
+  from {
+    opacity: 0;
+    transform: translateX(14px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateX(0);
   }
 }
 

@@ -37,6 +37,7 @@ interface DatePickerState {
   granularity: PeriodGranularity;
   draft: string;
   viewMonth: string;
+  transition?: "previous" | "next";
 }
 
 interface SyncState {
@@ -616,6 +617,7 @@ function updateDatePickerDraft(value: string) {
     ...picker,
     draft: value,
     viewMonth: picker.granularity === "day" ? value.slice(0, 7) : value,
+    transition: undefined,
   };
   render();
 }
@@ -627,6 +629,7 @@ function navigateDatePicker(direction: "previous" | "next") {
   state.datePicker = {
     ...picker,
     viewMonth: shiftMonthKey(picker.viewMonth, picker.granularity === "month" ? delta * 12 : delta),
+    transition: picker.granularity === "day" ? direction : undefined,
   };
   render();
 }
@@ -671,6 +674,7 @@ function renderDatePicker() {
       : picker.scope === "activity"
         ? `${availableMonths.length} 个可查看月份`
         : "审计记录";
+  const transitionClass = picker.transition ? ` is-transitioning-${picker.transition}` : "";
 
   return `
     <div class="date-picker-backdrop" data-picker-backdrop>
@@ -690,7 +694,7 @@ function renderDatePicker() {
           <strong>${escapeHtml(selection)}</strong>
           <small>${escapeHtml(helper)}</small>
         </div>
-        <div class="date-picker-content">
+        <div class="date-picker-content${transitionClass}">
           ${picker.granularity === "day" ? renderDatePickerDayGrid(picker) : renderDatePickerMonthGrid(picker)}
         </div>
         <footer class="date-picker-footer">
@@ -2948,6 +2952,25 @@ function renderEmptyState(sceneMotionClass: string) {
 
 function bindEvents() {
   bindSyncStatusEvents();
+
+  const picker = state.datePicker;
+  const pickerContent = app.querySelector<HTMLElement>(".date-picker-content");
+  if (picker?.transition && pickerContent) {
+    const { transition, viewMonth } = picker;
+    pickerContent.addEventListener(
+      "animationend",
+      (event) => {
+        if (
+          event.target === pickerContent &&
+          state.datePicker?.viewMonth === viewMonth &&
+          state.datePicker.transition === transition
+        ) {
+          state.datePicker = { ...state.datePicker, transition: undefined };
+        }
+      },
+      { once: true },
+    );
+  }
 
   app.querySelector<HTMLFormElement>("#authForm")?.addEventListener("submit", (event) => {
     event.preventDefault();
