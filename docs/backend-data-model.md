@@ -103,6 +103,11 @@ the small-team snapshot and computes owner-only public-ledger summaries for 3,
   fall back to `received_at` and then `occurred_at`.
 - Submitted expenses and approved-but-unpaid expenses are current workflow
   exposure, not historical cash outflow.
+- A business owner can void an approved transaction on an organization public
+  ledger with a required reason of at most 200 characters. Voiding changes only
+  `approval_state` to `voided`, preserves payment and receipt facts, records a
+  `transaction.voided` audit event, and removes its effect from balances,
+  cash-flow analysis, and workflow exposure while retaining the history row.
 - `paid_pending_receipt` expenses have already reduced the account balance and
   are included in cash outflow while remaining visible as unsettled receipts.
 - Current account balances include opening balances and every transaction that

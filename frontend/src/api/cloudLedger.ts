@@ -68,6 +68,7 @@ export interface CloudLedgerApi {
   ): Promise<Transaction>;
   markTransactionPaid(transactionId: string): Promise<Transaction>;
   confirmTransactionReceipt(transactionId: string): Promise<Transaction>;
+  voidTransaction(transactionId: string, voidReason: string): Promise<Transaction>;
   listApprovalQueue(ledgerId: string): Promise<ApprovalQueueItem[]>;
   listAuditTrail(ledgerId: string): Promise<AuditLogEntry[]>;
   isAuthRequired(error: unknown): boolean;
@@ -304,6 +305,16 @@ const serverApi: CloudLedgerApi = {
     const transaction = await authenticatedJson<TransactionDto>("/app/payments/confirm-receipt", {
       method: "POST",
       body: { transactionId },
+    });
+    overviewCache = undefined;
+    return mapTransaction(transaction, overview);
+  },
+
+  async voidTransaction(transactionId, voidReason) {
+    const overview = overviewCache ?? (await getOverview());
+    const transaction = await authenticatedJson<TransactionDto>("/app/transactions/void", {
+      method: "POST",
+      body: { transactionId, voidReason },
     });
     overviewCache = undefined;
     return mapTransaction(transaction, overview);
@@ -1104,7 +1115,11 @@ const mockApi: CloudLedgerApi = {
 
   async markTransactionPaid(transactionId) {
     const transaction = mockTransactions.find((item) => item.id === transactionId);
-    if (!transaction || transaction.paymentState !== "pending_payment") {
+    if (
+      !transaction ||
+      transaction.approvalState !== "approved" ||
+      transaction.paymentState !== "pending_payment"
+    ) {
       throw new Error("流水不是待打款状态");
     }
     transaction.paymentState = "paid_pending_receipt";
@@ -1114,11 +1129,60 @@ const mockApi: CloudLedgerApi = {
 
   async confirmTransactionReceipt(transactionId) {
     const transaction = mockTransactions.find((item) => item.id === transactionId);
-    if (!transaction || transaction.paymentState !== "paid_pending_receipt") {
+    if (
+      !transaction ||
+      transaction.approvalState !== "approved" ||
+      transaction.paymentState !== "paid_pending_receipt"
+    ) {
       throw new Error("流水不是待确认收款状态");
     }
     transaction.paymentState = "received";
     transaction.receivedAt = nowIso();
+    return transaction;
+  },
+
+  async voidTransaction(transactionId, voidReason) {
+    const transaction = mockTransactions.find((item) => item.id === transactionId);
+    const ledger = mockLedgers.find((item) => item.id === transaction?.ledgerId);
+    const reason = voidReason.trim();
+    if (!transaction) throw new Error("流水不存在");
+    if (ledger?.kind !== "organization" || ledger.role !== "business_owner") {
+      throw new Error("actor is not authorized for this action");
+    }
+    if (transaction.approvalState !== "approved") {
+      throw new Error("transaction is not eligible for voiding");
+    }
+    if (!reason) throw new Error("void reason is required");
+    if (Array.from(reason).length > 200) throw new Error("void reason must not exceed 200 characters");
+    const affectsBalance =
+      transaction.direction === "income" || transaction.paymentState !== "pending_payment";
+    transaction.approvalState = "voided";
+    mockAuditTrail = [
+      {
+        id: crypto.randomUUID(),
+        ledgerId: transaction.ledgerId,
+        action: "transaction_voided",
+        actorName: "我",
+        resourceId: transaction.id,
+        createdAt: nowIso(),
+        summary: `作废${transaction.title}，原因：${reason}`,
+      },
+      ...mockAuditTrail,
+    ];
+    if (
+      !mockEmployeeMode &&
+      ledger &&
+      affectsBalance
+    ) {
+      const delta = transaction.direction === "income" ? -transaction.amountCents : transaction.amountCents;
+      ledger.balanceCents = (ledger.balanceCents ?? 0) + delta;
+      const account = mockAccounts.find(
+        (item) => item.ledgerId === transaction.ledgerId && item.name === transaction.accountName,
+      );
+      if (account && account.balanceCents !== null) {
+        account.balanceCents = (account.balanceCents ?? 0) + delta;
+      }
+    }
     return transaction;
   },
 
@@ -1795,7 +1859,7 @@ function normalizeApprovalState(state: TransactionDto["approvalState"]): Transac
     submitted: "pending",
     approved: "approved",
     rejected: "rejected",
-    voided: "deleted",
+    voided: "voided",
   };
 
   return states[state];
@@ -1823,7 +1887,7 @@ function normalizeAuditAction(action: string): AuditLogEntry["action"] {
   }
 
   if (action.includes("deleted") || action.includes("voided")) {
-    return "transaction_deleted";
+    return "transaction_voided";
   }
 
   if (action.includes("submitted")) {

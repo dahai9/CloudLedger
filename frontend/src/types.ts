@@ -8,7 +8,7 @@ export type MemberRole =
 
 export type TransactionDirection = "expense" | "income";
 
-export type ApprovalState = "draft" | "pending" | "approved" | "rejected" | "deleted";
+export type ApprovalState = "draft" | "pending" | "approved" | "rejected" | "voided";
 export type PaymentState = "not_applicable" | "pending_payment" | "paid_pending_receipt" | "received";
 export type AnalysisMonths = 3 | 6 | 12;
 
@@ -22,7 +22,7 @@ export type AuditAction =
   | "transaction_paid"
   | "transaction_received"
   | "transaction_auto_approved"
-  | "transaction_deleted";
+  | "transaction_voided";
 
 export type PeriodGranularity = "day" | "month";
 

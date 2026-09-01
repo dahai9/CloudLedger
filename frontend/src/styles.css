@@ -598,6 +598,7 @@ button:not(:disabled):active {
 .date-picker-day:focus-visible,
 .date-picker-secondary:focus-visible,
 .date-picker-primary:focus-visible,
+.void-dialog-close:focus-visible,
 .nav-button:focus-visible {
   outline: 3px solid rgb(47 111 159 / 34%);
   outline-offset: 2px;
@@ -1238,6 +1239,185 @@ button:not(:disabled):active {
   animation: date-picker-dialog-enter 240ms var(--motion-ease) both;
 }
 
+.void-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 12px 12px max(12px, env(safe-area-inset-bottom));
+  background: rgb(23 34 31 / 52%);
+  backdrop-filter: blur(5px);
+  animation: date-picker-backdrop-enter 180ms ease both;
+}
+
+.void-dialog {
+  display: grid;
+  width: min(100%, 480px);
+  max-height: min(760px, calc(100dvh - 24px));
+  overflow: auto;
+  border: 1px solid rgb(255 255 255 / 70%);
+  border-radius: 16px;
+  background: var(--surface);
+  box-shadow: 0 24px 70px rgb(13 38 30 / 26%);
+  animation: date-picker-dialog-enter 240ms var(--motion-ease) both;
+}
+
+.void-dialog-header,
+.void-dialog-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 20px;
+}
+
+.void-dialog-header {
+  border-bottom: 1px solid var(--line);
+}
+
+.void-dialog-title-wrap {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 11px;
+}
+
+.void-dialog-icon {
+  display: grid;
+  width: 40px;
+  height: 40px;
+  flex: 0 0 40px;
+  place-items: center;
+  border-radius: 10px;
+  background: var(--coral-soft);
+  color: var(--coral);
+}
+
+.void-dialog-icon svg {
+  width: 20px;
+  height: 20px;
+}
+
+.void-dialog-kicker {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.void-dialog h2 {
+  margin: 2px 0 0;
+  font-size: 20px;
+  line-height: 1.2;
+}
+
+.void-dialog-close {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  flex: 0 0 38px;
+  place-items: center;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+}
+
+.void-dialog-close:hover {
+  background: var(--surface-quiet);
+  color: var(--ink);
+}
+
+.void-dialog-body {
+  display: grid;
+  gap: 16px;
+  padding: 20px;
+}
+
+.void-transaction-summary {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-quiet);
+}
+
+.void-transaction-summary > div {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.void-transaction-summary strong:first-child {
+  overflow-wrap: anywhere;
+}
+
+.void-transaction-summary span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.void-transaction-summary > strong:last-child {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.void-warning {
+  margin: 0;
+  padding: 12px 14px;
+  border-left: 3px solid var(--coral);
+  background: var(--coral-soft);
+  color: #8d3d2e;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.void-reason-field {
+  display: grid;
+  gap: 7px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.void-reason-field textarea {
+  width: 100%;
+  min-height: 104px;
+  resize: vertical;
+  padding: 11px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  font-weight: 500;
+  line-height: 1.5;
+}
+
+.void-reason-field textarea:focus {
+  border-color: var(--green);
+  outline: 3px solid rgb(8 124 101 / 14%);
+}
+
+.void-reason-field small {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.void-dialog-footer {
+  justify-content: flex-end;
+  border-top: 1px solid var(--line);
+}
+
+.void-dialog-footer button {
+  min-width: 112px;
+}
+
 .date-picker-header {
   display: flex;
   align-items: flex-start;
@@ -1750,7 +1930,7 @@ button:not(:disabled):active {
 }
 
 .status-chip.is-rejected,
-.status-chip.is-deleted {
+.status-chip.is-voided {
   background: var(--coral-soft);
   color: var(--coral);
 }

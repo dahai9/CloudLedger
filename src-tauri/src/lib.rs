@@ -3,9 +3,9 @@ use std::{path::PathBuf, sync::Mutex};
 use cloudledger_service::{
     AppConfirmTransactionReceiptInput, AppCreateCategoryInput, AppCreateTransactionInput,
     AppDecideApprovalInput, AppLedgerService, AppMarkTransactionPaidInput, AppServiceError,
-    AuditPeriodDto, AuditPeriodGranularity, CategoryDto, FinancialAnalysisDto,
-    FinancialMemberDetailDto, FinancialMonthDetailDto, LedgerOverview, TransactionDto,
-    TransactionMonthDto,
+    AppVoidTransactionInput, AuditPeriodDto, AuditPeriodGranularity, CategoryDto,
+    FinancialAnalysisDto, FinancialMemberDetailDto, FinancialMonthDetailDto, LedgerOverview,
+    TransactionDto, TransactionMonthDto,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
@@ -282,6 +282,23 @@ fn mark_transaction_paid(
 }
 
 #[tauri::command]
+fn void_transaction(
+    state: State<'_, AppState>,
+    mut input: AppVoidTransactionInput,
+) -> Result<TransactionDto, String> {
+    let mut service = state
+        .ledger_service
+        .lock()
+        .map_err(|_| "ledger service lock poisoned".to_string())?;
+    input.actor_user_id = service.current_user_id();
+    let transaction = service.void_transaction(input).map_err(service_error)?;
+    service
+        .save_to_path(&state.storage_path)
+        .map_err(service_error)?;
+    Ok(transaction)
+}
+
+#[tauri::command]
 fn confirm_transaction_receipt(
     state: State<'_, AppState>,
     mut input: AppConfirmTransactionReceiptInput,
@@ -335,6 +352,7 @@ pub fn run() {
             create_transaction,
             decide_approval,
             mark_transaction_paid,
+            void_transaction,
             confirm_transaction_receipt
         ])
         .run(tauri::generate_context!())

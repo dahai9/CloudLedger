@@ -106,6 +106,7 @@ pub fn router(state: ServerState) -> Router {
             "/app/payments/mark-paid",
             post(app_api::mark_transaction_paid),
         )
+        .route("/app/transactions/void", post(app_api::void_transaction))
         .route(
             "/app/payments/confirm-receipt",
             post(app_api::confirm_transaction_receipt),

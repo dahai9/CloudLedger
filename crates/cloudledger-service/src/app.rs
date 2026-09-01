@@ -64,6 +64,14 @@ pub enum AppServiceError {
     SelfApprovalDenied,
     #[error("rejection reason is required")]
     DecisionNoteRequired,
+    #[error("void reason is required")]
+    VoidReasonRequired,
+    #[error("void reason must not exceed 200 characters")]
+    InvalidVoidReason,
+    #[error("only organization public-ledger transactions can be voided")]
+    PublicLedgerOnly,
+    #[error("transaction is not eligible for voiding")]
+    InvalidVoidState,
     #[error("transaction currency must match account currency")]
     CurrencyMismatch,
     #[error("transfer transactions are not supported in the MVP")]
@@ -143,6 +151,15 @@ pub struct AppConfirmTransactionReceiptInput {
     #[serde(default)]
     pub actor_user_id: Uuid,
     pub transaction_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppVoidTransactionInput {
+    #[serde(default)]
+    pub actor_user_id: Uuid,
+    pub transaction_id: Uuid,
+    pub void_reason: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -906,11 +923,17 @@ impl AppLedgerService {
             .count();
         let pending_payment_count = transactions
             .iter()
-            .filter(|transaction| transaction.payment_state == "pending_payment")
+            .filter(|transaction| {
+                transaction.approval_state == "approved"
+                    && transaction.payment_state == "pending_payment"
+            })
             .count();
         let pending_receipt_count = transactions
             .iter()
-            .filter(|transaction| transaction.payment_state == "paid_pending_receipt")
+            .filter(|transaction| {
+                transaction.approval_state == "approved"
+                    && transaction.payment_state == "paid_pending_receipt"
+            })
             .count();
 
         LedgerOverview {
@@ -2064,6 +2087,53 @@ impl AppLedgerService {
         Ok(self.transaction_dto(&updated_transaction))
     }
 
+    pub fn void_transaction(
+        &mut self,
+        input: AppVoidTransactionInput,
+    ) -> Result<TransactionDto, AppServiceError> {
+        let transaction = self
+            .transactions
+            .get(&input.transaction_id)
+            .ok_or(AppServiceError::TransactionNotFound)?;
+        let ledger = self
+            .ledgers
+            .get(&transaction.ledger_id)
+            .cloned()
+            .ok_or(AppServiceError::LedgerNotFound)?;
+        if ledger.kind != LedgerKind::OrganizationPublic {
+            return Err(AppServiceError::PublicLedgerOnly);
+        }
+        if !self.authorized(input.actor_user_id, &ledger, Action::VoidTransaction) {
+            return Err(AppServiceError::Unauthorized);
+        }
+        if transaction.deleted_at.is_some() || transaction.approval_state != ApprovalState::Approved
+        {
+            return Err(AppServiceError::InvalidVoidState);
+        }
+        let reason = normalize_void_reason(input.void_reason)?;
+        let now = OffsetDateTime::now_utc();
+        let updated = {
+            let transaction = self
+                .transactions
+                .get_mut(&input.transaction_id)
+                .ok_or(AppServiceError::TransactionNotFound)?;
+            transaction.approval_state = ApprovalState::Voided;
+            transaction.updated_at = now;
+            transaction.version += 1;
+            transaction.clone()
+        };
+        self.audit_logs.push(AuditLog::new(
+            ledger.organization_id,
+            ledger.id,
+            input.actor_user_id,
+            "transaction.voided",
+            "transaction",
+            updated.id,
+            format!("作废公账流水：{}，原因：{}", updated.description, reason),
+        ));
+        Ok(self.transaction_dto(&updated))
+    }
+
     pub fn mark_transaction_paid(
         &mut self,
         input: AppMarkTransactionPaidInput,
@@ -2693,6 +2763,17 @@ fn user_dto(user: &User) -> UserDto {
 fn normalize_decision_note(note: Option<String>) -> Option<String> {
     note.map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn normalize_void_reason(reason: String) -> Result<String, AppServiceError> {
+    let normalized = reason.trim().to_string();
+    if normalized.is_empty() {
+        return Err(AppServiceError::VoidReasonRequired);
+    }
+    if normalized.chars().count() > 200 {
+        return Err(AppServiceError::InvalidVoidReason);
+    }
+    Ok(normalized)
 }
 
 fn normalize_optional_email(email: String) -> Option<String> {
@@ -3451,6 +3532,295 @@ mod tests {
         assert!(overview.audit_logs.iter().any(|audit| {
             audit.action == "transaction.received" && audit.actor_display_name == "Bob"
         }));
+    }
+
+    #[test]
+    fn business_owner_can_void_approved_transactions_and_restore_accounting() {
+        let mut service = AppLedgerService::seeded();
+        let owner_id = service.current_user_id();
+        let overview = service.overview(owner_id);
+        let public = overview
+            .ledgers
+            .iter()
+            .find(|ledger| ledger.kind == "organization_public")
+            .expect("seeded public ledger");
+        let public_id = Uuid::parse_str(&public.id).expect("public ledger id");
+        let account_id = overview
+            .accounts
+            .iter()
+            .find(|account| account.ledger_id == public.id && account.kind == "bank")
+            .and_then(|account| Uuid::parse_str(&account.id).ok())
+            .expect("public bank account");
+
+        let income = service
+            .create_transaction(AppCreateTransactionInput {
+                actor_user_id: owner_id,
+                ledger_id: public_id,
+                account_id,
+                category_id: None,
+                kind: TransactionKind::Income,
+                amount_minor: 125_000,
+                currency: "CNY".to_string(),
+                description: "可作废收入".to_string(),
+                client_mutation_id: None,
+            })
+            .expect("create income");
+        assert_eq!(income.approval_state, "approved");
+        let income_id = Uuid::parse_str(&income.id).expect("income id");
+
+        let pending_payment = service
+            .create_transaction(AppCreateTransactionInput {
+                actor_user_id: owner_id,
+                ledger_id: public_id,
+                account_id,
+                category_id: None,
+                kind: TransactionKind::Expense,
+                amount_minor: 10_000,
+                currency: "CNY".to_string(),
+                description: "待打款作废支出".to_string(),
+                client_mutation_id: None,
+            })
+            .expect("create pending expense");
+        let pending_payment_id = Uuid::parse_str(&pending_payment.id).expect("pending id");
+
+        let paid = service
+            .create_transaction(AppCreateTransactionInput {
+                actor_user_id: owner_id,
+                ledger_id: public_id,
+                account_id,
+                category_id: None,
+                kind: TransactionKind::Expense,
+                amount_minor: 20_000,
+                currency: "CNY".to_string(),
+                description: "已打款作废支出".to_string(),
+                client_mutation_id: None,
+            })
+            .expect("create paid expense");
+        let paid_id = Uuid::parse_str(&paid.id).expect("paid id");
+        let paid = service
+            .mark_transaction_paid(AppMarkTransactionPaidInput {
+                actor_user_id: owner_id,
+                transaction_id: paid_id,
+            })
+            .expect("mark paid");
+        let paid_at = paid.paid_at.clone();
+
+        let received = service
+            .create_transaction(AppCreateTransactionInput {
+                actor_user_id: owner_id,
+                ledger_id: public_id,
+                account_id,
+                category_id: None,
+                kind: TransactionKind::Expense,
+                amount_minor: 30_000,
+                currency: "CNY".to_string(),
+                description: "已收款作废支出".to_string(),
+                client_mutation_id: None,
+            })
+            .expect("create received expense");
+        let received_id = Uuid::parse_str(&received.id).expect("received id");
+        service
+            .mark_transaction_paid(AppMarkTransactionPaidInput {
+                actor_user_id: owner_id,
+                transaction_id: received_id,
+            })
+            .expect("mark received paid");
+        let received = service
+            .confirm_transaction_receipt(AppConfirmTransactionReceiptInput {
+                actor_user_id: owner_id,
+                transaction_id: received_id,
+            })
+            .expect("confirm received");
+        let received_at = received.received_at.clone();
+
+        let before = service.overview(owner_id);
+        let before_balance = before
+            .accounts
+            .iter()
+            .find(|account| account.id == account_id.to_string())
+            .and_then(|account| account.balance_minor)
+            .expect("owner balance");
+        assert_eq!(before_balance, 5_075_000);
+        assert_eq!(before.pending_payment_count, 1);
+        assert_eq!(before.pending_receipt_count, 1);
+
+        let voided_income = service
+            .void_transaction(AppVoidTransactionInput {
+                actor_user_id: owner_id,
+                transaction_id: income_id,
+                void_reason: "重复入账".to_string(),
+            })
+            .expect("void income");
+        assert_eq!(voided_income.approval_state, "voided");
+        assert_eq!(voided_income.payment_state, "not_applicable");
+
+        let voided_pending = service
+            .void_transaction(AppVoidTransactionInput {
+                actor_user_id: owner_id,
+                transaction_id: pending_payment_id,
+                void_reason: "取消采购".to_string(),
+            })
+            .expect("void pending expense");
+        assert_eq!(voided_pending.payment_state, "pending_payment");
+
+        let voided_paid = service
+            .void_transaction(AppVoidTransactionInput {
+                actor_user_id: owner_id,
+                transaction_id: paid_id,
+                void_reason: "付款对象错误".to_string(),
+            })
+            .expect("void paid expense");
+        assert_eq!(voided_paid.paid_at, paid_at);
+
+        let voided_received = service
+            .void_transaction(AppVoidTransactionInput {
+                actor_user_id: owner_id,
+                transaction_id: received_id,
+                void_reason: "线下已退款".to_string(),
+            })
+            .expect("void received expense");
+        assert_eq!(voided_received.received_at, received_at);
+
+        let after = service.overview(owner_id);
+        let after_balance = after
+            .accounts
+            .iter()
+            .find(|account| account.id == account_id.to_string())
+            .and_then(|account| account.balance_minor)
+            .expect("owner balance after void");
+        assert_eq!(after_balance, 5_000_000);
+        assert_eq!(after.pending_payment_count, 0);
+        assert_eq!(after.pending_receipt_count, 0);
+        assert!(
+            after
+                .transactions
+                .iter()
+                .filter(|transaction| transaction.approval_state == "voided")
+                .count()
+                >= 4
+        );
+        assert!(after.audit_logs.iter().any(|audit| {
+            audit.action == "transaction.voided"
+                && audit.resource_id == received.id
+                && audit.summary.contains("线下已退款")
+        }));
+
+        let analysis = service
+            .financial_analysis(owner_id, public_id, 3)
+            .expect("analysis after void");
+        assert_eq!(analysis.income_minor, 0);
+        assert_eq!(analysis.expense_minor, 0);
+    }
+
+    #[test]
+    fn void_transaction_enforces_reason_state_scope_and_owner_role() {
+        let mut service = AppLedgerService::seeded();
+        let owner_id = service.current_user_id();
+        let overview = service.overview(owner_id);
+        let public = overview
+            .ledgers
+            .iter()
+            .find(|ledger| ledger.kind == "organization_public")
+            .expect("seeded public ledger");
+        let public_id = Uuid::parse_str(&public.id).expect("public ledger id");
+        let account_id = overview
+            .accounts
+            .iter()
+            .find(|account| account.ledger_id == public.id)
+            .and_then(|account| Uuid::parse_str(&account.id).ok())
+            .expect("public account");
+        let submitted = overview
+            .transactions
+            .iter()
+            .find(|transaction| transaction.approval_state == "submitted")
+            .expect("submitted transaction");
+        let submitted_id = Uuid::parse_str(&submitted.id).expect("submitted id");
+
+        assert!(matches!(
+            service.void_transaction(AppVoidTransactionInput {
+                actor_user_id: owner_id,
+                transaction_id: submitted_id,
+                void_reason: "".to_string(),
+            }),
+            Err(AppServiceError::InvalidVoidState)
+        ));
+
+        let approved = service
+            .create_transaction(AppCreateTransactionInput {
+                actor_user_id: owner_id,
+                ledger_id: public_id,
+                account_id,
+                category_id: None,
+                kind: TransactionKind::Income,
+                amount_minor: 1_000,
+                currency: "CNY".to_string(),
+                description: "原因校验".to_string(),
+                client_mutation_id: None,
+            })
+            .expect("create approved transaction");
+        let approved_id = Uuid::parse_str(&approved.id).expect("approved id");
+        assert!(matches!(
+            service.void_transaction(AppVoidTransactionInput {
+                actor_user_id: owner_id,
+                transaction_id: approved_id,
+                void_reason: " ".to_string(),
+            }),
+            Err(AppServiceError::VoidReasonRequired)
+        ));
+        assert!(matches!(
+            service.void_transaction(AppVoidTransactionInput {
+                actor_user_id: owner_id,
+                transaction_id: approved_id,
+                void_reason: "x".repeat(201),
+            }),
+            Err(AppServiceError::InvalidVoidReason)
+        ));
+
+        let employee_id = service
+            .users()
+            .into_iter()
+            .find(|user| user.display_name == "Bob")
+            .and_then(|user| Uuid::parse_str(&user.id).ok())
+            .expect("employee id");
+        assert!(matches!(
+            service.void_transaction(AppVoidTransactionInput {
+                actor_user_id: employee_id,
+                transaction_id: approved_id,
+                void_reason: "越权作废".to_string(),
+            }),
+            Err(AppServiceError::Unauthorized)
+        ));
+
+        let personal = overview
+            .transactions
+            .iter()
+            .find(|transaction| transaction.kind == "income" && transaction.ledger_id != public.id)
+            .expect("personal income");
+        assert!(matches!(
+            service.void_transaction(AppVoidTransactionInput {
+                actor_user_id: owner_id,
+                transaction_id: Uuid::parse_str(&personal.id).expect("personal id"),
+                void_reason: "不应作用于私账".to_string(),
+            }),
+            Err(AppServiceError::PublicLedgerOnly)
+        ));
+
+        let voided = service
+            .void_transaction(AppVoidTransactionInput {
+                actor_user_id: owner_id,
+                transaction_id: approved_id,
+                void_reason: "确认作废".to_string(),
+            })
+            .expect("void approved transaction");
+        assert_eq!(voided.approval_state, "voided");
+        assert!(matches!(
+            service.void_transaction(AppVoidTransactionInput {
+                actor_user_id: owner_id,
+                transaction_id: approved_id,
+                void_reason: "重复操作".to_string(),
+            }),
+            Err(AppServiceError::InvalidVoidState)
+        ));
     }
 
     #[test]

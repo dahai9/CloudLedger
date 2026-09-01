@@ -278,6 +278,7 @@ The mobile API owns app login and ledger operations:
 - `POST /app/approvals/decide`
 - `POST /app/payments/mark-paid`
 - `POST /app/payments/confirm-receipt`
+- `POST /app/transactions/void` (business owner only; approved organization-public transactions)
 
 Development Web auth uses `/auth/web/login|refresh|logout`. The legacy
 `/auth/login|refresh|logout` endpoints return `426 client_upgrade_required` for

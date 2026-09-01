@@ -249,6 +249,10 @@ export interface TransactionActionInput {
   transactionId: string;
 }
 
+export interface VoidTransactionInput extends TransactionActionInput {
+  voidReason: string;
+}
+
 export async function loadOverview(): Promise<LedgerOverview> {
   return invoke<LedgerOverview>("get_overview");
 }
@@ -321,4 +325,10 @@ export async function confirmTransactionReceipt(
   input: TransactionActionInput
 ): Promise<TransactionDto> {
   return invoke<TransactionDto>("confirm_transaction_receipt", { input });
+}
+
+export async function voidTransaction(
+  input: VoidTransactionInput,
+): Promise<TransactionDto> {
+  return invoke<TransactionDto>("void_transaction", { input });
 }

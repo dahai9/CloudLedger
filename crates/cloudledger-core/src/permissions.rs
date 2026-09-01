@@ -60,7 +60,7 @@ fn can_perform_organization(ctx: &AuthorizationContext<'_>, action: Action) -> b
 
     match role {
         MembershipRole::Owner | MembershipRole::Admin => false,
-        MembershipRole::BusinessOwner | MembershipRole::Approver => matches!(
+        MembershipRole::BusinessOwner => matches!(
             action,
             Action::ViewLedger
                 | Action::CreateTransaction
@@ -69,6 +69,19 @@ fn can_perform_organization(ctx: &AuthorizationContext<'_>, action: Action) -> b
                 | Action::MarkTransactionPaid
                 | Action::ConfirmReceipt
                 | Action::VoidTransaction
+                | Action::ExportLedger
+                | Action::ManageAccounts
+                | Action::ViewAuditLog
+                | Action::ViewFinancialAnalytics
+        ),
+        MembershipRole::Approver => matches!(
+            action,
+            Action::ViewLedger
+                | Action::CreateTransaction
+                | Action::SubmitTransaction
+                | Action::ApproveTransaction
+                | Action::MarkTransactionPaid
+                | Action::ConfirmReceipt
                 | Action::ExportLedger
                 | Action::ManageAccounts
                 | Action::ViewAuditLog
@@ -120,8 +133,24 @@ mod tests {
 
         assert!(can_perform(&ctx, Action::ApproveTransaction));
         assert!(can_perform(&ctx, Action::MarkTransactionPaid));
+        assert!(can_perform(&ctx, Action::VoidTransaction));
         assert!(can_perform(&ctx, Action::ViewFinancialAnalytics));
         assert!(!can_perform(&ctx, Action::ManageMembers));
+    }
+
+    #[test]
+    fn approver_cannot_void_public_ledger_transactions() {
+        let approver = Uuid::new_v4();
+        let org = Uuid::new_v4();
+        let ledger = Ledger::organization_public(org, "Company books");
+
+        let ctx = AuthorizationContext {
+            actor_user_id: approver,
+            ledger: &ledger,
+            membership_role: Some(MembershipRole::Approver),
+        };
+
+        assert!(!can_perform(&ctx, Action::VoidTransaction));
     }
 
     #[test]

@@ -27,7 +27,7 @@ type ViewMode = "activity" | "analysis" | "approval" | "audit";
 type AnalysisDetailTarget =
   | { kind: "month"; month: string }
   | { kind: "member"; memberId: string };
-type TransactionFilter = "all" | "pending" | "approved" | "rejected";
+type TransactionFilter = "all" | "pending" | "approved" | "rejected" | "voided";
 type AuthStatus = "checking" | "authenticated" | "anonymous";
 type SyncPhase = "idle" | "connecting" | "syncing" | "success" | "failed";
 type DatePickerScope = "activity" | "audit";
@@ -66,6 +66,11 @@ interface AuthForm {
 
 interface ProfileForm {
   displayName: string;
+}
+
+interface VoidDialogState {
+  transactionId: string;
+  reason: string;
 }
 
 interface AppState {
@@ -107,6 +112,7 @@ interface AppState {
   auditLoading: boolean;
   auditError?: string;
   auditDetailTransactionId?: string;
+  voidDialog?: VoidDialogState;
   categoryEditing: boolean;
   categoryName: string;
   amountsVisible: boolean;
@@ -257,6 +263,10 @@ document.addEventListener("keydown", (event) => {
   }
   if (state.datePicker) {
     closeDatePicker();
+    return;
+  }
+  if (state.voidDialog) {
+    closeVoidDialog();
     return;
   }
   if (state.userMenuOpen) {
@@ -777,6 +787,52 @@ function renderDatePickerDayGrid(picker: DatePickerState) {
     </div>
     <div class="date-picker-day-grid" role="grid" aria-label="${escapeHtml(formatMonthLabel(month))}">
       ${cells.join("")}
+    </div>
+  `;
+}
+
+function renderVoidDialog() {
+  const dialog = state.voidDialog;
+  if (!dialog) return "";
+  const transaction = state.dashboard?.recentTransactions.find(
+    (item) => item.id === dialog.transactionId,
+  );
+  if (!transaction) return "";
+  const processing = state.pendingAction === transaction.id;
+  const reason = escapeHtml(dialog.reason);
+  return `
+    <div class="void-backdrop" data-void-backdrop>
+      <section class="void-dialog" role="dialog" aria-modal="true" aria-labelledby="voidDialogTitle">
+        <header class="void-dialog-header">
+          <div class="void-dialog-title-wrap">
+            <span class="void-dialog-icon" aria-hidden="true"><i data-lucide="ban"></i></span>
+            <div>
+              <span class="void-dialog-kicker">流水更正</span>
+              <h2 id="voidDialogTitle">作废这笔流水</h2>
+            </div>
+          </div>
+          <button class="void-dialog-close" type="button" data-void-cancel aria-label="关闭作废窗口" title="关闭"><i data-lucide="x"></i></button>
+        </header>
+        <div class="void-dialog-body">
+          <div class="void-transaction-summary">
+            <div>
+              <strong>${escapeHtml(transaction.title)}</strong>
+              <span>${escapeHtml(transaction.accountName)} · ${escapeHtml(transaction.categoryName)} · ${formatDate(transaction.occurredAt)}</span>
+            </div>
+            <strong class="${transaction.direction === "expense" ? "amount-out" : "amount-in"}">${formatSignedMoney(transaction.amountCents, state.dashboard?.ledger.currency ?? "CNY", transaction.direction)}</strong>
+          </div>
+          <p class="void-warning">作废后不再计入余额和财务分析，但不会自动追回已经发生的真实款项。原流水和审计记录会继续保留。</p>
+          <label class="void-reason-field">
+            <span>作废原因</span>
+            <textarea id="voidReasonInput" maxlength="200" rows="4" placeholder="请输入作废原因">${reason}</textarea>
+            <small>必填，最多 200 个字符</small>
+          </label>
+        </div>
+        <footer class="void-dialog-footer">
+          <button class="secondary-button" type="button" data-void-cancel ${processing ? "disabled" : ""}>取消</button>
+          <button class="danger-button" type="button" data-void-confirm ${processing || !dialog.reason.trim() ? "disabled" : ""}>${processing ? "处理中" : "确认作废"}</button>
+        </footer>
+      </section>
     </div>
   `;
 }
@@ -1408,6 +1464,7 @@ function render() {
       ${dashboard && ledger ? renderBottomNav(dashboard) : ""}
       ${state.toast ? `<div class="toast" role="status">${escapeHtml(state.toast)}</div>` : ""}
       ${renderDatePicker()}
+      ${renderVoidDialog()}
     </main>
   `;
 
@@ -1949,10 +2006,13 @@ function renderBalancePanel(dashboard: LedgerDashboard) {
   const { ledger } = dashboard;
   const canViewBalances = ledger.canViewBalances;
   const pendingPaymentCount = dashboard.recentTransactions.filter(
-    (transaction) => transaction.paymentState === "pending_payment",
+    (transaction) =>
+      transaction.approvalState === "approved" && transaction.paymentState === "pending_payment",
   ).length;
   const pendingReceiptCount = dashboard.recentTransactions.filter(
-    (transaction) => transaction.paymentState === "paid_pending_receipt",
+    (transaction) =>
+      transaction.approvalState === "approved" &&
+      transaction.paymentState === "paid_pending_receipt",
   ).length;
   const organization = ledger.organizationName
     ? `<span class="context-pill">${escapeHtml(ledger.organizationName)}</span>`
@@ -2500,6 +2560,10 @@ function renderTransactionList(dashboard: LedgerDashboard) {
       return transaction.approvalState === "rejected";
     }
 
+    if (state.filter === "voided") {
+      return transaction.approvalState === "voided";
+    }
+
     return true;
   });
   const filterCounts: Record<TransactionFilter, number> = {
@@ -2512,6 +2576,9 @@ function renderTransactionList(dashboard: LedgerDashboard) {
     ).length,
     rejected: dashboard.recentTransactions.filter(
       (transaction) => transaction.approvalState === "rejected",
+    ).length,
+    voided: dashboard.recentTransactions.filter(
+      (transaction) => transaction.approvalState === "voided",
     ).length,
   };
 
@@ -2546,6 +2613,7 @@ function renderTransactionList(dashboard: LedgerDashboard) {
           ${renderFilterButton("pending", "待审", filterCounts.pending)}
           ${renderFilterButton("approved", "已入账", filterCounts.approved)}
           ${renderFilterButton("rejected", "驳回", filterCounts.rejected)}
+          ${renderFilterButton("voided", "作废", filterCounts.voided)}
         </div>
       </div>
       <div class="transaction-list">
@@ -2660,11 +2728,19 @@ function renderTransactionActions(
     return "";
   }
   const canMarkPaid =
-    dashboard.ledger.role === "business_owner" && transaction.paymentState === "pending_payment";
+    dashboard.ledger.role === "business_owner" &&
+    transaction.approvalState === "approved" &&
+    transaction.paymentState === "pending_payment";
   const canConfirmReceipt =
+    transaction.approvalState === "approved" &&
     transaction.paymentState === "paid_pending_receipt" &&
     transaction.createdByUserId === state.currentUser?.id;
-  if (!canMarkPaid && !canConfirmReceipt) {
+  const canVoid =
+    dashboard.ledger.kind === "organization" &&
+    dashboard.ledger.role === "business_owner" &&
+    state.cloudStatus.state === "online" &&
+    transaction.approvalState === "approved";
+  if (!canMarkPaid && !canConfirmReceipt && !canVoid) {
     return "";
   }
 
@@ -2677,6 +2753,11 @@ function renderTransactionActions(
     ${
       canConfirmReceipt
         ? `<button class="primary-button" type="button" data-payment-action="confirm-receipt" data-transaction-id="${escapeHtml(transaction.id)}">确认收到款项</button>`
+        : ""
+    }
+    ${
+      canVoid
+        ? `<button class="danger-button" type="button" data-void-transaction="${escapeHtml(transaction.id)}">作废</button>`
         : ""
     }
   </div>`;
@@ -3257,6 +3338,28 @@ function bindEvents() {
     });
   });
 
+  app.querySelectorAll<HTMLButtonElement>("[data-void-transaction]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const transactionId = button.dataset.voidTransaction;
+      if (transactionId) openVoidDialog(transactionId);
+    });
+  });
+  app.querySelector<HTMLElement>("[data-void-backdrop]")?.addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeVoidDialog();
+  });
+  app.querySelectorAll<HTMLButtonElement>("[data-void-cancel]").forEach((button) => {
+    button.addEventListener("click", closeVoidDialog);
+  });
+  app.querySelector<HTMLTextAreaElement>("#voidReasonInput")?.addEventListener("input", (event) => {
+    if (!state.voidDialog) return;
+    state.voidDialog.reason = (event.currentTarget as HTMLTextAreaElement).value;
+    const confirmButton = app.querySelector<HTMLButtonElement>("[data-void-confirm]");
+    if (confirmButton) confirmButton.disabled = !state.voidDialog.reason.trim();
+  });
+  app.querySelector<HTMLButtonElement>("[data-void-confirm]")?.addEventListener("click", () => {
+    void submitVoidTransaction();
+  });
+
   app.querySelector<HTMLButtonElement>("#retryButton")?.addEventListener("click", () => {
     void loadInitialState();
   });
@@ -3308,6 +3411,68 @@ async function saveProfile() {
   } catch (error) {
     showToast(friendlyError(error, "保存账号信息失败"));
   } finally {
+    state.pendingAction = undefined;
+    render();
+  }
+}
+
+function openVoidDialog(transactionId: string) {
+  const dashboard = state.dashboard;
+  const transaction = dashboard?.recentTransactions.find((item) => item.id === transactionId);
+  if (!dashboard || !transaction || state.pendingAction) return;
+  if (
+    dashboard.ledger.kind !== "organization" ||
+    dashboard.ledger.role !== "business_owner" ||
+    transaction.approvalState !== "approved"
+  ) {
+    return;
+  }
+  if (state.cloudStatus.state !== "online") {
+    showToast("联网后才能作废公账流水");
+    return;
+  }
+  state.voidDialog = { transactionId, reason: "" };
+  render();
+  app.querySelector<HTMLTextAreaElement>("#voidReasonInput")?.focus();
+}
+
+function closeVoidDialog() {
+  if (state.pendingAction && state.voidDialog?.transactionId === state.pendingAction) return;
+  state.voidDialog = undefined;
+  render();
+}
+
+async function submitVoidTransaction() {
+  const dialog = state.voidDialog;
+  if (!dialog || state.pendingAction) return;
+  const reason = dialog.reason.trim();
+  if (!reason) {
+    showToast("请输入作废原因");
+    return;
+  }
+  try {
+    state.loading = true;
+    state.pendingAction = dialog.transactionId;
+    render();
+    const transaction = await cloudLedgerApi.voidTransaction(dialog.transactionId, reason);
+    state.voidDialog = undefined;
+    state.analysis = undefined;
+    state.analysisError = undefined;
+    resetAnalysisDetail();
+    state.auditData = undefined;
+    state.auditDetailTransactionId = undefined;
+    state.cachedDashboards = {};
+    state.cachedAuditPeriods = {};
+    state.activityMonth = transactionMonthKey(transaction.occurredAt);
+    state.activityDay = transactionDayKey(transaction.occurredAt);
+    await refreshDashboard();
+    state.view = "activity";
+    state.filter = "voided";
+    showToast("已作废流水，已从余额和分析中排除");
+  } catch (error) {
+    showToast(friendlyError(error, "作废流水失败"));
+  } finally {
+    state.loading = false;
     state.pendingAction = undefined;
     render();
   }
@@ -3618,6 +3783,18 @@ function friendlyError(error: unknown, fallback: string) {
   if (message.includes("only the applicant can confirm receipt")) {
     return "只有申请人可以确认收到款项";
   }
+  if (message.includes("void reason is required")) {
+    return "请输入作废原因";
+  }
+  if (message.includes("void reason must not exceed 200 characters")) {
+    return "作废原因不能超过 200 个字符";
+  }
+  if (message.includes("only organization public-ledger transactions can be voided")) {
+    return "只能作废公账流水";
+  }
+  if (message.includes("transaction is not eligible for voiding")) {
+    return "这笔流水当前不能作废，只能作废已批准流水";
+  }
   if (message.includes("not authorized")) {
     return "当前账号没有权限执行此操作";
   }
@@ -3788,7 +3965,7 @@ function roleLabel(role: Ledger["role"]) {
 function transactionStateLabel(transaction: LedgerDashboard["recentTransactions"][number]) {
   if (transaction.approvalState === "pending") return "待老板审批";
   if (transaction.approvalState === "rejected") return "已驳回";
-  if (transaction.approvalState === "deleted") return "已作废";
+  if (transaction.approvalState === "voided") return "已作废";
   if (transaction.approvalState === "draft") return "草稿";
   if (transaction.paymentState === "pending_payment") return "已批准待打款";
   if (transaction.paymentState === "paid_pending_receipt") return "已打款待确认";
@@ -3802,7 +3979,7 @@ function statusClass(stateValue: ApprovalState) {
     pending: "is-pending",
     approved: "is-approved",
     rejected: "is-rejected",
-    deleted: "is-deleted",
+    voided: "is-voided",
   };
 
   return classes[stateValue];
@@ -3817,7 +3994,7 @@ function auditActionLabel(action: LedgerDashboard["auditTrail"][number]["action"
     transaction_paid: "打款",
     transaction_received: "确认收款",
     transaction_auto_approved: "自动批准",
-    transaction_deleted: "删除",
+    transaction_voided: "作废",
   };
 
   return labels[action];
@@ -3832,7 +4009,7 @@ function auditActionIcon(action: LedgerDashboard["auditTrail"][number]["action"]
     transaction_paid: "banknote",
     transaction_received: "hand-coins",
     transaction_auto_approved: "badge-check",
-    transaction_deleted: "trash-2",
+    transaction_voided: "ban",
   };
   return icons[action];
 }
@@ -3843,7 +4020,7 @@ function approvalStateLabel(stateValue: ApprovalState) {
     pending: "待审批",
     approved: "已批准",
     rejected: "已驳回",
-    deleted: "已作废",
+    voided: "已作废",
   };
   return labels[stateValue];
 }

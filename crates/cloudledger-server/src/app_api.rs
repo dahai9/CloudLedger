@@ -5,9 +5,9 @@ use axum::{
 };
 use cloudledger_service::{
     AppConfirmTransactionReceiptInput, AppCreateCategoryInput, AppCreateTransactionInput,
-    AppDecideApprovalInput, AppMarkTransactionPaidInput, AuditPeriodDto, AuditPeriodGranularity,
-    CategoryDto, FinancialAnalysisDto, FinancialMemberDetailDto, FinancialMonthDetailDto,
-    LedgerOverview, TransactionDto, TransactionMonthDto,
+    AppDecideApprovalInput, AppMarkTransactionPaidInput, AppVoidTransactionInput, AuditPeriodDto,
+    AuditPeriodGranularity, CategoryDto, FinancialAnalysisDto, FinancialMemberDetailDto,
+    FinancialMonthDetailDto, LedgerOverview, TransactionDto, TransactionMonthDto,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -286,6 +286,37 @@ pub async fn mark_transaction_paid(
         let mut staged_service = service.clone();
         let transaction = staged_service
             .mark_transaction_paid(input)
+            .map_err(ApiError::from_service)?;
+        (transaction, staged_service)
+    };
+    state
+        .storage
+        .save_ledger(staged_service.snapshot())
+        .await
+        .map_err(ApiError::from_storage)?;
+    *state
+        .ledger_service
+        .lock()
+        .map_err(|_| ApiError::internal("ledger service lock poisoned"))? = staged_service;
+    Ok(Json(transaction))
+}
+
+pub async fn void_transaction(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(mut input): Json<AppVoidTransactionInput>,
+) -> Result<Json<TransactionDto>, ApiError> {
+    let _write_guard = state.write_gate.lock().await;
+    let session = auth_routes::authenticate(&state, &headers)?;
+    input.actor_user_id = session.user.id;
+    let (transaction, staged_service) = {
+        let service = state
+            .ledger_service
+            .lock()
+            .map_err(|_| ApiError::internal("ledger service lock poisoned"))?;
+        let mut staged_service = service.clone();
+        let transaction = staged_service
+            .void_transaction(input)
             .map_err(ApiError::from_service)?;
         (transaction, staged_service)
     };
