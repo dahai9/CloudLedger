@@ -237,6 +237,29 @@ PostgreSQL 使用 cloudledger_runtime
 database.auto_migrate = false
 ```
 
+### 客户端最低版本与强制升级
+
+首次选择镜像版本时，工具还会写入以下三个版本控制配置；它们同时保存在
+`/etc/cloudledger/ops.env` 和生成的 `server.toml` 中：
+
+```text
+CLOUDLEDGER_CLIENT_VERSION=<当前发布客户端的 SemVer>
+CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION=<允许继续访问的最低 SemVer>
+CLOUDLEDGER_CLIENT_DOWNLOAD_URL=<HTTPS 官方下载页>
+```
+
+默认最低版本与所选发布版本一致。生产升级到新 tag 时，升级事务会先更新这两个版本
+值并重新生成 `server.toml`，再启动新后端；迁移开始前若失败，会连同配置一起恢复。
+下载地址必须是 HTTPS 官方地址。不要直接编辑 `server.toml`，应通过 `1 → 4` 重新选择
+镜像和版本策略，随后执行 `1 → 6` 生成后端配置。
+
+Tauri 客户端会在每次启动、回到前台和定时刷新时读取 `GET /client/version`，并为所有
+请求带上客户端版本。在线检测到低于最低版本时，`/auth/*` 与 `/app/*` 会返回
+`426 client_update_required`；客户端将停止业务操作，只显示当前版本、最低版本和官方下载
+按钮。`/health`、`/ready`、版本检查、首次 bootstrap 与 CORS 预检不会受此限制。已经离线
+的客户端无法向服务端确认版本，因此仍可使用本地缓存；一旦恢复联网并确认版本过低，必须
+升级后才能继续使用在线功能。
+
 配置 rclone 时选择“打开 rclone 数字配置向导”。OneDrive OAuth 通常需要浏览器
 回调；先在管理员电脑建立隧道：
 

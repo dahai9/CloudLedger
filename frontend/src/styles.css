@@ -2303,6 +2303,100 @@ button:not(:disabled):active {
   margin-top: 5px;
 }
 
+.analysis-heading-actions {
+  display: grid;
+  justify-items: end;
+  gap: 8px;
+}
+
+.analysis-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(72px, 1fr));
+  gap: 4px;
+  padding: 4px;
+  border-radius: 8px;
+  background: #eef2ea;
+}
+
+.analysis-tabs .filter-tab {
+  min-height: 34px;
+  border-radius: 7px;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.analysis-tabs .filter-tab.is-active {
+  background: #fff;
+  box-shadow: 0 4px 14px rgb(32 33 31 / 8%);
+}
+
+.month-picker-button {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.month-picker-button:hover,
+.month-picker-button:focus-visible {
+  border-color: var(--blue);
+  outline: none;
+}
+
+.month-picker-button svg {
+  width: 15px;
+  height: 15px;
+  color: var(--blue);
+}
+
+.update-required-panel {
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+  padding: 32px 22px;
+  text-align: center;
+}
+
+.update-required-panel h1,
+.update-required-panel p {
+  margin: 0;
+}
+
+.update-required-panel p {
+  max-width: 300px;
+  color: var(--muted);
+  line-height: 1.65;
+}
+
+.update-required-panel small {
+  color: var(--muted);
+}
+
+.update-required-icon {
+  display: grid;
+  width: 52px;
+  height: 52px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--blue-soft);
+  color: var(--blue);
+}
+
+.update-required-icon svg {
+  width: 26px;
+  height: 26px;
+}
+
 .analysis-range {
   display: grid;
   grid-template-columns: repeat(3, minmax(60px, 1fr));
@@ -3087,6 +3181,15 @@ button:not(:disabled):active {
   .analysis-heading {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .analysis-heading-actions {
+    width: 100%;
+    justify-items: stretch;
+  }
+
+  .month-picker-button {
+    justify-content: center;
   }
 
   .analysis-detail-heading .analysis-back-button {

@@ -521,6 +521,7 @@ dependencies = [
  "ipnet",
  "rand_core 0.6.4",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

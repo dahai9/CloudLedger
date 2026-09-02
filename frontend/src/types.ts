@@ -53,6 +53,13 @@ export interface CloudStatus {
   detail?: string;
 }
 
+export interface ClientVersionStatus {
+  currentVersion: string;
+  minSupportedVersion: string;
+  downloadUrl: string;
+  updateRequired: boolean;
+}
+
 export interface UserSession {
   currentUser: UserAccount;
   cloudStatus: CloudStatus;

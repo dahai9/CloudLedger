@@ -11,6 +11,7 @@ pub mod state;
 pub mod storage;
 pub mod sync;
 pub mod turnstile;
+pub mod version;
 
 use crate::{login_protection::SecurityRateKind, request_security::RequestContext};
 use axum::{
@@ -62,9 +63,11 @@ pub fn router(state: ServerState) -> Router {
     let cors = cors_layer(&state);
     let request_security = state.request_security.clone();
     let rate_limit_state = state.clone();
+    let version_state = state.clone();
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/client/version", get(version::client_version))
         .route("/sync/ping", get(sync::sync_ping))
         .route("/auth/login", post(auth_routes::legacy_upgrade))
         .route("/auth/refresh", post(auth_routes::legacy_upgrade))
@@ -120,6 +123,10 @@ pub fn router(state: ServerState) -> Router {
         .layer(middleware::from_fn_with_state(
             request_security,
             request_security::resolve_request_context,
+        ))
+        .layer(middleware::from_fn_with_state(
+            version_state,
+            version::enforce_client_version,
         ))
         .layer(TraceLayer::new_for_http())
         // Keep CORS outermost so rate-limit and authentication failures remain
@@ -183,7 +190,11 @@ fn cors_layer(state: &ServerState) -> CorsLayer {
         .iter()
         .map(|origin| HeaderValue::from_str(origin).expect("validated CORS origin"))
         .collect::<Vec<_>>();
-    let mut headers = vec![AUTHORIZATION, CONTENT_TYPE];
+    let mut headers = vec![
+        AUTHORIZATION,
+        CONTENT_TYPE,
+        HeaderName::from_static("x-cloudledger-client-version"),
+    ];
     if state.ngrok_warning_bypass_enabled {
         headers.push(HeaderName::from_static("ngrok-skip-browser-warning"));
     }
@@ -239,7 +250,7 @@ async fn auth_bootstrap(State(state): State<ServerState>) -> Json<AuthBootstrapR
 
 #[cfg(test)]
 mod http_tests {
-    use std::{fs, net::SocketAddr};
+    use std::{fs, net::SocketAddr, sync::Arc};
 
     use axum::{
         body::{to_bytes, Body},
@@ -277,6 +288,77 @@ mod http_tests {
                 .expect("bearer header"),
         );
         request
+    }
+
+    #[tokio::test]
+    async fn client_version_endpoint_and_gate_enforce_the_minimum_version() {
+        let data_dir = std::env::temp_dir().join(format!("cloudledger-http-{}", Uuid::new_v4()));
+        let mut state = ServerState::load(data_dir.clone()).expect("load test state");
+        *Arc::make_mut(&mut state.client_version) = "0.1.14".to_string();
+        *Arc::make_mut(&mut state.min_supported_client_version) = "0.1.13".to_string();
+        *Arc::make_mut(&mut state.client_download_url) =
+            "https://github.com/dahai9/CloudLedger/releases/latest".to_string();
+        let app = router(state);
+
+        let mut version_request = request(Method::GET, "/client/version", json!({}));
+        version_request.headers_mut().insert(
+            "x-cloudledger-client-version",
+            HeaderValue::from_static("0.1.12"),
+        );
+        let version_response = app.clone().oneshot(version_request).await.unwrap();
+        assert_eq!(version_response.status(), StatusCode::OK);
+        let version_body = to_bytes(version_response.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&version_body).unwrap(),
+            json!({
+                "currentVersion": "0.1.14",
+                "minSupportedVersion": "0.1.13",
+                "downloadUrl": "https://github.com/dahai9/CloudLedger/releases/latest",
+                "updateRequired": true
+            })
+        );
+
+        let mut outdated = request(Method::GET, "/app/overview", json!({}));
+        outdated.headers_mut().insert(
+            "x-cloudledger-client-version",
+            HeaderValue::from_static("0.1.12"),
+        );
+        let outdated = app.clone().oneshot(outdated).await.unwrap();
+        assert_eq!(outdated.status(), StatusCode::UPGRADE_REQUIRED);
+        let outdated_body = to_bytes(outdated.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&outdated_body).unwrap()["code"],
+            "client_update_required"
+        );
+
+        let mut supported = request(Method::GET, "/app/overview", json!({}));
+        supported.headers_mut().insert(
+            "x-cloudledger-client-version",
+            HeaderValue::from_static("0.1.13"),
+        );
+        let supported = app.clone().oneshot(supported).await.unwrap();
+        assert_eq!(supported.status(), StatusCode::UNAUTHORIZED);
+
+        let preflight = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/app/overview")
+            .header(header::ORIGIN, "tauri://localhost")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .header(
+                header::ACCESS_CONTROL_REQUEST_HEADERS,
+                "authorization,x-cloudledger-client-version",
+            )
+            .body(Body::empty())
+            .unwrap();
+        let preflight = app.oneshot(preflight).await.unwrap();
+        assert_eq!(preflight.status(), StatusCode::OK);
+        assert!(preflight
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|headers| headers.contains("x-cloudledger-client-version")));
+
+        fs::remove_dir_all(data_dir).expect("remove test data");
     }
 
     #[tokio::test]

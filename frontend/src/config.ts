@@ -19,3 +19,5 @@ export const cloudBaseUrl =
   configuredBaseUrl(window.__CLOUDLEDGER_CONFIG__?.apiBaseUrl) ??
   configuredBaseUrl(import.meta.env.VITE_CLOUDLEDGER_CLOUD_URL) ??
   defaultWebBaseUrl();
+
+export const clientVersion = import.meta.env.VITE_CLOUDLEDGER_APP_VERSION.trim();

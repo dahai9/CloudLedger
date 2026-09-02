@@ -26,6 +26,7 @@ readonly CLOUDFLARE_IPV4_URL='https://www.cloudflare.com/ips-v4'
 readonly CLOUDFLARE_IPV6_URL='https://www.cloudflare.com/ips-v6'
 readonly -a OPS_CONFIG_KEYS=(
   CLOUDLEDGER_GHCR_OWNER CLOUDLEDGER_RELEASE_TAG
+  CLOUDLEDGER_CLIENT_VERSION CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION CLOUDLEDGER_CLIENT_DOWNLOAD_URL
   CLOUDLEDGER_SERVER_IMAGE CLOUDLEDGER_POSTGRES_IMAGE CLOUDLEDGER_CADDY_IMAGE CLOUDLEDGER_ANCHOR_IMAGE
   CLOUDLEDGER_API_DOMAIN CLOUDLEDGER_HTTP_PUBLISH CLOUDLEDGER_HTTPS_PUBLISH
   CLOUDLEDGER_CADDY_ORIGIN_CERT_PATH CLOUDLEDGER_CADDY_ORIGIN_KEY_PATH
@@ -259,6 +260,12 @@ read_choice() {
 }
 
 valid_tag() { [[ "$1" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([._-][A-Za-z0-9.-]+)?$ && "$1" != latest ]]; }
+valid_client_version() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?(\+[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; }
+client_version_for_tag() {
+  local version=${1#v}
+  printf '%s' "${version//.alpha./-alpha.}"
+}
+valid_download_url() { [[ "$1" =~ ^https://[^[:space:]\"\\]+$ ]]; }
 valid_domain() { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ && "$1" == *.* ]]; }
 valid_ghcr_image() {
   local image=$1 package=$2 tag=$3
@@ -635,14 +642,26 @@ choose_tag() {
 }
 
 configure_images() {
-  local owner tag
+  local owner tag client_version min_supported_version download_url
   load_env || return 1
   read -r -p "GHCR 仓库所有者 [${CLOUDLEDGER_GHCR_OWNER:-dahai9}]: " owner
   owner=${owner:-${CLOUDLEDGER_GHCR_OWNER:-dahai9}}
   [[ "$owner" =~ ^[a-z0-9_.-]+$ ]] || { fail 'GHCR 仓库所有者必须使用小写字母、数字、点、下划线或连字符。'; return 1; }
   tag=$(choose_tag) || return 1
+  client_version=$(client_version_for_tag "$tag")
+  read -r -p "最低支持客户端版本 [${client_version}]: " min_supported_version
+  min_supported_version=${min_supported_version:-$client_version}
+  min_supported_version=${min_supported_version#v}
+  min_supported_version=${min_supported_version//.alpha./-alpha.}
+  valid_client_version "$min_supported_version" || { fail '最低支持客户端版本必须是 SemVer。'; return 1; }
+  read -r -p '官方下载地址 [https://github.com/dahai9/CloudLedger/releases/latest]: ' download_url
+  download_url=${download_url:-https://github.com/dahai9/CloudLedger/releases/latest}
+  valid_download_url "$download_url" || { fail '官方下载地址必须是 HTTPS URL，且不能包含空格或引号。'; return 1; }
   set_env_value CLOUDLEDGER_GHCR_OWNER "$owner" || return 1
   set_env_value CLOUDLEDGER_RELEASE_TAG "$tag" || return 1
+  set_env_value CLOUDLEDGER_CLIENT_VERSION "$client_version" || return 1
+  set_env_value CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION "$min_supported_version" || return 1
+  set_env_value CLOUDLEDGER_CLIENT_DOWNLOAD_URL "$download_url" || return 1
   set_env_value CLOUDLEDGER_SERVER_IMAGE "ghcr.io/$owner/cloudledger-server:$tag" || return 1
   set_env_value CLOUDLEDGER_POSTGRES_IMAGE "ghcr.io/$owner/cloudledger-postgres:$tag" || return 1
   set_env_value CLOUDLEDGER_CADDY_IMAGE "ghcr.io/$owner/cloudledger-caddy:$tag" || return 1
@@ -835,7 +854,18 @@ validate_server_config_values() {
 write_server_config_file() {
   local target=$1 database_name=$2 api_domain=$3 runtime_password=$4 admin_path=$5 admin_token=$6
   local turnstile_site=$7 turnstile_secret=$8 audit_key_id=$9
-  local audit_hmac=${10} identifier_hmac=${11} runtime_url
+  local audit_hmac=${10} identifier_hmac=${11} runtime_url client_version min_supported_client_version download_url
+  local configured_client_version=${12:-${CLOUDLEDGER_CLIENT_VERSION:-}}
+  local configured_min_supported_version=${13:-${CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION:-}}
+  local configured_download_url=${14:-${CLOUDLEDGER_CLIENT_DOWNLOAD_URL:-}}
+  client_version=${configured_client_version:-$(client_version_for_tag "${CLOUDLEDGER_RELEASE_TAG:-}")}
+  client_version=${client_version:-0.0.0}
+  min_supported_client_version=${configured_min_supported_version:-$client_version}
+  min_supported_client_version=$(client_version_for_tag "$min_supported_client_version")
+  download_url=${configured_download_url:-https://github.com/dahai9/CloudLedger/releases/latest}
+  valid_client_version "$client_version" || { fail '客户端版本必须是 SemVer。'; return 1; }
+  valid_client_version "$min_supported_client_version" || { fail '最低支持客户端版本必须是 SemVer。'; return 1; }
+  valid_download_url "$download_url" || { fail '官方下载地址必须是 HTTPS URL，且不能包含空格或引号。'; return 1; }
   validate_server_config_values "$database_name" "$api_domain" "$runtime_password" "$admin_path" "$admin_token" \
     "$turnstile_site" "$turnstile_secret" "$audit_key_id" "$audit_hmac" "$identifier_hmac" || return 1
   runtime_url="postgres://cloudledger_runtime:${runtime_password}@127.0.0.1:5432/${database_name}"
@@ -848,6 +878,9 @@ public_api_url = "https://${api_domain}"
 public_admin_url = "https://${api_domain}"
 allow_insecure_lan = false
 web_login_enabled = false
+client_version = "${client_version}"
+min_supported_client_version = "${min_supported_client_version}"
+client_download_url = "${download_url}"
 data_dir = "/var/lib/cloudledger"
 
 [database]
@@ -886,7 +919,7 @@ EOF
 write_server_config_from_env_file() {
   local source=$1 target=$2 database_name=$3
   local api_domain runtime_password admin_path admin_token turnstile_site turnstile_secret
-  local audit_key_id audit_hmac identifier_hmac
+  local audit_key_id audit_hmac identifier_hmac client_version min_supported_client_version download_url
   ops_env_file_value "$source" CLOUDLEDGER_API_DOMAIN api_domain || return 1
   ops_env_file_value "$source" CLOUDLEDGER_RUNTIME_DB_PASSWORD runtime_password || return 1
   ops_env_file_value "$source" CLOUDLEDGER_ADMIN_PATH admin_path || return 1
@@ -896,8 +929,12 @@ write_server_config_from_env_file() {
   ops_env_file_value "$source" CLOUDLEDGER_AUDIT_KEY_ID audit_key_id || return 1
   ops_env_file_value "$source" CLOUDLEDGER_AUDIT_HMAC_KEY audit_hmac || return 1
   ops_env_file_value "$source" CLOUDLEDGER_AUDIT_IDENTIFIER_HMAC_KEY identifier_hmac || return 1
+  ops_env_file_value "$source" CLOUDLEDGER_CLIENT_VERSION client_version || return 1
+  ops_env_file_value "$source" CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION min_supported_client_version || return 1
+  ops_env_file_value "$source" CLOUDLEDGER_CLIENT_DOWNLOAD_URL download_url || return 1
   write_server_config_file "$target" "$database_name" "$api_domain" "$runtime_password" "$admin_path" \
-    "$admin_token" "$turnstile_site" "$turnstile_secret" "$audit_key_id" "$audit_hmac" "$identifier_hmac"
+    "$admin_token" "$turnstile_site" "$turnstile_secret" "$audit_key_id" "$audit_hmac" "$identifier_hmac" \
+    "$client_version" "$min_supported_client_version" "$download_url"
 }
 
 render_server_config() {
@@ -906,7 +943,8 @@ render_server_config() {
   local name temp config_dir
   for name in CLOUDLEDGER_API_DOMAIN CLOUDLEDGER_RUNTIME_DB_PASSWORD CLOUDLEDGER_ADMIN_PATH \
     CLOUDLEDGER_ADMIN_TOKEN CLOUDLEDGER_TURNSTILE_SITE_KEY CLOUDLEDGER_TURNSTILE_SECRET_KEY \
-    CLOUDLEDGER_AUDIT_KEY_ID CLOUDLEDGER_AUDIT_HMAC_KEY CLOUDLEDGER_AUDIT_IDENTIFIER_HMAC_KEY; do
+    CLOUDLEDGER_AUDIT_KEY_ID CLOUDLEDGER_AUDIT_HMAC_KEY CLOUDLEDGER_AUDIT_IDENTIFIER_HMAC_KEY \
+    CLOUDLEDGER_CLIENT_VERSION CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION CLOUDLEDGER_CLIENT_DOWNLOAD_URL; do
     require_env_value "$name" || return 1
   done
   config_dir=$(dirname "$SERVER_CONFIG") || return 1
@@ -918,7 +956,9 @@ render_server_config() {
   write_server_config_file "$temp" cloudledger "$CLOUDLEDGER_API_DOMAIN" "$CLOUDLEDGER_RUNTIME_DB_PASSWORD" \
     "$CLOUDLEDGER_ADMIN_PATH" "$CLOUDLEDGER_ADMIN_TOKEN" "$CLOUDLEDGER_TURNSTILE_SITE_KEY" \
     "$CLOUDLEDGER_TURNSTILE_SECRET_KEY" "$CLOUDLEDGER_AUDIT_KEY_ID" "$CLOUDLEDGER_AUDIT_HMAC_KEY" \
-    "$CLOUDLEDGER_AUDIT_IDENTIFIER_HMAC_KEY" || { remove_sensitive_path "$temp"; return 1; }
+    "$CLOUDLEDGER_AUDIT_IDENTIFIER_HMAC_KEY" "$CLOUDLEDGER_CLIENT_VERSION" \
+    "$CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION" "$CLOUDLEDGER_CLIENT_DOWNLOAD_URL" \
+    || { remove_sensitive_path "$temp"; return 1; }
   if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
     chown 10001:10001 "$temp" || { remove_sensitive_path "$temp"; return 1; }
   fi
@@ -932,7 +972,8 @@ normalize_ops_env() {
   load_env || return 1
   local name
   for name in CLOUDLEDGER_GHCR_OWNER CLOUDLEDGER_SERVER_IMAGE CLOUDLEDGER_POSTGRES_IMAGE CLOUDLEDGER_CADDY_IMAGE \
-    CLOUDLEDGER_ANCHOR_IMAGE CLOUDLEDGER_RELEASE_TAG \
+    CLOUDLEDGER_ANCHOR_IMAGE CLOUDLEDGER_RELEASE_TAG CLOUDLEDGER_CLIENT_VERSION \
+    CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION CLOUDLEDGER_CLIENT_DOWNLOAD_URL \
     CLOUDLEDGER_API_DOMAIN CLOUDLEDGER_BOOTSTRAP_DB_PASSWORD CLOUDLEDGER_MIGRATION_DB_PASSWORD \
     CLOUDLEDGER_RUNTIME_DB_PASSWORD CLOUDLEDGER_BOOTSTRAP_DATABASE_URL CLOUDLEDGER_MIGRATION_DATABASE_URL \
     CLOUDLEDGER_CADDY_ORIGIN_CERT_PATH CLOUDLEDGER_CADDY_ORIGIN_KEY_PATH; do
@@ -960,6 +1001,7 @@ validate_deployment_config() {
   done
   for name in CLOUDLEDGER_GHCR_OWNER CLOUDLEDGER_SERVER_IMAGE CLOUDLEDGER_POSTGRES_IMAGE CLOUDLEDGER_CADDY_IMAGE \
     CLOUDLEDGER_ANCHOR_IMAGE CLOUDLEDGER_RELEASE_TAG CLOUDLEDGER_API_DOMAIN \
+    CLOUDLEDGER_CLIENT_VERSION CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION CLOUDLEDGER_CLIENT_DOWNLOAD_URL \
     CLOUDLEDGER_BOOTSTRAP_DB_PASSWORD CLOUDLEDGER_MIGRATION_DB_PASSWORD CLOUDLEDGER_RUNTIME_DB_PASSWORD \
     CLOUDLEDGER_BOOTSTRAP_DATABASE_URL CLOUDLEDGER_MIGRATION_DATABASE_URL \
     CLOUDLEDGER_ADMIN_PATH CLOUDLEDGER_ADMIN_TOKEN CLOUDLEDGER_TURNSTILE_SITE_KEY CLOUDLEDGER_TURNSTILE_SECRET_KEY \
@@ -1002,11 +1044,16 @@ validate_deployment_config() {
   if ! write_server_config_file "$temp" cloudledger "$CLOUDLEDGER_API_DOMAIN" "$CLOUDLEDGER_RUNTIME_DB_PASSWORD" \
     "$CLOUDLEDGER_ADMIN_PATH" "$CLOUDLEDGER_ADMIN_TOKEN" "$CLOUDLEDGER_TURNSTILE_SITE_KEY" \
     "$CLOUDLEDGER_TURNSTILE_SECRET_KEY" "$CLOUDLEDGER_AUDIT_KEY_ID" "$CLOUDLEDGER_AUDIT_HMAC_KEY" \
-    "$CLOUDLEDGER_AUDIT_IDENTIFIER_HMAC_KEY" || ! cmp -s "$SERVER_CONFIG" "$temp"; then
+    "$CLOUDLEDGER_AUDIT_IDENTIFIER_HMAC_KEY" "$CLOUDLEDGER_CLIENT_VERSION" \
+    "$CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION" "$CLOUDLEDGER_CLIENT_DOWNLOAD_URL" \
+    || ! cmp -s "$SERVER_CONFIG" "$temp"; then
     remove_sensitive_path "$temp"
     fail '当前 server.toml 不符合工具生成的安全配置模板。'
     return 1
   fi
+  valid_client_version "$CLOUDLEDGER_CLIENT_VERSION" || { fail '客户端版本必须是 SemVer。'; return 1; }
+  valid_client_version "$CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION" || { fail '最低支持客户端版本必须是 SemVer。'; return 1; }
+  valid_download_url "$CLOUDLEDGER_CLIENT_DOWNLOAD_URL" || { fail '官方下载地址必须是 HTTPS URL，且不能包含空格或引号。'; return 1; }
   remove_sensitive_path "$temp" || return 1
   validate_certificate_pair "$CLOUDLEDGER_CADDY_ORIGIN_CERT_PATH" "$CLOUDLEDGER_CADDY_ORIGIN_KEY_PATH" \
     "$CLOUDLEDGER_API_DOMAIN" || return 1
@@ -2438,7 +2485,7 @@ restore_upgrade_assets() {
 }
 
 prepare_legacy_deployment_for_upgrade() {
-  local tag=$1 owner old_cert old_key admin_path admin_token audit_key_id audit_hmac identifier_hmac
+  local tag=$1 owner old_cert old_key admin_path admin_token audit_key_id audit_hmac identifier_hmac target_client_version
   local turnstile_site turnstile_secret
   owner=${CLOUDLEDGER_SERVER_IMAGE#ghcr.io/}; owner=${owner%%/*}
   old_cert=$CLOUDLEDGER_CADDY_ORIGIN_CERT_PATH
@@ -2460,6 +2507,11 @@ prepare_legacy_deployment_for_upgrade() {
   install_cert_pair_locked "$old_cert" "$old_key" || return 1
   set_env_value CLOUDLEDGER_GHCR_OWNER "$owner" || return 1
   set_env_value CLOUDLEDGER_RELEASE_TAG "$tag" || return 1
+  target_client_version=$(client_version_for_tag "$tag")
+  valid_client_version "$target_client_version" || { fail '目标 tag 无法转换为客户端 SemVer。'; return 1; }
+  set_env_value CLOUDLEDGER_CLIENT_VERSION "$target_client_version" || return 1
+  set_env_value CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION "$target_client_version" || return 1
+  set_env_value CLOUDLEDGER_CLIENT_DOWNLOAD_URL 'https://github.com/dahai9/CloudLedger/releases/latest' || return 1
   set_env_value CLOUDLEDGER_SERVER_IMAGE "ghcr.io/$owner/cloudledger-server:$tag" || return 1
   set_env_value CLOUDLEDGER_POSTGRES_IMAGE "ghcr.io/$owner/cloudledger-postgres:$tag" || return 1
   set_env_value CLOUDLEDGER_CADDY_IMAGE "ghcr.io/$owner/cloudledger-caddy:$tag" || return 1
@@ -2565,7 +2617,7 @@ upgrade_locked() {
 }
 
 upgrade_transaction() {
-  local tag=$1 new_server new_postgres new_caddy new_anchor snapshot asset_snapshot rc legacy=0 owner
+  local tag=$1 new_server new_postgres new_caddy new_anchor snapshot asset_snapshot rc legacy=0 owner target_client_version
   local old_server old_postgres old_caddy old_anchor image
   load_env || return 1
   if legacy_deployment_detected; then
@@ -2594,6 +2646,8 @@ upgrade_transaction() {
     new_caddy="${old_caddy%:*}:$tag"
     new_anchor="${old_anchor%:*}:$tag"
   fi
+  target_client_version=$(client_version_for_tag "$tag")
+  valid_client_version "$target_client_version" || { fail '目标 tag 无法转换为客户端 SemVer。'; return 1; }
   log '检查四个目标 GHCR 镜像 manifest...'
   for image in "$new_server" "$new_postgres" "$new_caddy" "$new_anchor"; do
     docker manifest inspect "$image" >/dev/null \
@@ -2620,6 +2674,9 @@ upgrade_transaction() {
       && set_env_value CLOUDLEDGER_CADDY_IMAGE "$new_caddy" \
       && set_env_value CLOUDLEDGER_ANCHOR_IMAGE "$new_anchor" \
       && set_env_value CLOUDLEDGER_RELEASE_TAG "$tag" \
+      && set_env_value CLOUDLEDGER_CLIENT_VERSION "$target_client_version" \
+      && set_env_value CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION "$target_client_version" \
+      && render_server_config \
       || { handle_active_upgrade_abort; return 1; }
   fi
   if upgrade_locked; then

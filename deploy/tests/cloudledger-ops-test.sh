@@ -183,6 +183,9 @@ seed_backup_fixture() {
     'public_admin_url = "https://cloudledger-test.513921.xyz"' \
     'allow_insecure_lan = false' \
     'web_login_enabled = false' \
+    'client_version = "0.1.4"' \
+    'min_supported_client_version = "0.1.4"' \
+    'client_download_url = "https://github.com/dahai9/CloudLedger/releases/latest"' \
     'data_dir = "/var/lib/cloudledger"' \
     '' \
     '[database]' \
@@ -224,6 +227,9 @@ seed_backup_fixture() {
       'CLOUDLEDGER_CADDY_IMAGE=ghcr.io/cloudledger/cloudledger-caddy:v0.1.4' \
       'CLOUDLEDGER_ANCHOR_IMAGE=ghcr.io/cloudledger/cloudledger-network-anchor:v0.1.4' \
       'CLOUDLEDGER_RELEASE_TAG=v0.1.4' \
+      'CLOUDLEDGER_CLIENT_VERSION=0.1.4' \
+      'CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION=0.1.4' \
+      'CLOUDLEDGER_CLIENT_DOWNLOAD_URL=https://github.com/dahai9/CloudLedger/releases/latest' \
       'CLOUDLEDGER_API_DOMAIN=cloudledger-test.513921.xyz' \
       'CLOUDLEDGER_HTTP_PUBLISH=127.0.0.1:18080:80' \
       'CLOUDLEDGER_HTTPS_PUBLISH=443:443' \
@@ -750,6 +756,10 @@ test_restore_with_archived_passwords() {
     -e 's/test-bootstrap-password/current-bootstrap-password/g' \
     -e 's/test-migration-password/current-migration-password/g' \
     -e 's/test-runtime-password/current-runtime-password/g' \
+    -e 's/CLOUDLEDGER_CLIENT_VERSION=0\.1\.4/CLOUDLEDGER_CLIENT_VERSION=0.1.5/g' \
+    -e 's/CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION=0\.1\.4/CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION=0.1.5/g' \
+    -e 's/client_version = "0\.1\.4"/client_version = "0.1.5"/g' \
+    -e 's/min_supported_client_version = "0\.1\.4"/min_supported_client_version = "0.1.5"/g' \
     "$CLOUDLEDGER_OPS_ENV" "$CLOUDLEDGER_SERVER_CONFIG"
   : >"$CLOUDLEDGER_TEST_NFT_STATE"
   printf '4\n6\n%s\nYES\n%s\n0\n0\n' "$name" "$name" | "$OPS" >"$CASE_ROOT/restore.out" 2>&1
@@ -757,6 +767,10 @@ test_restore_with_archived_passwords() {
   assert_contains 'CLOUDLEDGER_BOOTSTRAP_DB_PASSWORD=test-bootstrap-password' "$CLOUDLEDGER_OPS_ENV"
   assert_contains 'CLOUDLEDGER_MIGRATION_DB_PASSWORD=test-migration-password' "$CLOUDLEDGER_OPS_ENV"
   assert_contains 'CLOUDLEDGER_RUNTIME_DB_PASSWORD=test-runtime-password' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'CLOUDLEDGER_CLIENT_VERSION=0.1.4' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION=0.1.4' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'client_version = "0.1.4"' "$CLOUDLEDGER_SERVER_CONFIG"
+  assert_contains 'min_supported_client_version = "0.1.4"' "$CLOUDLEDGER_SERVER_CONFIG"
   assert_trace_order "$CLOUDLEDGER_TEST_TRACE" \
     'restore:dropdb' 'restore:createdb' 'restore:pg-restore' 'postgres:query' 'compose:pull'
 }
@@ -962,6 +976,11 @@ test_upgrade_transaction_order() {
     'http:local-ready' \
     'compose:up:caddy'
   assert_contains 'CLOUDLEDGER_RELEASE_TAG=v0.1.5' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'CLOUDLEDGER_CLIENT_VERSION=0.1.5' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION=0.1.5' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'client_version = "0.1.5"' "$CLOUDLEDGER_SERVER_CONFIG"
+  assert_contains 'min_supported_client_version = "0.1.5"' "$CLOUDLEDGER_SERVER_CONFIG"
+  assert_contains 'client_download_url = "https://github.com/dahai9/CloudLedger/releases/latest"' "$CLOUDLEDGER_SERVER_CONFIG"
   assert_contains '升级完成' "$CASE_ROOT/upgrade.out"
 }
 
@@ -971,6 +990,8 @@ test_upgrade_failure_boundaries() {
   export CLOUDLEDGER_TEST_COMPOSE_FAIL_AT=pull
   printf '3\n3\nv0.1.5\nYES\n0\n0\n' | "$OPS" >"$CASE_ROOT/upgrade.out" 2>&1
   assert_contains 'CLOUDLEDGER_RELEASE_TAG=v0.1.4' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'client_version = "0.1.4"' "$CLOUDLEDGER_SERVER_CONFIG"
+  assert_contains 'min_supported_client_version = "0.1.4"' "$CLOUDLEDGER_SERVER_CONFIG"
   assert_contains 'pre-migration-failure' "$CLOUDLEDGER_OPS_STATE_DIR/upgrade.log"
   assert_contains '已恢复旧镜像配置' "$CASE_ROOT/upgrade.out"
 
@@ -979,6 +1000,8 @@ test_upgrade_failure_boundaries() {
   export CLOUDLEDGER_TEST_COMPOSE_FAIL_AT=migration
   printf '3\n3\nv0.1.5\nYES\n0\n0\n' | "$OPS" >"$CASE_ROOT/upgrade.out" 2>&1
   assert_contains 'CLOUDLEDGER_RELEASE_TAG=v0.1.5' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'client_version = "0.1.5"' "$CLOUDLEDGER_SERVER_CONFIG"
+  assert_contains 'min_supported_client_version = "0.1.5"' "$CLOUDLEDGER_SERVER_CONFIG"
   assert_contains 'post-migration-failure' "$CLOUDLEDGER_OPS_STATE_DIR/upgrade.log"
   assert_contains '禁止盲目降级' "$CASE_ROOT/upgrade.out"
 }
@@ -1004,6 +1027,10 @@ test_legacy_upgrade_adoption() {
   assert_contains 'CLOUDLEDGER_RELEASE_TAG=v0.1.5' "$CLOUDLEDGER_OPS_ENV"
   assert_contains 'CLOUDLEDGER_CADDY_IMAGE=ghcr.io/cloudledger/cloudledger-caddy:v0.1.5' "$CLOUDLEDGER_OPS_ENV"
   assert_contains 'CLOUDLEDGER_ANCHOR_IMAGE=ghcr.io/cloudledger/cloudledger-network-anchor:v0.1.5' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'CLOUDLEDGER_CLIENT_VERSION=0.1.5' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION=0.1.5' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'client_version = "0.1.5"' "$CLOUDLEDGER_SERVER_CONFIG"
+  assert_contains 'min_supported_client_version = "0.1.5"' "$CLOUDLEDGER_SERVER_CONFIG"
   assert_not_contains 'CLOUDLEDGER_HTTP_HOST_PORT=' "$CLOUDLEDGER_OPS_ENV"
   assert_not_contains 'CLOUDLEDGER_HTTPS_HOST_PORT=' "$CLOUDLEDGER_OPS_ENV"
   assert_not_contains 'CLOUDLEDGER_ADMIN_TUNNEL_PORT=' "$CLOUDLEDGER_OPS_ENV"
@@ -1061,6 +1088,14 @@ test_legacy_upgrade_adoption() {
     || fail_test 'legacy signal rollback did not restore server.toml byte-for-byte'
   assert_contains 'legacy-installed-ops' "$CLOUDLEDGER_DEPLOY_DIR/cloudledger-ops.sh"
   assert_contains 'legacy-installed-roles' "$CLOUDLEDGER_DEPLOY_DIR/postgres_roles.sql"
+
+  setup_case legacy-upgrade-alpha-version
+  seed_legacy_upgrade_fixture
+  printf '3\n3\nv0.1.5.alpha.1\nYES\n0\n0\n' | "$OPS" >"$CASE_ROOT/upgrade.out" 2>&1
+  assert_contains 'CLOUDLEDGER_CLIENT_VERSION=0.1.5-alpha.1' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION=0.1.5-alpha.1' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'client_version = "0.1.5-alpha.1"' "$CLOUDLEDGER_SERVER_CONFIG"
+  assert_contains 'min_supported_client_version = "0.1.5-alpha.1"' "$CLOUDLEDGER_SERVER_CONFIG"
 }
 
 test_restore_signal_rollback() {

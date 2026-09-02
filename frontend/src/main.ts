@@ -1,4 +1,5 @@
-import { cloudLedgerApi } from "./api/cloudLedger";
+import { ClientUpdateRequiredError, cloudLedgerApi } from "./api/cloudLedger";
+import { clientVersion } from "./config";
 import { createIcons, icons } from "lucide";
 import { offlineStore, type OfflineSnapshot } from "./offlineStore";
 import "./styles.css";
@@ -12,6 +13,7 @@ import type {
   FinancialAnalysis,
   FinancialMemberDetail,
   FinancialMonthDetail,
+  ClientVersionStatus,
   LoginDraft,
   NewTransactionDraft,
   OfflineTransaction,
@@ -24,13 +26,14 @@ import type {
 } from "./types";
 
 type ViewMode = "activity" | "analysis" | "approval" | "audit";
+type AnalysisTab = "summary" | "month";
 type AnalysisDetailTarget =
   | { kind: "month"; month: string }
   | { kind: "member"; memberId: string };
 type TransactionFilter = "all" | "pending" | "approved" | "rejected" | "voided";
 type AuthStatus = "checking" | "authenticated" | "anonymous";
 type SyncPhase = "idle" | "connecting" | "syncing" | "success" | "failed";
-type DatePickerScope = "activity" | "audit";
+type DatePickerScope = "activity" | "audit" | "analysis";
 
 interface DatePickerState {
   scope: DatePickerScope;
@@ -81,6 +84,8 @@ interface AppState {
   dashboard?: LedgerDashboard;
   analysis?: FinancialAnalysis;
   analysisMonths: AnalysisMonths;
+  analysisTab: AnalysisTab;
+  analysisMonth: string;
   analysisLoading: boolean;
   analysisError?: string;
   analysisDetailTarget?: AnalysisDetailTarget;
@@ -88,6 +93,9 @@ interface AppState {
   analysisMemberDetail?: FinancialMemberDetail;
   analysisDetailLoading: boolean;
   analysisDetailError?: string;
+  analysisMonthLoading: boolean;
+  analysisMonthError?: string;
+  updateRequired?: ClientVersionStatus;
   cachedDashboards: Record<string, LedgerDashboard>;
   cachedAuditPeriods: Record<string, AuditPeriod>;
   outbox: OfflineTransaction[];
@@ -141,8 +149,11 @@ const state: AppState = {
   },
   loading: true,
   analysisMonths: 6,
+  analysisTab: "summary",
+  analysisMonth: currentMonthKey(),
   analysisLoading: false,
   analysisDetailLoading: false,
+  analysisMonthLoading: false,
   cachedDashboards: {},
   cachedAuditPeriods: {},
   outbox: [],
@@ -215,6 +226,37 @@ window.setInterval(() => {
   }
 }, autoRefreshMs);
 
+async function checkClientVersion() {
+  if (!navigator.onLine) return true;
+  try {
+    const status = await cloudLedgerApi.checkClientVersion();
+    state.updateRequired = status.updateRequired ? status : undefined;
+    return !status.updateRequired;
+  } catch (error) {
+    if (applyClientUpdate(error)) return false;
+    return true;
+  }
+}
+
+function applyClientUpdate(error: unknown) {
+  if (!(error instanceof ClientUpdateRequiredError)) return false;
+  state.updateRequired = error.update;
+  state.loading = false;
+  state.pendingAction = undefined;
+  state.datePicker = undefined;
+  state.voidDialog = undefined;
+  state.toast = undefined;
+  state.analysisLoading = false;
+  state.analysisDetailLoading = false;
+  state.error = undefined;
+  resetAnalysisDetail();
+  return true;
+}
+
+function clientVersionLabel(value: string) {
+  return value.startsWith("v") ? value : `v${value}`;
+}
+
 window.addEventListener("focus", () => {
   if (state.authStatus === "authenticated") {
     void refreshRemoteState({ silent: true });
@@ -283,6 +325,12 @@ document.addEventListener("touchcancel", cancelPullRefresh, { passive: true });
 async function loadInitialState() {
   state.loading = true;
 
+  if (!(await checkClientVersion())) {
+    state.loading = false;
+    render();
+    return;
+  }
+
   // A cold start has no in-memory access token. Render the last private
   // snapshot first, then refresh its session and cloud data in the background.
   // After an explicit login, skip this path so another account's cache never
@@ -333,6 +381,9 @@ async function loadInitialState() {
     state.error = undefined;
     await saveOfflineSnapshot();
   } catch (error) {
+    if (applyClientUpdate(error)) {
+      return;
+    }
     const restored = await restoreOfflineState();
     if (restored) {
       state.cloudStatus = {
@@ -394,6 +445,7 @@ async function submitAuthForm() {
     state.authForm.turnstileSiteKey = undefined;
     await loadInitialState();
   } catch (error) {
+    if (applyClientUpdate(error)) return;
     if (cloudLedgerApi.isTurnstileRequired(error)) {
       try {
         const security = await cloudLedgerApi.getLoginSecurity();
@@ -426,6 +478,7 @@ async function logout() {
     render();
     await cloudLedgerApi.logout();
   } catch (error) {
+    if (applyClientUpdate(error)) return;
     showToast(friendlyError(error, "退出失败"));
   } finally {
     if (userId) {
@@ -467,6 +520,8 @@ async function switchLedger(ledgerId: string) {
     state.auditDetailTransactionId = undefined;
     state.analysis = undefined;
     state.analysisError = undefined;
+    state.analysisTab = "summary";
+    resetAnalysisMonth();
     resetAnalysisDetail();
     state.view = "activity";
     state.filter = "all";
@@ -492,6 +547,8 @@ async function switchLedger(ledgerId: string) {
     rememberDashboard(state.dashboard);
     state.analysis = undefined;
     state.analysisError = undefined;
+    state.analysisTab = "summary";
+    resetAnalysisMonth();
     resetAnalysisDetail();
     state.view = "activity";
     state.filter = "all";
@@ -601,7 +658,9 @@ function openDatePicker(scope: DatePickerScope, granularity: PeriodGranularity) 
       ? granularity === "day"
         ? state.activityDay
         : state.activityMonth
-      : state.auditPeriod;
+      : scope === "audit"
+        ? state.auditPeriod
+        : state.analysisMonth;
   const draft = value || (granularity === "day" ? currentDayKey() : currentMonthKey());
   state.datePicker = {
     scope,
@@ -670,6 +729,11 @@ function confirmDatePicker() {
     }
     return;
   }
+  if (picker.scope === "analysis") {
+    state.analysisTab = "month";
+    void loadAnalysisMonth(picker.draft, true);
+    return;
+  }
   setAuditPeriod(picker.granularity, picker.draft);
 }
 
@@ -679,7 +743,7 @@ function renderDatePicker() {
   const title = picker.granularity === "day" ? "选择日期" : "选择月份";
   const selection =
     picker.granularity === "day" ? formatDayLabel(picker.draft) : formatMonthLabel(picker.draft);
-  const context = picker.scope === "activity" ? "流水" : "审计";
+  const context = picker.scope === "activity" ? "流水" : picker.scope === "audit" ? "审计" : "分析";
   const availableMonths =
     picker.scope === "activity" ? state.dashboard?.availableTransactionMonths ?? [] : [];
   const helper =
@@ -733,12 +797,14 @@ function renderDatePickerMonthGrid(picker: DatePickerState) {
   );
   const months = Array.from({ length: 12 }, (_, index) => {
     const month = `${year}-${String(index + 1).padStart(2, "0")}`;
-    const disabled = picker.scope === "activity" && !available.has(month) && picker.draft !== month;
+    const disabled =
+      (picker.scope === "activity" && !available.has(month) && picker.draft !== month) ||
+      (picker.scope === "analysis" && month > currentMonthKey());
     const active = picker.draft === month;
     return `
       <button class="date-picker-month ${active ? "is-selected" : ""}" type="button" data-picker-value="${month}" aria-pressed="${active}" ${disabled ? "disabled" : ""}>
         <strong>${index + 1}月</strong>
-        <span>${disabled ? "暂无流水" : picker.scope === "activity" ? "可查看" : "审计记录"}</span>
+        <span>${disabled ? (picker.scope === "analysis" ? "尚未到达" : "暂无流水") : picker.scope === "activity" ? "可查看" : picker.scope === "analysis" ? "可分析" : "审计记录"}</span>
       </button>
     `;
   }).join("");
@@ -950,11 +1016,47 @@ async function loadFinancialAnalysis(force: boolean) {
       state.analysis = analysis;
     }
   } catch (error) {
+    if (applyClientUpdate(error)) return;
     if (state.activeLedgerId === ledgerId && state.analysisMonths === months) {
       state.analysisError = friendlyError(error, "加载财务分析失败");
     }
   } finally {
     state.analysisLoading = false;
+    render();
+  }
+}
+
+async function loadAnalysisMonth(month: string, force = false) {
+  const dashboard = state.dashboard;
+  if (
+    !dashboard ||
+    dashboard.ledger.role !== "business_owner" ||
+    dashboard.ledger.kind !== "organization" ||
+    state.analysisMonthLoading
+  ) {
+    return;
+  }
+  if (!force && state.analysisMonth === month && state.analysisMonthDetail?.month === month) {
+    return;
+  }
+  const ledgerId = dashboard.ledger.id;
+  state.analysisMonth = month;
+  state.analysisMonthDetail = undefined;
+  state.analysisMonthError = undefined;
+  state.analysisMonthLoading = true;
+  render();
+  try {
+    const detail = await cloudLedgerApi.getFinancialMonthDetail(ledgerId, month);
+    if (state.activeLedgerId === ledgerId && state.analysisMonth === month) {
+      state.analysisMonthDetail = detail;
+    }
+  } catch (error) {
+    if (applyClientUpdate(error)) return;
+    if (state.activeLedgerId === ledgerId && state.analysisMonth === month) {
+      state.analysisMonthError = friendlyError(error, "加载月度分析失败");
+    }
+  } finally {
+    state.analysisMonthLoading = false;
     render();
   }
 }
@@ -1001,6 +1103,7 @@ async function loadAnalysisDetail(target: AnalysisDetailTarget, force = false) {
       }
     }
   } catch (error) {
+    if (applyClientUpdate(error)) return;
     if (state.activeLedgerId === ledgerId && analysisTargetsEqual(state.analysisDetailTarget, target)) {
       state.analysisDetailError = friendlyError(error, "加载分析详情失败");
     }
@@ -1023,6 +1126,13 @@ function resetAnalysisDetail() {
   state.analysisDetailLoading = false;
 }
 
+function resetAnalysisMonth() {
+  state.analysisMonth = currentMonthKey();
+  state.analysisMonthDetail = undefined;
+  state.analysisMonthError = undefined;
+  state.analysisMonthLoading = false;
+}
+
 function analysisTargetsEqual(
   left: AnalysisDetailTarget | undefined,
   right: AnalysisDetailTarget | undefined,
@@ -1036,9 +1146,16 @@ function analysisTargetsEqual(
 async function refreshRemoteState(
   options: { silent: boolean; allowPending?: boolean; announceSync?: boolean } = { silent: true },
 ) {
-  if (!state.activeLedgerId || autoRefreshInFlight || (state.pendingAction && !options.allowPending)) {
+  if (
+    !state.activeLedgerId ||
+    state.updateRequired ||
+    autoRefreshInFlight ||
+    (state.pendingAction && !options.allowPending)
+  ) {
     return;
   }
+
+  if (!(await checkClientVersion())) return;
 
   const before = visibleStateFingerprint();
   const expectedUserId = state.currentUser?.id;
@@ -1103,6 +1220,9 @@ async function refreshRemoteState(
     }
     await saveOfflineSnapshot();
   } catch (error) {
+    if (applyClientUpdate(error)) {
+      return;
+    }
     if (cloudLedgerApi.isAuthRequired(error)) {
       if (state.dashboard && state.currentUser) {
         state.reauthRequired = true;
@@ -1236,6 +1356,8 @@ async function restoreOfflineState(): Promise<boolean> {
   state.activityDay = dashboard.selectedTransactionDay ?? currentDayKey();
   state.analysis = undefined;
   state.analysisError = undefined;
+  state.analysisTab = "summary";
+  resetAnalysisMonth();
   state.authStatus = "authenticated";
   state.error = undefined;
   state.cloudStatus = navigator.onLine
@@ -1432,6 +1554,7 @@ function entryAccountsForDashboard(dashboard: LedgerDashboard) {
 function render() {
   const dashboard = state.dashboard;
   const ledger = dashboard?.ledger;
+  const updateRequired = state.updateRequired !== undefined;
   const sceneIsEntering =
     lastRenderedAuthStatus === undefined ||
     lastRenderedAuthStatus !== state.authStatus ||
@@ -1448,10 +1571,12 @@ function render() {
       data-active-view="${escapeHtml(state.view)}"
       data-amount-visibility="${state.amountsVisible ? "visible" : "hidden"}"
     >
-      ${state.authStatus === "authenticated" && dashboard ? renderPullRefreshIndicator() : ""}
-      ${state.authStatus === "authenticated" ? renderTopBar() : ""}
+      ${!updateRequired && state.authStatus === "authenticated" && dashboard ? renderPullRefreshIndicator() : ""}
+      ${!updateRequired && state.authStatus === "authenticated" ? renderTopBar() : ""}
       ${
-        state.authStatus === "anonymous"
+        state.updateRequired
+          ? renderClientUpdateRequired(state.updateRequired)
+          : state.authStatus === "anonymous"
           ? renderLogin(sceneMotionClass)
           : state.loading && !dashboard
           ? renderLoading(sceneMotionClass)
@@ -1461,10 +1586,10 @@ function render() {
               ? renderError(sceneMotionClass)
               : renderEmptyState(sceneMotionClass)
       }
-      ${dashboard && ledger ? renderBottomNav(dashboard) : ""}
-      ${state.toast ? `<div class="toast" role="status">${escapeHtml(state.toast)}</div>` : ""}
-      ${renderDatePicker()}
-      ${renderVoidDialog()}
+      ${!updateRequired && dashboard && ledger ? renderBottomNav(dashboard) : ""}
+      ${!updateRequired && state.toast ? `<div class="toast" role="status">${escapeHtml(state.toast)}</div>` : ""}
+      ${!updateRequired ? renderDatePicker() : ""}
+      ${!updateRequired ? renderVoidDialog() : ""}
     </main>
   `;
 
@@ -1484,6 +1609,20 @@ function render() {
   lastSyncPresentationKey = JSON.stringify(syncPresentation());
   lastRenderedAuthStatus = state.authStatus;
   lastRenderedView = state.view;
+}
+
+function renderClientUpdateRequired(update: ClientVersionStatus) {
+  return `
+    <section class="state-panel update-required-panel" data-update-required>
+      <div class="update-required-icon" aria-hidden="true"><i data-lucide="download"></i></div>
+      <span class="section-kicker">Update required</span>
+      <h1>应用版本已过期</h1>
+      <p>当前版本 ${escapeHtml(clientVersionLabel(clientVersion))} 已停止支持，请下载最新版本后继续使用。</p>
+      <p class="update-required-meta">最低支持版本：${escapeHtml(clientVersionLabel(update.minSupportedVersion))}</p>
+      <button class="primary-button" id="openUpdateDownloadButton" type="button">下载新版本</button>
+      <small>将跳转到官方下载页面</small>
+    </section>
+  `;
 }
 
 function renderPullRefreshIndicator() {
@@ -2206,13 +2345,18 @@ function renderAnalysisPanel(dashboard: LedgerDashboard) {
       ${renderAnalysisRangeButton(12)}
     </div>
   `;
+  const tabs = renderAnalysisTabs();
+
+  if (state.analysisTab === "month") {
+    return renderMonthlyAnalysisPanel(tabs);
+  }
 
   if (state.analysisLoading && !analysis) {
     return `
       <section class="analysis-view" aria-label="财务分析">
         <div class="analysis-heading">
           <div><span class="section-kicker">Analytics</span><h2>财务分析</h2></div>
-          ${rangeControls}
+          <div class="analysis-heading-actions">${tabs}${rangeControls}</div>
         </div>
         <div class="analysis-state"><div class="spinner" aria-hidden="true"></div><p>正在汇总财务数据</p></div>
       </section>
@@ -2224,7 +2368,7 @@ function renderAnalysisPanel(dashboard: LedgerDashboard) {
       <section class="analysis-view" aria-label="财务分析">
         <div class="analysis-heading">
           <div><span class="section-kicker">Analytics</span><h2>财务分析</h2></div>
-          ${rangeControls}
+          <div class="analysis-heading-actions">${tabs}${rangeControls}</div>
         </div>
         <div class="analysis-state">
           <p>${escapeHtml(state.analysisError)}</p>
@@ -2264,7 +2408,7 @@ function renderAnalysisPanel(dashboard: LedgerDashboard) {
           <h2>财务分析</h2>
           <p>${formatPeriodMonth(analysis.periodStart)} 至 ${formatPeriodMonth(analysis.periodEnd)} · ${analysis.transactionCount} 笔实际收支</p>
         </div>
-        ${rangeControls}
+        <div class="analysis-heading-actions">${tabs}${rangeControls}</div>
       </div>
 
       <div class="analysis-metrics">
@@ -2371,6 +2515,44 @@ function renderAnalysisPanel(dashboard: LedgerDashboard) {
       <p class="analysis-updated">更新于 ${formatDate(analysis.generatedAt)} ${state.analysisLoading ? "· 刷新中" : ""}</p>
     </section>
   `;
+}
+
+function renderAnalysisTabs() {
+  return `
+    <div class="analysis-tabs" role="tablist" aria-label="分析类型">
+      <button class="filter-tab ${state.analysisTab === "summary" ? "is-active" : ""}" type="button" data-analysis-tab="summary" role="tab" aria-selected="${state.analysisTab === "summary"}">综合分析</button>
+      <button class="filter-tab ${state.analysisTab === "month" ? "is-active" : ""}" type="button" data-analysis-tab="month" role="tab" aria-selected="${state.analysisTab === "month"}">月度分析</button>
+    </div>
+  `;
+}
+
+function renderMonthlyAnalysisPanel(tabs: string) {
+  const detail = state.analysisMonthDetail?.month === state.analysisMonth ? state.analysisMonthDetail : undefined;
+  const heading = `
+    <div class="analysis-heading">
+      <div>
+        <span class="section-kicker">Monthly analytics</span>
+        <h2>月度分析</h2>
+        <p>按现金实际发生时间统计</p>
+      </div>
+      <div class="analysis-heading-actions">
+        ${tabs}
+        <button class="month-picker-button" type="button" data-date-picker-scope="analysis" data-date-picker-granularity="month" aria-label="选择分析月份">
+          <i data-lucide="calendar-range" aria-hidden="true"></i>${escapeHtml(formatMonthLabel(state.analysisMonth))}
+        </button>
+      </div>
+    </div>
+  `;
+  if (state.analysisMonthLoading && !detail) {
+    return `<section class="analysis-view" aria-label="月度分析">${heading}<div class="analysis-state"><div class="spinner" aria-hidden="true"></div><p>正在加载月度分析</p></div></section>`;
+  }
+  if (state.analysisMonthError && !detail) {
+    return `<section class="analysis-view" aria-label="月度分析">${heading}<div class="analysis-state"><p>${escapeHtml(state.analysisMonthError)}</p><button class="primary-button" id="retryAnalysisMonthButton" type="button">重新加载</button></div></section>`;
+  }
+  if (!detail) {
+    return `<section class="analysis-view" aria-label="月度分析">${heading}<div class="analysis-state"><p>请选择月份查看分析</p></div></section>`;
+  }
+  return renderMonthAnalysisDetail(heading, detail);
 }
 
 function renderAnalysisDetailPanel() {
@@ -3041,6 +3223,11 @@ function renderEmptyState(sceneMotionClass: string) {
 function bindEvents() {
   bindSyncStatusEvents();
 
+  app.querySelector<HTMLButtonElement>("#openUpdateDownloadButton")?.addEventListener("click", () => {
+    const url = state.updateRequired?.downloadUrl;
+    if (url) openDownloadUrl(url);
+  });
+
   const picker = state.datePicker;
   const pickerContent = app.querySelector<HTMLElement>(".date-picker-content");
   if (picker?.transition && pickerContent) {
@@ -3209,7 +3396,11 @@ function bindEvents() {
     button.addEventListener("click", () => {
       const scope = button.dataset.datePickerScope;
       const granularity = button.dataset.datePickerGranularity;
-      if ((scope === "activity" || scope === "audit") && (granularity === "day" || granularity === "month")) {
+      if (
+        (scope === "activity" || scope === "audit" || scope === "analysis") &&
+        (granularity === "day" || granularity === "month") &&
+        !(scope === "analysis" && granularity !== "month")
+      ) {
         openDatePicker(scope, granularity);
       }
     });
@@ -3292,6 +3483,21 @@ function bindEvents() {
     });
   });
 
+  app.querySelectorAll<HTMLButtonElement>("[data-analysis-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const tab = button.dataset.analysisTab;
+      if (tab !== "summary" && tab !== "month") return;
+      state.analysisTab = tab;
+      if (tab === "summary") {
+        resetAnalysisDetail();
+      } else {
+        resetAnalysisDetail();
+        void loadAnalysisMonth(state.analysisMonth);
+      }
+      render();
+    });
+  });
+
   app.querySelector<HTMLButtonElement>("#retryAnalysisButton")?.addEventListener("click", () => {
     void loadFinancialAnalysis(true);
   });
@@ -3299,8 +3505,16 @@ function bindEvents() {
   app.querySelectorAll<HTMLButtonElement>("[data-analysis-month]").forEach((button) => {
     button.addEventListener("click", () => {
       const month = button.dataset.analysisMonth;
-      if (month) void loadAnalysisDetail({ kind: "month", month });
+      if (month) {
+        state.analysisTab = "month";
+        resetAnalysisDetail();
+        void loadAnalysisMonth(month);
+      }
     });
+  });
+
+  app.querySelector<HTMLButtonElement>("#retryAnalysisMonthButton")?.addEventListener("click", () => {
+    void loadAnalysisMonth(state.analysisMonth, true);
   });
 
   app.querySelectorAll<HTMLButtonElement>("[data-analysis-member]").forEach((button) => {
@@ -3363,6 +3577,17 @@ function bindEvents() {
   app.querySelector<HTMLButtonElement>("#retryButton")?.addEventListener("click", () => {
     void loadInitialState();
   });
+}
+
+function openDownloadUrl(url: string) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:") return;
+    const opened = window.open(parsed.toString(), "_blank", "noopener,noreferrer");
+    if (!opened) window.location.assign(parsed.toString());
+  } catch {
+    showToast("官方下载地址无效");
+  }
 }
 
 function bindSyncStatusEvents() {
@@ -3766,6 +3991,9 @@ function showToast(message: string) {
 }
 
 function friendlyError(error: unknown, fallback: string) {
+  if (applyClientUpdate(error)) {
+    return "客户端版本过低，请升级后继续使用";
+  }
   const message = error instanceof Error ? error.message : String(error || fallback);
 
   if (message.includes("rejection reason is required")) {

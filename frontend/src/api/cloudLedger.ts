@@ -11,7 +11,7 @@ import type {
   TransactionDto,
   TransactionMonthDto,
 } from "../api";
-import { cloudBaseUrl } from "../config";
+import { clientVersion, cloudBaseUrl } from "../config";
 import { invoke } from "@tauri-apps/api/core";
 import type {
   ApprovalQueueItem,
@@ -20,6 +20,7 @@ import type {
   AuditLogEntry,
   AuditPeriod,
   Category,
+  ClientVersionStatus,
   FinancialAccount,
   FinancialAnalysis,
   FinancialMemberDetail,
@@ -41,6 +42,7 @@ export interface CloudLedgerApi {
   logout(): Promise<void>;
   getUserSession(): Promise<UserSession>;
   checkCloudStatus(): Promise<UserSession["cloudStatus"]>;
+  checkClientVersion(): Promise<ClientVersionStatus>;
   listLedgers(): Promise<Ledger[]>;
   getLedgerDashboard(ledgerId: string, month?: string, day?: string): Promise<LedgerDashboard>;
   getAuditPeriod(
@@ -114,6 +116,13 @@ class HttpError extends Error {
   ) {
     super(code || `HTTP ${status}`);
     this.name = "HttpError";
+  }
+}
+
+export class ClientUpdateRequiredError extends HttpError {
+  constructor(status: number, code: string, readonly update: ClientVersionStatus) {
+    super(status, code);
+    this.name = "ClientUpdateRequiredError";
   }
 }
 
@@ -203,6 +212,12 @@ const serverApi: CloudLedgerApi = {
 
   async checkCloudStatus() {
     return fetchCloudStatus();
+  },
+
+  async checkClientVersion() {
+    const response = await cloudFetch("/client/version");
+    if (!response.ok) throw await responseError(response);
+    return (await response.json()) as ClientVersionStatus;
   },
 
   async listLedgers() {
@@ -435,7 +450,26 @@ async function refreshStoredSession(session: AuthSession) {
 }
 
 async function responseError(response: Response) {
-  const body = (await response.json().catch(() => ({}))) as { error?: string };
+  const body = (await response.json().catch(() => ({}))) as {
+    error?: string;
+    code?: string;
+    currentVersion?: string;
+    minSupportedVersion?: string;
+    downloadUrl?: string;
+  };
+  if (
+    body.code === "client_update_required" &&
+    body.currentVersion &&
+    body.minSupportedVersion &&
+    body.downloadUrl
+  ) {
+    return new ClientUpdateRequiredError(response.status, body.code, {
+      currentVersion: body.currentVersion,
+      minSupportedVersion: body.minSupportedVersion,
+      downloadUrl: body.downloadUrl,
+      updateRequired: true,
+    });
+  }
   return new HttpError(response.status, body.error ?? "");
 }
 
@@ -444,6 +478,7 @@ async function cloudFetch(path: string, init?: RequestInit) {
   const timeout = controller ? window.setTimeout(() => controller.abort(), 5_000) : undefined;
   try {
     const headers = new Headers(init?.headers);
+    headers.set("X-CloudLedger-Client-Version", clientVersion);
     if (await ngrokWarningBypassEnabled()) {
       headers.set("ngrok-skip-browser-warning", "true");
     }
@@ -863,6 +898,15 @@ const mockApi: CloudLedgerApi = {
 
   async checkCloudStatus() {
     return mockCloudStatus();
+  },
+
+  async checkClientVersion() {
+    return {
+      currentVersion: clientVersion,
+      minSupportedVersion: clientVersion,
+      downloadUrl: "https://github.com/dahai9/CloudLedger/releases/latest",
+      updateRequired: false,
+    };
   },
 
   async listLedgers() {

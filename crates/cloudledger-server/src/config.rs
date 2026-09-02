@@ -59,6 +59,9 @@ pub struct ServerConfig {
     pub public_admin_url: String,
     pub allow_insecure_lan: bool,
     pub web_login_enabled: bool,
+    pub client_version: String,
+    pub min_supported_client_version: String,
+    pub client_download_url: String,
     pub data_dir: PathBuf,
 }
 
@@ -82,6 +85,10 @@ impl Default for ServerConfig {
             public_admin_url: "http://127.0.0.1:8788".to_string(),
             allow_insecure_lan: false,
             web_login_enabled: false,
+            client_version: "0.1.13".to_string(),
+            min_supported_client_version: "0.0.0".to_string(),
+            client_download_url: "https://github.com/dahai9/CloudLedger/releases/latest"
+                .to_string(),
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
         }
     }
@@ -218,6 +225,22 @@ impl BackendConfig {
         }
         validate_public_url("server.public_api_url", &self.server.public_api_url)?;
         validate_public_url("server.public_admin_url", &self.server.public_admin_url)?;
+        let current_version = semver::Version::parse(&self.server.client_version)
+            .with_context(|| "server.client_version must be valid semantic version")?;
+        let minimum_version = semver::Version::parse(&self.server.min_supported_client_version)
+            .with_context(|| {
+                "server.min_supported_client_version must be valid semantic version"
+            })?;
+        if minimum_version > current_version {
+            anyhow::bail!(
+                "server.min_supported_client_version cannot exceed server.client_version"
+            );
+        }
+        let download_url = Url::parse(&self.server.client_download_url)
+            .with_context(|| "server.client_download_url must be a valid URL")?;
+        if download_url.scheme() != "https" || download_url.host_str().is_none() {
+            anyhow::bail!("server.client_download_url must use HTTPS");
+        }
         validate_server_mode(self, &database_url)?;
         validate_admin_path(&self.admin.path)?;
         if self.admin.token.is_empty() {
