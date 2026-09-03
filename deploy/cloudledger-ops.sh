@@ -265,6 +265,26 @@ client_version_for_tag() {
   local version=${1#v}
   printf '%s' "${version//.alpha./-alpha.}"
 }
+backfill_client_version_config() {
+  load_env || return 1
+  local release_version
+  release_version=$(client_version_for_tag "${CLOUDLEDGER_RELEASE_TAG:-}")
+  valid_client_version "$release_version" || {
+    fail '当前 release tag 无法转换为客户端 SemVer，无法兼容升级。'
+    return 1
+  }
+  if [[ -z "${CLOUDLEDGER_CLIENT_VERSION:-}" ]]; then
+    set_env_value CLOUDLEDGER_CLIENT_VERSION "$release_version" || return 1
+  fi
+  if [[ -z "${CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION:-}" ]]; then
+    set_env_value CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION "${CLOUDLEDGER_CLIENT_VERSION:-$release_version}" || return 1
+  fi
+  if [[ -z "${CLOUDLEDGER_CLIENT_DOWNLOAD_URL:-}" ]]; then
+    set_env_value CLOUDLEDGER_CLIENT_DOWNLOAD_URL 'https://github.com/dahai9/CloudLedger/releases/latest' || return 1
+  fi
+  load_env
+  render_server_config
+}
 valid_download_url() { [[ "$1" =~ ^https://[^[:space:]\"\\]+$ ]]; }
 valid_domain() { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ && "$1" == *.* ]]; }
 valid_ghcr_image() {
@@ -995,6 +1015,7 @@ normalize_ops_env() {
 
 validate_deployment_config() {
   load_env || return 1
+  local allow_missing_client_version=${1:-0}
   local name owner image_owner temp
   for name in CLOUDLEDGER_HTTP_HOST_PORT CLOUDLEDGER_HTTPS_HOST_PORT CLOUDLEDGER_ADMIN_TUNNEL_PORT; do
     [[ -z "${!name:-}" ]] || { fail '当前配置仍包含旧版端口键，请通过升级向导执行受控接管。'; return 1; }
@@ -1007,6 +1028,11 @@ validate_deployment_config() {
     CLOUDLEDGER_ADMIN_PATH CLOUDLEDGER_ADMIN_TOKEN CLOUDLEDGER_TURNSTILE_SITE_KEY CLOUDLEDGER_TURNSTILE_SECRET_KEY \
     CLOUDLEDGER_AUDIT_KEY_ID CLOUDLEDGER_AUDIT_HMAC_KEY CLOUDLEDGER_AUDIT_IDENTIFIER_HMAC_KEY \
     CLOUDLEDGER_CADDY_ORIGIN_CERT_PATH CLOUDLEDGER_CADDY_ORIGIN_KEY_PATH; do
+    if (( allow_missing_client_version == 1 )) && [[ "$name" == CLOUDLEDGER_CLIENT_VERSION \
+      || "$name" == CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION \
+      || "$name" == CLOUDLEDGER_CLIENT_DOWNLOAD_URL ]]; then
+      continue
+    fi
     require_env_value "$name" || return 1
   done
   [[ "$CLOUDLEDGER_GHCR_OWNER" =~ ^[a-z0-9_.-]+$ ]] \
@@ -1044,16 +1070,31 @@ validate_deployment_config() {
   if ! write_server_config_file "$temp" cloudledger "$CLOUDLEDGER_API_DOMAIN" "$CLOUDLEDGER_RUNTIME_DB_PASSWORD" \
     "$CLOUDLEDGER_ADMIN_PATH" "$CLOUDLEDGER_ADMIN_TOKEN" "$CLOUDLEDGER_TURNSTILE_SITE_KEY" \
     "$CLOUDLEDGER_TURNSTILE_SECRET_KEY" "$CLOUDLEDGER_AUDIT_KEY_ID" "$CLOUDLEDGER_AUDIT_HMAC_KEY" \
-    "$CLOUDLEDGER_AUDIT_IDENTIFIER_HMAC_KEY" "$CLOUDLEDGER_CLIENT_VERSION" \
-    "$CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION" "$CLOUDLEDGER_CLIENT_DOWNLOAD_URL" \
-    || ! cmp -s "$SERVER_CONFIG" "$temp"; then
+    "$CLOUDLEDGER_AUDIT_IDENTIFIER_HMAC_KEY" "${CLOUDLEDGER_CLIENT_VERSION:-}" \
+    "${CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION:-}" "${CLOUDLEDGER_CLIENT_DOWNLOAD_URL:-}" \
+    || { (( allow_missing_client_version == 0 )) && ! cmp -s "$SERVER_CONFIG" "$temp"; }; then
     remove_sensitive_path "$temp"
     fail '当前 server.toml 不符合工具生成的安全配置模板。'
     return 1
   fi
-  valid_client_version "$CLOUDLEDGER_CLIENT_VERSION" || { fail '客户端版本必须是 SemVer。'; return 1; }
-  valid_client_version "$CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION" || { fail '最低支持客户端版本必须是 SemVer。'; return 1; }
-  valid_download_url "$CLOUDLEDGER_CLIENT_DOWNLOAD_URL" || { fail '官方下载地址必须是 HTTPS URL，且不能包含空格或引号。'; return 1; }
+  if [[ -n "${CLOUDLEDGER_CLIENT_VERSION:-}" ]]; then
+    valid_client_version "$CLOUDLEDGER_CLIENT_VERSION" || { fail '客户端版本必须是 SemVer。'; return 1; }
+  elif (( allow_missing_client_version == 0 )); then
+    fail '客户端版本缺失。'
+    return 1
+  fi
+  if [[ -n "${CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION:-}" ]]; then
+    valid_client_version "$CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION" || { fail '最低支持客户端版本必须是 SemVer。'; return 1; }
+  elif (( allow_missing_client_version == 0 )); then
+    fail '最低支持客户端版本缺失。'
+    return 1
+  fi
+  if [[ -n "${CLOUDLEDGER_CLIENT_DOWNLOAD_URL:-}" ]]; then
+    valid_download_url "$CLOUDLEDGER_CLIENT_DOWNLOAD_URL" || { fail '官方下载地址必须是 HTTPS URL，且不能包含空格或引号。'; return 1; }
+  elif (( allow_missing_client_version == 0 )); then
+    fail '官方下载地址缺失。'
+    return 1
+  fi
   remove_sensitive_path "$temp" || return 1
   validate_certificate_pair "$CLOUDLEDGER_CADDY_ORIGIN_CERT_PATH" "$CLOUDLEDGER_CADDY_ORIGIN_KEY_PATH" \
     "$CLOUDLEDGER_API_DOMAIN" || return 1
@@ -2618,13 +2659,17 @@ upgrade_locked() {
 
 upgrade_transaction() {
   local tag=$1 new_server new_postgres new_caddy new_anchor snapshot asset_snapshot rc legacy=0 owner target_client_version
-  local old_server old_postgres old_caddy old_anchor image
+  local old_server old_postgres old_caddy old_anchor image allow_missing_client_version=0
   load_env || return 1
   if legacy_deployment_detected; then
     legacy=1
     validate_legacy_deployment || return 1
   else
-    validate_deployment_config || return 1
+    if [[ -z "${CLOUDLEDGER_CLIENT_VERSION:-}" || -z "${CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION:-}" \
+      || -z "${CLOUDLEDGER_CLIENT_DOWNLOAD_URL:-}" ]]; then
+      allow_missing_client_version=1
+    fi
+    validate_deployment_config "$allow_missing_client_version" || return 1
   fi
   old_server=${CLOUDLEDGER_SERVER_IMAGE:-}
   old_postgres=${CLOUDLEDGER_POSTGRES_IMAGE:-}
@@ -2668,7 +2713,8 @@ upgrade_transaction() {
       && make_backup \
       || { handle_active_upgrade_abort; return 1; }
   else
-    make_backup \
+    { (( allow_missing_client_version == 0 )) || backfill_client_version_config; } \
+      && make_backup \
       && set_env_value CLOUDLEDGER_SERVER_IMAGE "$new_server" \
       && set_env_value CLOUDLEDGER_POSTGRES_IMAGE "$new_postgres" \
       && set_env_value CLOUDLEDGER_CADDY_IMAGE "$new_caddy" \
@@ -2676,6 +2722,7 @@ upgrade_transaction() {
       && set_env_value CLOUDLEDGER_RELEASE_TAG "$tag" \
       && set_env_value CLOUDLEDGER_CLIENT_VERSION "$target_client_version" \
       && set_env_value CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION "$target_client_version" \
+      && set_env_value CLOUDLEDGER_CLIENT_DOWNLOAD_URL "${CLOUDLEDGER_CLIENT_DOWNLOAD_URL:-https://github.com/dahai9/CloudLedger/releases/latest}" \
       && render_server_config \
       || { handle_active_upgrade_abort; return 1; }
   fi

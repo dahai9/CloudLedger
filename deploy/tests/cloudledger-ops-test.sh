@@ -984,6 +984,29 @@ test_upgrade_transaction_order() {
   assert_contains '升级完成' "$CASE_ROOT/upgrade.out"
 }
 
+test_upgrade_backfills_client_version_config() {
+  setup_case upgrade-backfill-client-version
+  seed_backup_fixture yes
+  sed -i \
+    -e '/^CLOUDLEDGER_CLIENT_VERSION=/d' \
+    -e '/^CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION=/d' \
+    -e '/^CLOUDLEDGER_CLIENT_DOWNLOAD_URL=/d' \
+    "$CLOUDLEDGER_OPS_ENV"
+  sed -i \
+    -e '/^client_version = /d' \
+    -e '/^min_supported_client_version = /d' \
+    -e '/^client_download_url = /d' \
+    "$CLOUDLEDGER_SERVER_CONFIG"
+  printf '3\n3\nv0.1.5\nYES\n0\n0\n' | "$OPS" >"$CASE_ROOT/upgrade.out" 2>&1
+  assert_contains '升级完成' "$CASE_ROOT/upgrade.out"
+  assert_contains 'CLOUDLEDGER_CLIENT_VERSION=0.1.5' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'CLOUDLEDGER_MIN_SUPPORTED_CLIENT_VERSION=0.1.5' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'CLOUDLEDGER_CLIENT_DOWNLOAD_URL=https://github.com/dahai9/CloudLedger/releases/latest' "$CLOUDLEDGER_OPS_ENV"
+  assert_contains 'client_version = "0.1.5"' "$CLOUDLEDGER_SERVER_CONFIG"
+  assert_contains 'min_supported_client_version = "0.1.5"' "$CLOUDLEDGER_SERVER_CONFIG"
+  assert_contains 'client_download_url = "https://github.com/dahai9/CloudLedger/releases/latest"' "$CLOUDLEDGER_SERVER_CONFIG"
+}
+
 test_upgrade_failure_boundaries() {
   setup_case upgrade-pre-migration-failure
   seed_backup_fixture yes
@@ -1235,6 +1258,7 @@ main() {
   run_selected diagnostic-redaction test_diagnostic_redaction
   run_selected rclone-redaction test_rclone_display_redaction
   run_selected upgrade-order test_upgrade_transaction_order
+  run_selected upgrade-backfill test_upgrade_backfills_client_version_config
   run_selected upgrade-boundaries test_upgrade_failure_boundaries
   run_selected legacy-upgrade test_legacy_upgrade_adoption
   run_selected restore-signal test_restore_signal_rollback
