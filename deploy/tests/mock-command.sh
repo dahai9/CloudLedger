@@ -317,6 +317,11 @@ case $name in
         ;;
       */auth/security)
         record 'turnstile:status'
+        if [[ ${CLOUDLEDGER_TEST_REQUIRE_CLIENT_VERSION_HEADER:-0} == 1 ]]; then
+          has_arg 'X-CloudLedger-Client-Version: 0.1.4' "$@" \
+            || { record 'turnstile:missing-client-version'; exit 22; }
+          record 'turnstile:client-version'
+        fi
         response='{"turnstileEnabled":true,"turnstileSiteKey":"test-turnstile-site-key"}'
         ;;
       */ready)

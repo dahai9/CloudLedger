@@ -138,7 +138,7 @@ setup_case() {
     CLOUDLEDGER_TEST_HTTPS_LISTENER CLOUDLEDGER_TEST_ASSERT_CLEAN_COMPOSE_ENV \
     CLOUDLEDGER_TEST_MIGRATION_SUMMARY CLOUDLEDGER_TEST_RM_FAIL_PATTERN \
     CLOUDLEDGER_TEST_NFT_CAPTURE CLOUDLEDGER_TEST_NFT_PRETTY_PRIORITY \
-    CLOUDLEDGER_TEST_MISSING_RESTORE_TABLE
+    CLOUDLEDGER_TEST_MISSING_RESTORE_TABLE CLOUDLEDGER_TEST_REQUIRE_CLIENT_VERSION_HEADER
 }
 
 cleanup_injected_rm_paths() {
@@ -868,8 +868,10 @@ run_deploy_verification_menu() {
 test_turnstile_secret_probe() {
   setup_case turnstile-secret-valid
   seed_backup_fixture no
+  export CLOUDLEDGER_TEST_REQUIRE_CLIENT_VERSION_HEADER=1
   run_deploy_verification_menu "$CASE_ROOT/verify.out"
   assert_contains 'turnstile:probe' "$CLOUDLEDGER_TEST_TRACE"
+  assert_contains 'turnstile:client-version' "$CLOUDLEDGER_TEST_TRACE"
   assert_contains 'Turnstile secret key 验证通过' "$CASE_ROOT/verify.out"
   assert_secret_not_logged "$CLOUDLEDGER_TEST_TURNSTILE_SECRET" \
     "$CASE_ROOT/verify.out" "$CLOUDLEDGER_TEST_TRACE"

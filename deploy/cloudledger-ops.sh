@@ -1193,9 +1193,23 @@ check_local_backend() {
 }
 
 verify_turnstile() {
-  local api response
+  local api response client_version
   api=$(api_base_url)
-  response=$(curl -fsS --max-time 10 "$api/auth/security") || { fail '无法读取 Turnstile 状态。'; return 1; }
+  load_env || return 1
+  client_version=${CLOUDLEDGER_CLIENT_VERSION:-}
+  if [[ -n "$client_version" ]]; then
+    valid_client_version "$client_version" \
+      || { fail '当前客户端版本配置无效，无法读取 Turnstile 状态。'; return 1; }
+    response=$(curl -fsS --max-time 10 \
+      -H "X-CloudLedger-Client-Version: $client_version" "$api/auth/security") \
+      || { fail '无法读取 Turnstile 状态。'; return 1; }
+  else
+    # Older deployments predate the client-version gate. Keep their public
+    # verification path working until the first controlled upgrade backfills
+    # the version fields.
+    response=$(curl -fsS --max-time 10 "$api/auth/security") \
+      || { fail '无法读取 Turnstile 状态。'; return 1; }
+  fi
   jq -e '.turnstileEnabled == true and (.turnstileSiteKey | length > 0)' <<<"$response" >/dev/null \
     || { fail 'API 未启用 Turnstile 或 site key 为空。'; return 1; }
   verify_turnstile_credentials || return 1
