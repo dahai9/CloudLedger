@@ -2645,6 +2645,26 @@ button:not(:disabled):active {
   border-bottom: 1px solid var(--line);
 }
 
+.analysis-member-detail-row {
+  width: 100%;
+  padding: 0;
+  cursor: pointer;
+  border-top: 0;
+  border-right: 0;
+  border-left: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+}
+
+.analysis-member-detail-row:hover,
+.analysis-member-detail-row:focus-visible {
+  background: rgb(47 111 159 / 6%);
+  outline: 2px solid rgb(47 111 159 / 24%);
+  outline-offset: -2px;
+}
+
 .analysis-list-row > div,
 .member-spend-row > div:first-child {
   display: grid;

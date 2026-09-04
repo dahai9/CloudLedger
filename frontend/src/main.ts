@@ -95,6 +95,7 @@ interface AppState {
   analysisDetailError?: string;
   analysisMonthLoading: boolean;
   analysisMonthError?: string;
+  analysisMonthMemberId?: string;
   updateRequired?: ClientVersionStatus;
   cachedDashboards: Record<string, LedgerDashboard>;
   cachedAuditPeriods: Record<string, AuditPeriod>;
@@ -1041,6 +1042,7 @@ async function loadAnalysisMonth(month: string, force = false) {
   }
   const ledgerId = dashboard.ledger.id;
   state.analysisMonth = month;
+  state.analysisMonthMemberId = undefined;
   state.analysisMonthDetail = undefined;
   state.analysisMonthError = undefined;
   state.analysisMonthLoading = true;
@@ -1124,6 +1126,7 @@ function resetAnalysisDetail() {
   state.analysisMemberDetail = undefined;
   state.analysisDetailError = undefined;
   state.analysisDetailLoading = false;
+  state.analysisMonthMemberId = undefined;
 }
 
 function resetAnalysisMonth() {
@@ -1131,6 +1134,7 @@ function resetAnalysisMonth() {
   state.analysisMonthDetail = undefined;
   state.analysisMonthError = undefined;
   state.analysisMonthLoading = false;
+  state.analysisMonthMemberId = undefined;
 }
 
 function analysisTargetsEqual(
@@ -2552,6 +2556,12 @@ function renderMonthlyAnalysisPanel(tabs: string) {
   if (!detail) {
     return `<section class="analysis-view" aria-label="月度分析">${heading}<div class="analysis-state"><p>请选择月份查看分析</p></div></section>`;
   }
+  if (state.analysisMonthMemberId) {
+    const member = detail.memberExpenses.find(
+      (item) => item.userId === state.analysisMonthMemberId && item.expenseCents > 0,
+    );
+    if (member) return renderMonthMemberAnalysisDetail(detail, member.userId, member.displayName);
+  }
   return renderMonthAnalysisDetail(heading, detail);
 }
 
@@ -2635,7 +2645,7 @@ function renderMonthAnalysisDetail(heading: string, detail: FinancialMonthDetail
             activeMembers.length > 0
               ? activeMembers
                   .map(
-                    (member) => `<div class="analysis-list-row"><div><strong>${escapeHtml(member.displayName)}</strong><span>${member.transactionCount} 笔</span></div><strong class="amount-out">${formatMoney(member.expenseCents, detail.currency)}</strong></div>`,
+                    (member) => `<button class="analysis-list-row analysis-member-detail-row" type="button" data-analysis-month-member="${escapeHtml(member.userId)}" title="查看 ${escapeHtml(member.displayName)} 在 ${escapeHtml(formatMonthLabel(detail.month))} 的详细支出"><div><strong>${escapeHtml(member.displayName)}</strong><span>${member.transactionCount} 笔 · 查看明细</span></div><strong class="amount-out">${formatMoney(member.expenseCents, detail.currency)}</strong></button>`,
                   )
                   .join("")
               : `<p class="empty-copy">本月暂无成员已打款支出</p>`
@@ -2643,6 +2653,39 @@ function renderMonthAnalysisDetail(heading: string, detail: FinancialMonthDetail
         </div>
       </section>
       ${renderActualTransactionSection(detail.transactions, detail.currency, "逐笔实际收支")}
+    </section>
+  `;
+}
+
+function renderMonthMemberAnalysisDetail(
+  detail: FinancialMonthDetail,
+  memberId: string,
+  displayName: string,
+) {
+  const transactions = detail.transactions.filter(
+    (transaction) =>
+      transaction.direction === "expense" && transaction.submittedByUserId === memberId,
+  );
+  const expenseCents = transactions.reduce(
+    (total, transaction) => total + transaction.amountCents,
+    0,
+  );
+  return `
+    <section class="analysis-view" aria-label="${escapeHtml(displayName)} ${escapeHtml(detail.month)} 月支出明细">
+      <div class="analysis-heading analysis-detail-heading">
+        <div>
+          <span class="section-kicker">Monthly member detail</span>
+          <h2>${escapeHtml(displayName)}支出明细</h2>
+          <p>${escapeHtml(formatMonthLabel(detail.month))} · 按实际完成打款时间统计</p>
+        </div>
+        <button class="ghost-button analysis-back-button" id="closeAnalysisMonthMemberButton" type="button">
+          <i data-lucide="arrow-left" aria-hidden="true"></i>返回月度分析
+        </button>
+      </div>
+      <div class="analysis-metrics analysis-member-metrics">
+        ${renderAnalysisMetric("本月已打款支出", expenseCents, detail.currency, `${transactions.length} 笔项目`)}
+      </div>
+      ${renderActualTransactionSection(transactions, detail.currency, "逐笔支出")}
     </section>
   `;
 }
@@ -3523,6 +3566,22 @@ function bindEvents() {
       if (memberId) void loadAnalysisDetail({ kind: "member", memberId });
     });
   });
+
+  app.querySelectorAll<HTMLButtonElement>("[data-analysis-month-member]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const memberId = button.dataset.analysisMonthMember;
+      if (!memberId) return;
+      state.analysisMonthMemberId = memberId;
+      render();
+    });
+  });
+
+  app
+    .querySelector<HTMLButtonElement>("#closeAnalysisMonthMemberButton")
+    ?.addEventListener("click", () => {
+      state.analysisMonthMemberId = undefined;
+      render();
+    });
 
   app.querySelector<HTMLButtonElement>("#closeAnalysisDetailButton")?.addEventListener("click", () => {
     closeAnalysisDetail();
