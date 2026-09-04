@@ -1449,11 +1449,41 @@ enable_backup_timers() {
 rclone_remote_name() { local remote=$1; printf '%s' "${remote%%:*}"; }
 
 validate_rclone_crypt_remote() {
-  local remote=$1 name
+  local remote=$1 name line in_section=0 found=0 type='' type_seen=0
   [[ "$remote" =~ ^[A-Za-z0-9_.-]+:.+$ ]] || { fail '远程目录格式应为 cryptRemote:path。'; return 1; }
   name=$(rclone_remote_name "$remote")
-  rclone config show "$name" 2>/dev/null | grep -Eq '^[[:space:]]*type[[:space:]]*=[[:space:]]*crypt[[:space:]]*$' \
-    || { fail '所选 remote 不是 rclone crypt；禁止明文上传备份。'; return 1; }
+  [[ -f "$RCLONE_CONFIG" && ! -L "$RCLONE_CONFIG" ]] \
+    || { fail "未找到 rclone 配置文件: $RCLONE_CONFIG"; return 1; }
+  # Read the local config directly instead of relying on `rclone config show`.
+  # Older rclone versions may fail that command while still exposing the
+  # plaintext `type` field (for example when an encrypted config cannot be
+  # decrypted), which previously produced a false "not crypt" rejection.
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line%$'\r'}
+    if [[ "$line" == "[$name]" ]]; then
+      in_section=1
+      found=$((found + 1))
+      continue
+    fi
+    if [[ "$line" == \[*\] ]]; then
+      in_section=0
+      continue
+    fi
+    if (( in_section == 1 )) && [[ "$line" =~ ^[[:space:]]*type[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+      type=${BASH_REMATCH[1]}
+      type=${type#"${type%%[![:space:]]*}"}
+      type=${type%"${type##*[![:space:]]}"}
+      type_seen=$((type_seen + 1))
+    fi
+  done <"$RCLONE_CONFIG"
+  if (( found != 1 )); then
+    fail "rclone 配置中找不到唯一 remote '$name'（配置文件: $RCLONE_CONFIG）。"
+    return 1
+  fi
+  if (( type_seen != 1 )) || [[ "$type" != crypt ]]; then
+    fail "所选 remote '$name' 的 type 不是 crypt；禁止明文上传备份。"
+    return 1
+  fi
 }
 
 require_remote_backup_configuration() {

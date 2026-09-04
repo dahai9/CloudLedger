@@ -957,6 +957,16 @@ test_rclone_display_redaction() {
   assert_secret_not_logged "$CLOUDLEDGER_TEST_RCLONE_PASSWORD" "$CASE_ROOT/rclone.out"
 }
 
+test_rclone_crypt_remote_validation() {
+  setup_case rclone-crypt-validation
+  seed_rclone_config
+  sed -i 's/^\[cloudledger-crypt\]$/[Onedrive-crypt]/' "$CLOUDLEDGER_RCLONE_CONFIG"
+  printf '7\n9\nOnedrive-crypt:CloudLedger/backups\n0\n0\n' \
+    | "$OPS" >"$CASE_ROOT/rclone-validation.out" 2>&1
+  assert_not_contains '不是 rclone crypt' "$CASE_ROOT/rclone-validation.out"
+  assert_contains 'CLOUDLEDGER_RCLONE_REMOTE=Onedrive-crypt:CloudLedger/backups' "$CLOUDLEDGER_OPS_ENV"
+}
+
 test_upgrade_transaction_order() {
   setup_case upgrade-order
   seed_backup_fixture yes
@@ -1259,6 +1269,7 @@ main() {
   run_selected systemd-units test_systemd_unit_contract
   run_selected diagnostic-redaction test_diagnostic_redaction
   run_selected rclone-redaction test_rclone_display_redaction
+  run_selected rclone-crypt-validation test_rclone_crypt_remote_validation
   run_selected upgrade-order test_upgrade_transaction_order
   run_selected upgrade-backfill test_upgrade_backfills_client_version_config
   run_selected upgrade-boundaries test_upgrade_failure_boundaries
